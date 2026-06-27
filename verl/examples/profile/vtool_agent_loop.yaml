@@ -1,0 +1,4 @@
+- name: vtool_agent
+  _target_: examples.profile.shared.agent.vtool_agent_loop.VToolAgentLoop
+  tool_timeout_seconds: 10.0
+  force_oracle_refocus: true

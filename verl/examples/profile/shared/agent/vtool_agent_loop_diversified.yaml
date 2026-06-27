@@ -1,0 +1,15 @@
+- name: vtool_agent
+  _target_: examples.profile.shared.agent.vtool_agent_loop.VToolAgentLoop
+  tool_timeout_seconds: 10.0
+  # Passed into Ray workers via hydra instantiate (reliable); do not rely on env alone.
+  force_oracle_refocus: true
+  # CONTROLLED EXPERIMENT (NOT a real RL policy): make each branch of a GRPO group
+  # apply a DIFFERENT but still valid focus_on_* refocus to the SAME base image, so
+  # we can measure cross-branch turn1 image-token similarity when branches diverge.
+  # The deterministic per-sample oracle is preserved separately via vtool_agent_loop.yaml.
+  oracle_diversify_by_branch: true
+  # Annotation style for the diversified edit. Default "draw" = each branch boxes a
+  # DIFFERENT bbox region with the SAME style (clean cross-branch comparison: only the
+  # focused region varies). Use "draw,highlight" to also vary style; avoid "mask"
+  # (whites out the rest of the chart -> too-aggressive, semantically different edit).
+  oracle_diversify_modes: "draw"

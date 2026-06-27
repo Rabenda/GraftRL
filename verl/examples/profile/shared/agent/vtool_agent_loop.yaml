@@ -1,0 +1,5 @@
+- name: vtool_agent
+  _target_: examples.profile.shared.agent.vtool_agent_loop.VToolAgentLoop
+  tool_timeout_seconds: 10.0
+  # Passed into Ray workers via hydra instantiate (reliable); do not rely on VTOOL_ORACLE_REFOCUS env alone.
+  force_oracle_refocus: true

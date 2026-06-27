@@ -131,3 +131,7 @@ logs
 log
 outputs
 .history
+
+# Profiling / experiment artifacts (large dumps, images, CSV logs)
+profile_logs*/
+profile_gallery/

@@ -1,0 +1,6 @@
+- name: vtool_agent
+  _target_: examples.profile.shared.agent.vtool_agent_loop.VToolAgentLoop
+  tool_timeout_seconds: 10.0
+  # Oracle refocus from dataset thoughts (bbox mask/draw/highlight). Required for
+  # base Qwen2.5-VL profiling — the model rarely emits valid focus_on_* code.
+  force_oracle_refocus: true

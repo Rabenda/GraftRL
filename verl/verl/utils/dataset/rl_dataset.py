@@ -103,7 +103,7 @@ class RLHFDataset(Dataset):
         self.max_samples = max_samples
         self.config = config
 
-        self.cache_dir = os.path.expanduser(config.get("cache_dir", "~/.cache/verl/rlhf"))
+        self.cache_dir = os.path.expanduser(config.get("cache_dir", "/data/verl/rlhf"))
         self.prompt_key = config.get("prompt_key", "prompt")
         self.image_key = config.get("image_key", "images")
         self.video_key = config.get("video_key", "videos")

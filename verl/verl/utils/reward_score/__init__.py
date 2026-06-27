@@ -91,6 +91,16 @@ def default_compute_score(
 
         res = geo3k.compute_score(solution_str, ground_truth)
     elif data_source in [
+        "VTOOL/Refocus_Chart",
+        "ReFocus/ReFocus_Data",
+        "vstar",
+        "visual_toolbox_v2",
+        "ChenShawn/DeepEyes-Datasets-47k",
+    ]:
+        from . import refocus_chart
+
+        res = refocus_chart.compute_score(solution_str, ground_truth)
+    elif data_source in [
         "searchR1_nq",
         "searchR1_triviaqa",
         "searchR1_popqa",

@@ -40,6 +40,24 @@ logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 DEFAULT_ROUTING_CACHE_SIZE = 10000
 
 
+def _grpo_sim_cache_enabled() -> bool:
+    return os.environ.get("SGLANG_GRPO_SIM_CACHE", "0").lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+
+
+def _vlm_cacheblend_enabled() -> bool:
+    return os.environ.get("SGLANG_VLM_CACHEBLEND", "0").lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+
+
 @ray.remote
 class GlobalRequestLoadBalancer:
     """Global sticky-session + in-flight load balancer shared by all AgentLoopWorkers.
@@ -186,6 +204,9 @@ class LLMServerClient:
         video_data: Optional[list[Any]] = None,
         audio_data: Optional[list[Any]] = None,
         mm_processor_kwargs: Optional[dict[str, Any]] = None,
+        agent_turn: Optional[int] = None,
+        agent_uid: Optional[str] = None,
+        rollout_idx: Optional[str] = None,
         **kwargs: Any,
     ) -> TokenOutput:
         """Generate tokens from prompt ids.
@@ -198,19 +219,32 @@ class LLMServerClient:
         Returns:
             TokenOutput | DiffusionOutput: token or diffusion output
         """
-        server_id, server = await self._acquire_server(request_id)
+        routing_request_id = request_id
+        if (_grpo_sim_cache_enabled() or _vlm_cacheblend_enabled()) and agent_uid:
+            routing_request_id = f"grpo_agent_uid:{agent_uid}"
+
+        server_id, server = await self._acquire_server(routing_request_id)
         try:
             multimodal_kwargs = {}
             if audio_data is not None:
                 multimodal_kwargs["audio_data"] = audio_data
             if mm_processor_kwargs:
                 multimodal_kwargs["mm_processor_kwargs"] = mm_processor_kwargs
+            # Sticky LB uses agent `request_id`; SGLang rid is per-turn for profiling correlation.
+            if agent_turn is not None:
+                sglang_request_id = f"{request_id}_t{int(agent_turn)}"
+            else:
+                sglang_request_id = uuid4().hex
             output: TokenOutput = await server.generate.remote(
-                request_id=uuid4().hex,  # use new request_id for each turn
+                request_id=sglang_request_id,
                 prompt_ids=prompt_ids,
                 sampling_params=sampling_params,
                 image_data=image_data,
                 video_data=video_data,
+                agent_request_id=request_id,
+                agent_turn=agent_turn,
+                agent_uid=agent_uid,
+                rollout_idx=rollout_idx,
                 **multimodal_kwargs,
                 **kwargs,
             )

@@ -728,6 +728,47 @@ class AgentLoopWorker:
             extra_fields=output.extra_fields,
         )
 
+    def _multi_modal_inputs_from_images(
+        self,
+        images: list[Any],
+        mm_processor_kwargs: Optional[dict[str, Any]] = None,
+    ) -> dict[str, torch.Tensor]:
+        """Build concatenated multi-modal inputs for multi-turn image rollouts.
+
+        Incremental agent loops tokenize each new observation separately, but postprocess
+        must still provide processor outputs for the cumulative image list. Re-decoding
+        padded input_ids text with all images attached can desync grid rows from image
+        pad tokens, so process each image independently and concatenate processor keys.
+        """
+        parts: dict[str, list[torch.Tensor]] = {}
+        for img in images:
+            if isinstance(img, Image.Image):
+                img = img.convert("RGB")
+            mi = build_multimodal_processor_inputs(
+                self.processor,
+                text=[""],
+                images=[img],
+                mm_processor_kwargs=mm_processor_kwargs,
+            )
+            mi.pop("input_ids", None)
+            mi.pop("attention_mask", None)
+            mi = dict(mi.convert_to_tensors("pt"))
+            for key, value in mi.items():
+                if value is None:
+                    continue
+                if not isinstance(value, torch.Tensor):
+                    value = torch.as_tensor(value)
+                parts.setdefault(key, []).append(value)
+
+        multi_modal_inputs = {key: torch.cat(values, dim=0) for key, values in parts.items()}
+        image_grid_thw = multi_modal_inputs.get("image_grid_thw")
+        if image_grid_thw is not None:
+            images_seqlens = torch.repeat_interleave(
+                image_grid_thw[:, 1] * image_grid_thw[:, 2], image_grid_thw[:, 0]
+            )
+            multi_modal_inputs["images_seqlens"] = images_seqlens
+        return multi_modal_inputs
+
     def _compute_multi_modal_inputs(self, output, input_ids) -> dict[str, torch.Tensor]:
         """Compute multi-modal inputs with image, video and audio."""
         multi_modal_inputs = {}
@@ -738,6 +779,15 @@ class AgentLoopWorker:
         images = multi_modal_data.get("images")
         videos = multi_modal_data.get("videos")
         audios = multi_modal_data.get("audios")
+        mm_processor_kwargs = (
+            output.mm_processor_kwargs
+            if output.mm_processor_kwargs is not None
+            else self._get_mm_processor_kwargs(audios)
+        )
+
+        if images is not None and isinstance(images, list) and len(images) > 1 and videos is None and audios is None:
+            return self._multi_modal_inputs_from_images(images, mm_processor_kwargs)
+
         current_text = self.tokenizer.decode(input_ids.squeeze(0), skip_special_tokens=True)
 
         multi_modal_inputs = build_multimodal_processor_inputs(
@@ -746,9 +796,7 @@ class AgentLoopWorker:
             images=images,
             videos=videos,
             audio=audios,
-            mm_processor_kwargs=output.mm_processor_kwargs
-            if output.mm_processor_kwargs is not None
-            else self._get_mm_processor_kwargs(audios),
+            mm_processor_kwargs=mm_processor_kwargs,
         )
         multi_modal_inputs.pop("input_ids", None)
         multi_modal_inputs.pop("attention_mask", None)

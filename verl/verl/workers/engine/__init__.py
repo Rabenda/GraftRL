@@ -50,7 +50,7 @@ try:
     from .mindspeed import MindspeedEngineWithLMHead, MindspeedEngineWithValueHead, MindSpeedLLMEngineWithLMHead
 
     __all__ += ["MindspeedEngineWithLMHead", "MindspeedEngineWithValueHead", "MindSpeedLLMEngineWithLMHead"]
-except ImportError:
+except Exception:
     MindspeedEngineWithLMHead = None
     MindspeedEngineWithValueHead = None
     MindSpeedLLMEngineWithLMHead = None
@@ -59,6 +59,7 @@ try:
     from .megatron import MegatronEngine, MegatronEngineWithLMHead, MegatronEngineWithValueHead
 
     __all__ += ["MegatronEngine", "MegatronEngineWithLMHead", "MegatronEngineWithValueHead"]
-except ImportError:
+except Exception:
     MegatronEngine = None
     MegatronEngineWithLMHead = None
+    MegatronEngineWithValueHead = None
