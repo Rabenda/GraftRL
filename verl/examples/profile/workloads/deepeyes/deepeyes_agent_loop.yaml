@@ -1,0 +1,9 @@
+- name: deepeyes_agent
+  _target_: examples.profile.workloads.deepeyes.deepeyes_agent_loop.DeepEyesAgentLoop
+  tool_timeout_seconds: 10.0
+  max_tool_rounds: 5
+# Parquet rows from HF use agent_name=deepeyes_visual_toolbox_v2
+- name: deepeyes_visual_toolbox_v2
+  _target_: examples.profile.workloads.deepeyes.deepeyes_agent_loop.DeepEyesAgentLoop
+  tool_timeout_seconds: 10.0
+  max_tool_rounds: 5

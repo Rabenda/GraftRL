@@ -1,0 +1,9 @@
+- name: sokoban_agent
+  _target_: examples.profile.workloads.sokoban.sokoban_agent_loop.SokobanAgentLoop
+  max_env_steps: 15
+  env_seed_base: 0
+  dim_room: [6, 6]
+  num_boxes: 1
+  search_depth: 30
+  # Per-turn decode budget (VAGEN-style); total capped by rollout.response_length.
+  response_length_per_turn: 128

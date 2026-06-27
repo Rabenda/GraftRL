@@ -1,0 +1,4 @@
+- name: dummy_crop_agent
+  _target_: examples.profile.archive.dummy_crop.dummy_crop_agent_loop.DummyCropAgentLoop
+  crop_ratio: 0.5
+  first_turn_max_new_tokens: 32

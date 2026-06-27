@@ -1,0 +1,500 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <style>
+    @page { margin: 18mm 14mm; }
+    body {
+      font-family: "Noto Sans CJK SC", "Noto Sans SC", "PingFang SC",
+                   "Microsoft YaHei", "WenQuanYi Micro Hei", sans-serif;
+      font-size: 11pt; line-height: 1.5; color: #111; max-width: 100%;
+    }
+    h1 { font-size: 20pt; margin-top: 0; }
+    h2 { font-size: 15pt; margin-top: 1.4em; border-bottom: 1px solid #ccc; padding-bottom: 0.25em; }
+    h3 { font-size: 12.5pt; }
+    table { border-collapse: collapse; width: 100%; margin: 0.6em 0; font-size: 9.5pt; page-break-inside: avoid; }
+    th, td { border: 1px solid #bbb; padding: 5px 7px; vertical-align: top; }
+    th { background: #f0f0f0; }
+    img { max-width: 100%; height: auto; }
+    td img { max-width: 200px; }
+    code { background: #f5f5f5; padding: 1px 4px; font-size: 9pt; }
+    blockquote { border-left: 3px solid #888; padding-left: 12px; color: #444; margin-left: 0; }
+    pre { background: #f5f5f5; padding: 10px; font-size: 8.5pt; white-space: pre-wrap; word-break: break-all; }
+    hr { border: none; border-top: 1px solid #ddd; margin: 1.5em 0; }
+  </style>
+</head>
+<body><h1>同组 4 个 branch 的 turn1 refocus实验说明</h1>
+<h2>实验目标</h2>
+<p>GRPO 里 <code>rollout_n=4</code>，<strong>同一个 prompt + 同一张原图</strong>会开出 4 条 branch。每条 branch 走完 refocus 后都会有一张 <strong>turn1 新图</strong>。这 4 张 turn1 图彼此像不像？像到 ViT 的 image token 能不能在 group 里互相复用？</p>
+<hr />
+<h2>两个阶段的区别</h2>
+<table>
+<thead>
+<tr>
+<th></th>
+<th><strong>阶段一：原始 refocus + Oracle</strong></th>
+<th><strong>阶段二：Diversified Oracle（受控改造）</strong></th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>目的</td>
+<td>用数据集自带的 <strong>确定性 oracle refocus</strong>，模拟「正常 profiling 跑 refocus」</td>
+<td>故意让 4 个 branch <strong>框不同区域</strong>，且 <strong>只用 draw</strong>，测「分化最大」时 token 还能不能复用</td>
+</tr>
+<tr>
+<td>4 个 branch 的 turn1</td>
+<td>理论上应跑 <strong>同一段</strong> oracle → 多数组 <strong>4 张图字节级相同</strong></td>
+<td>每 branch <strong>不同 bbox</strong>，刻意 <strong>4/4 不同图</strong></td>
+</tr>
+<tr>
+<td>意义</td>
+<td><strong>乐观上界</strong>（exact dedup 能命中多少）</td>
+<td><strong>保守下界</strong>（最不像的时候 cos 还有多少）</td>
+</tr>
+<tr>
+<td>数据目录</td>
+<td><code>profile_logs_refocus_chart_origin/</code></td>
+<td><code>profile_logs_refocus_chart/</code>（<code>VTOOL_ORACLE_DIVERSIFY=1</code>）</td>
+</tr>
+</tbody>
+</table>
+<hr />
+<h1>阶段一：原始 refocus + Oracle</h1>
+<h2>方法论</h2>
+<ol>
+<li><strong>设定</strong>：<code>TRAIN_BATCH_SIZE=64</code>，<code>ROLLOUT_N=4</code>，Refocus Chart 多轮数据；agent 开 <code>force_oracle_refocus</code>，用数据里写好的 <code>oracle_refocus_code</code>（<code>focus_on_*_with_draw/highlight/...</code>），<strong>不是</strong>让 policy 自己学出来的 tool call。</li>
+<li><strong>一个 group 里发生什么</strong>：</li>
+<li>turn0：4 个 branch 输入 <strong>同一张原图</strong>（chart）。</li>
+<li>turn1：每个 branch 执行 oracle 做 refocus，得到 <strong>refocus 输出图</strong>。</li>
+<li><strong>怎么量</strong>：</li>
+<li>对每组 4 张 <strong>turn1 refocus PNG</strong>，用 Qwen2.5-VL-7B 的 ViT 重新 encode，得到每张图的 <strong>image token 序列</strong>（长度 = <code>n_tokens</code>）。</li>
+<li>两两算 <strong>per-token cosine</strong>，汇总 <code>token_mean_cos</code>、<code>reusable@0.99</code>（cos≥0.99 的 token 占比）等。</li>
+</ol>
+<hr />
+<h2>阶段一 · 例子：<code>group_a48d7a74</code></h2>
+<blockquote>
+<p>路径：<code>profile_logs_refocus_chart_origin/similarity/case_studies_crossbranch/group_a48d7a74/</code><br />
+这个组在阶段一里比较「特殊」：<strong>4 张 turn1 并不相同</strong>（有的 refocus 成功、有的失败、框的内容也不一样），正好能看 <strong>partial token reuse</strong>，所以适合当例子。</p>
+</blockquote>
+<h3>视觉对比（原图 → 4 张 turn1）</h3>
+<p>4 个 branch 的 <strong>turn0 是同一张原图</strong>（sha256 一致），下面只贴一张代表；<strong>本实验要比的是下面 4 张 turn1</strong>。</p>
+<p><strong>原图 turn0</strong>（580 image tokens · 4 branch 共用）</p>
+<p><img alt="阶段一 a48d7a74 原图 turn0" src="file:///workspace/repo/verl_vision/profile_logs_refocus_chart_origin/similarity/case_studies_crossbranch/group_a48d7a74/branch0_turn0.png" /></p>
+<p><strong>4 张 turn1 refocus</strong></p>
+<table>
+<thead>
+<tr>
+<th style="text-align: center;">branch0 · 580 tokens</th>
+<th style="text-align: center;">branch1 · 580 tokens</th>
+<th style="text-align: center;">branch2 · 580 tokens</th>
+<th style="text-align: center;">branch3 · 580 tokens</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td style="text-align: center;">3 个红框：iShares / Vanguard / State Street</td>
+<td style="text-align: center;"><strong>= 原图</strong>（refocus 失败）</td>
+<td style="text-align: center;">3 个红框：Vanguard / State Street / Invesco</td>
+<td style="text-align: center;">1 个红框：State Street</td>
+</tr>
+<tr>
+<td style="text-align: center;"><img alt="b0 turn1" src="file:///workspace/repo/verl_vision/profile_logs_refocus_chart_origin/similarity/case_studies_crossbranch/group_a48d7a74/branch0_turn1_refocus.png" /></td>
+<td style="text-align: center;"><img alt="b1 turn1" src="file:///workspace/repo/verl_vision/profile_logs_refocus_chart_origin/similarity/case_studies_crossbranch/group_a48d7a74/branch1_turn1_refocus.png" /></td>
+<td style="text-align: center;"><img alt="b2 turn1" src="file:///workspace/repo/verl_vision/profile_logs_refocus_chart_origin/similarity/case_studies_crossbranch/group_a48d7a74/branch2_turn1_refocus.png" /></td>
+<td style="text-align: center;"><img alt="b3 turn1" src="file:///workspace/repo/verl_vision/profile_logs_refocus_chart_origin/similarity/case_studies_crossbranch/group_a48d7a74/branch3_turn1_refocus.png" /></td>
+</tr>
+</tbody>
+</table>
+<h3>Image token 数量</h3>
+<table>
+<thead>
+<tr>
+<th>场景</th>
+<th>含义</th>
+<th>本组数值</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>离线相似度分析</strong>（case study 里的 <code>n_tokens</code>）</td>
+<td>对 <strong>单张 dump 出来的 PNG</strong> 跑 ViT，得到的 patch token 数</td>
+<td>turn0 / 每张 turn1 都是 <strong>580</strong></td>
+</tr>
+<tr>
+<td><strong>训练时 SGLang encode</strong>（<code>vision_encoder_log</code>）</td>
+<td>一次 forward 里送进 vision 的 token 总量</td>
+<td>turn0：<strong>580</strong>；turn1：<strong>1160</strong>（≈ 原图 + refocus 图各 encode 一遍）</td>
+</tr>
+</tbody>
+</table>
+<p>580 的来源：Qwen2.5-VL 把图 resize 后打成 <strong>20×29</strong> 的 patch grid → <strong>20×29 = 580</strong> 个 image token。<br />
+4 个 branch 的 turn0 <strong>sha256 相同</strong> → 4 份 turn0 的 580 个 token 可以 <strong>100% exact 复用</strong>。</p>
+<h3>4 张 turn1 相似度</h3>
+<p><strong>ViT token 两两 mean-cos 矩阵</strong>（1.0 = 同一张图）：</p>
+<table>
+<thead>
+<tr>
+<th style="text-align: center;"></th>
+<th style="text-align: center;">branch0</th>
+<th style="text-align: center;">branch1</th>
+<th style="text-align: center;">branch2</th>
+<th style="text-align: center;">branch3</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td style="text-align: center;"><strong>branch0</strong></td>
+<td style="text-align: center;">1.000</td>
+<td style="text-align: center;">0.855</td>
+<td style="text-align: center;">0.917</td>
+<td style="text-align: center;">0.917</td>
+</tr>
+<tr>
+<td style="text-align: center;"><strong>branch1</strong></td>
+<td style="text-align: center;">0.855</td>
+<td style="text-align: center;">1.000</td>
+<td style="text-align: center;">0.861</td>
+<td style="text-align: center;">0.931</td>
+</tr>
+<tr>
+<td style="text-align: center;"><strong>branch2</strong></td>
+<td style="text-align: center;">0.917</td>
+<td style="text-align: center;">0.861</td>
+<td style="text-align: center;">1.000</td>
+<td style="text-align: center;">0.898</td>
+</tr>
+<tr>
+<td style="text-align: center;"><strong>branch3</strong></td>
+<td style="text-align: center;">0.917</td>
+<td style="text-align: center;">0.931</td>
+<td style="text-align: center;">0.898</td>
+<td style="text-align: center;">1.000</td>
+</tr>
+</tbody>
+</table>
+<ul>
+<li><strong>4 张 turn1 的 sha256 都不同</strong>（<code>4 distinct turn1</code>），但 cos 仍在 <strong>0.86–0.93</strong>。</li>
+<li>branch1 的 turn1 = 原图 → 和 branch0/2/3 的 refocus 图比，cos 大约 <strong>0.85–0.93</strong>（没框的那条 branch 反而和「多框」的图也挺像，因为改动像素很少）。</li>
+</ul>
+<p><strong>更细的 6 对 turn1×turn1</strong>（摘自 <code>turn1_cross_branch.csv</code>）：</p>
+<table>
+<thead>
+<tr>
+<th>对比</th>
+<th style="text-align: center;">字节相同？</th>
+<th style="text-align: center;">改动像素%</th>
+<th style="text-align: center;">token mean cos</th>
+<th style="text-align: center;">reusable@0.99</th>
+<th style="text-align: center;">reusable@0.95</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>b0 vs b1</td>
+<td style="text-align: center;">否</td>
+<td style="text-align: center;">3.27%</td>
+<td style="text-align: center;">0.855</td>
+<td style="text-align: center;">28.6%</td>
+<td style="text-align: center;">55.0%</td>
+</tr>
+<tr>
+<td>b0 vs b2</td>
+<td style="text-align: center;">否</td>
+<td style="text-align: center;">2.18%</td>
+<td style="text-align: center;">0.917</td>
+<td style="text-align: center;">45.9%</td>
+<td style="text-align: center;">70.7%</td>
+</tr>
+<tr>
+<td>b0 vs b3</td>
+<td style="text-align: center;">否</td>
+<td style="text-align: center;">2.18%</td>
+<td style="text-align: center;">0.917</td>
+<td style="text-align: center;">50.7%</td>
+<td style="text-align: center;">73.8%</td>
+</tr>
+<tr>
+<td>b1 vs b2</td>
+<td style="text-align: center;">否</td>
+<td style="text-align: center;">3.27%</td>
+<td style="text-align: center;">0.861</td>
+<td style="text-align: center;">28.4%</td>
+<td style="text-align: center;">55.2%</td>
+</tr>
+<tr>
+<td>b1 vs b3</td>
+<td style="text-align: center;">否</td>
+<td style="text-align: center;">1.09%</td>
+<td style="text-align: center;">0.931</td>
+<td style="text-align: center;">50.5%</td>
+<td style="text-align: center;">77.8%</td>
+</tr>
+<tr>
+<td>b2 vs b3</td>
+<td style="text-align: center;">否</td>
+<td style="text-align: center;">2.18%</td>
+<td style="text-align: center;">0.898</td>
+<td style="text-align: center;">38.4%</td>
+<td style="text-align: center;">66.4%</td>
+</tr>
+</tbody>
+</table>
+<p><strong>本例小结（阶段一）</strong>：即使 oracle 本意是「大家做同一种 refocus」，这个组里因为 <strong>执行结果不一致</strong>（失败 / 多框组合不同），4 张 turn1 已经不一样了，但 <strong>平均仍有 ~90% 的 token cosine 很高、约一半 token 达到 0.99 可复用阈值</strong>——说明该实验的 <strong>partial reuse</strong> 在「不同 refocus 图」之间是存在的。</p>
+<hr />
+<h1>阶段二：Diversified Oracle（受控改造）</h1>
+<h2>方法论</h2>
+<ol>
+<li><strong>为什么要改造</strong>：阶段一里 95% 的组 turn1 完全一样，该实验回答不了「4 条 branch 若 refocus 成不同局部图，token 还能复用吗」。</li>
+<li><strong>我们改了什么</strong>（<code>VTOOL_ORACLE_DIVERSIFY=1</code> + <code>vtool_agent_loop_diversified.yaml</code>）：</li>
+<li>仍用 oracle 管线，但按 <strong>branch 的 request_id</strong> 哈希，从 metadata 的 bbox 列表里 <strong>选不同 key</strong>；</li>
+<li><strong>固定只用 <code>draw</code></strong>（画红框），不用 mask（mask 会把大半张图涂白，和「局部框选」不是一类编辑）；</li>
+<li><strong>不声称</strong>这是真实 RL policy 的自然行为 → 定位成 <strong>controlled synthetic local-edit workload</strong>。</li>
+<li><strong>比较对象仍然一样</strong>：比 4 张 turn1 的 ViT token cosine；只是现在 <strong>刻意让 4 张图尽量不同</strong>（保守、分化最大的情形）。</li>
+</ol>
+<h3>结论</h3>
+<p>来自 <code>profile_logs_refocus_chart/similarity_diversified/similarity_summary_by_pair_type.md</code>：</p>
+<table>
+<thead>
+<tr>
+<th>指标</th>
+<th style="text-align: right;">数值</th>
+<th>和阶段一对比</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>turn1 跨 branch byte-identical</td>
+<td style="text-align: right;"><strong>100 / 585 ≈ 17%</strong></td>
+<td>从 95% 降到 17%，<strong>真分化了</strong></td>
+</tr>
+<tr>
+<td>token mean cos（全部 turn1 对）</td>
+<td style="text-align: right;"><strong>0.9125</strong></td>
+<td>仍很高，但低于阶段一的 0.9955</td>
+</tr>
+<tr>
+<td>只统计「图确实不同」的 485 对</td>
+<td style="text-align: right;">mean cos <strong>0.8944</strong>，reusable@0.99 <strong>49.4%</strong></td>
+<td>这才是保守的</td>
+</tr>
+<tr>
+<td>reusable@0.95（全部）</td>
+<td style="text-align: right;"><strong>74.8%</strong></td>
+<td>约 3/4 token 仍可当 partial cache 候选</td>
+</tr>
+</tbody>
+</table>
+<p><strong>结论（阶段二）</strong>：故意让 4 个 branch <strong>框不同区域、只画框</strong>，turn1 大多已是不同 PNG，但 <strong>token 仍高度相似（~0.89–0.91）</strong>—— <strong>group-level partial image-token reuse</strong> 在保守设定下仍成立。</p>
+<hr />
+<h2>阶段二 · 例子 1：<code>group_36cf828b</code>（横向条形图 · _sector  Added value）</h2>
+<blockquote>
+<p>路径：<code>profile_logs_refocus_chart/similarity_diversified/case_studies_crossbranch/group_36cf828b/</code><br />
+特点：<strong>4/4 turn1 都不同</strong>，每个 branch <strong>只框一行</strong>，典型「同款 draw、不同区域」。</p>
+</blockquote>
+<h3>视觉对比（原图 → 4 张 turn1）</h3>
+<p><strong>原图 turn0</strong>（812 image tokens · 4 branch 共用）</p>
+<p><img alt="阶段二 36cf828b 原图" src="file:///workspace/repo/verl_vision/profile_logs_refocus_chart/similarity_diversified/case_studies_crossbranch/group_36cf828b/branch0_turn0.png" /></p>
+<p><strong>4 张 turn1</strong>（diversified draw · 每 branch 只框 <strong>一行</strong> · 4/4 不同 PNG）</p>
+<table>
+<thead>
+<tr>
+<th style="text-align: center;">branch0 · 812 tokens</th>
+<th style="text-align: center;">branch1 · 812 tokens</th>
+<th style="text-align: center;">branch2 · 812 tokens</th>
+<th style="text-align: center;">branch3 · 812 tokens</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td style="text-align: center;">Financial services</td>
+<td style="text-align: center;">Other services</td>
+<td style="text-align: center;">Services（最大条）</td>
+<td style="text-align: center;">Information and communication</td>
+</tr>
+<tr>
+<td style="text-align: center;"><img alt="b0" src="file:///workspace/repo/verl_vision/profile_logs_refocus_chart/similarity_diversified/case_studies_crossbranch/group_36cf828b/branch0_turn1_refocus.png" /></td>
+<td style="text-align: center;"><img alt="b1" src="file:///workspace/repo/verl_vision/profile_logs_refocus_chart/similarity_diversified/case_studies_crossbranch/group_36cf828b/branch1_turn1_refocus.png" /></td>
+<td style="text-align: center;"><img alt="b2" src="file:///workspace/repo/verl_vision/profile_logs_refocus_chart/similarity_diversified/case_studies_crossbranch/group_36cf828b/branch2_turn1_refocus.png" /></td>
+<td style="text-align: center;"><img alt="b3" src="file:///workspace/repo/verl_vision/profile_logs_refocus_chart/similarity_diversified/case_studies_crossbranch/group_36cf828b/branch3_turn1_refocus.png" /></td>
+</tr>
+</tbody>
+</table>
+<p>原图：各国经济部门「Added value in million euros」横向条形图。整张图几乎一样，<strong>只有红框位置不同</strong> → 像素改动约 0.78%，但 4 个文件 hash 都不同。</p>
+<h3>Image token 数量</h3>
+<table>
+<thead>
+<tr>
+<th>场景</th>
+<th style="text-align: center;">turn0</th>
+<th style="text-align: center;">各 branch turn1（单张 PNG 分析）</th>
+<th style="text-align: center;">turn1 训练 forward</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>离线 <code>n_tokens</code></td>
+<td style="text-align: center;"><strong>812</strong></td>
+<td style="text-align: center;"><strong>812</strong>（4 张都不同 hash）</td>
+<td style="text-align: center;">—</td>
+</tr>
+<tr>
+<td><code>vision_encoder_log</code></td>
+<td style="text-align: center;"><strong>812</strong></td>
+<td style="text-align: center;">—</td>
+<td style="text-align: center;"><strong>1624</strong>（≈ 2×812）</td>
+</tr>
+</tbody>
+</table>
+<p>812 = 另一张 resize 后的 patch grid（本图更大，grid 不是 20×29）。</p>
+<h3>4 张 turn1 相似度矩阵</h3>
+<table>
+<thead>
+<tr>
+<th style="text-align: center;"></th>
+<th style="text-align: center;">b0</th>
+<th style="text-align: center;">b1</th>
+<th style="text-align: center;">b2</th>
+<th style="text-align: center;">b3</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td style="text-align: center;"><strong>b0</strong></td>
+<td style="text-align: center;">1.000</td>
+<td style="text-align: center;">0.853</td>
+<td style="text-align: center;">0.883</td>
+<td style="text-align: center;">0.859</td>
+</tr>
+<tr>
+<td style="text-align: center;"><strong>b1</strong></td>
+<td style="text-align: center;">0.853</td>
+<td style="text-align: center;">1.000</td>
+<td style="text-align: center;">0.890</td>
+<td style="text-align: center;">0.870</td>
+</tr>
+<tr>
+<td style="text-align: center;"><strong>b2</strong></td>
+<td style="text-align: center;">0.883</td>
+<td style="text-align: center;">0.890</td>
+<td style="text-align: center;">1.000</td>
+<td style="text-align: center;">0.874</td>
+</tr>
+<tr>
+<td style="text-align: center;"><strong>b3</strong></td>
+<td style="text-align: center;">0.859</td>
+<td style="text-align: center;">0.870</td>
+<td style="text-align: center;">0.874</td>
+<td style="text-align: center;">1.000</td>
+</tr>
+</tbody>
+</table>
+<p>组内汇总：<strong>6 对 turn1 平均 cos = 0.8715</strong>；reusable@0.99 ≈ <strong>44.4%</strong>，@0.95 ≈ <strong>66.2%</strong>。<br />
+像素只改了约 <strong>0.78%</strong>，但 4 张图已是不同文件 → <strong>exact cache 基本帮不上，partial token cache 仍有空间</strong>。</p>
+<hr />
+<h2>阶段二 · 例子 2：<code>group_75ee7c0b</code>（纵向柱状图 · 2008–2020 访客）</h2>
+<blockquote>
+<p>路径：<code>profile_logs_refocus_chart/similarity_diversified/case_studies_crossbranch/group_75ee7c0b/</code><br />
+特点：经典 <strong>柱状图 + 单柱红框</strong>；4 个 branch 框 <strong>不同年份</strong>（diversified 按 hash 选 x 轴 bbox）。</p>
+</blockquote>
+<h3>视觉对比（原图 → 4 张 turn1）</h3>
+<p><strong>原图 turn0</strong>（580 image tokens · 4 branch 共用）</p>
+<p><img alt="阶段二 75ee7c0b 原图" src="file:///workspace/repo/verl_vision/profile_logs_refocus_chart/similarity_diversified/case_studies_crossbranch/group_75ee7c0b/branch0_turn0.png" /></p>
+<p><strong>4 张 turn1</strong>（diversified draw · 每 branch 框 <strong>不同年份</strong> 的柱子 · 4/4 不同 PNG）</p>
+<table>
+<thead>
+<tr>
+<th style="text-align: center;">branch0 · 580 tokens</th>
+<th style="text-align: center;">branch1 · 580 tokens</th>
+<th style="text-align: center;">branch2 · 580 tokens</th>
+<th style="text-align: center;">branch3 · 580 tokens</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td style="text-align: center;"><strong>2014</strong> 柱</td>
+<td style="text-align: center;"><strong>2020</strong> 柱</td>
+<td style="text-align: center;"><strong>2011</strong> 柱</td>
+<td style="text-align: center;"><strong>2013</strong> 柱</td>
+</tr>
+<tr>
+<td style="text-align: center;"><img alt="b0" src="file:///workspace/repo/verl_vision/profile_logs_refocus_chart/similarity_diversified/case_studies_crossbranch/group_75ee7c0b/branch0_turn1_refocus.png" /></td>
+<td style="text-align: center;"><img alt="b1" src="file:///workspace/repo/verl_vision/profile_logs_refocus_chart/similarity_diversified/case_studies_crossbranch/group_75ee7c0b/branch1_turn1_refocus.png" /></td>
+<td style="text-align: center;"><img alt="b2" src="file:///workspace/repo/verl_vision/profile_logs_refocus_chart/similarity_diversified/case_studies_crossbranch/group_75ee7c0b/branch2_turn1_refocus.png" /></td>
+<td style="text-align: center;"><img alt="b3" src="file:///workspace/repo/verl_vision/profile_logs_refocus_chart/similarity_diversified/case_studies_crossbranch/group_75ee7c0b/branch3_turn1_refocus.png" /></td>
+</tr>
+</tbody>
+</table>
+<p>原图：2008–2020 访客数竖条图。红框在柱子上平移，<strong>背景和其他柱子完全保留</strong> → 典型「局部编辑、整图高度相似」。</p>
+<h3>Image token 数量</h3>
+<table>
+<thead>
+<tr>
+<th>场景</th>
+<th style="text-align: center;">turn0</th>
+<th style="text-align: center;">各 turn1（离线）</th>
+<th style="text-align: center;">turn1 训练 forward</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>离线 <code>n_tokens</code></td>
+<td style="text-align: center;"><strong>580</strong></td>
+<td style="text-align: center;"><strong>580</strong> ×4</td>
+<td style="text-align: center;">—</td>
+</tr>
+<tr>
+<td><code>vision_encoder_log</code></td>
+<td style="text-align: center;"><strong>580</strong></td>
+<td style="text-align: center;">—</td>
+<td style="text-align: center;"><strong>1160</strong></td>
+</tr>
+</tbody>
+</table>
+<h3>4 张 turn1 相似度矩阵</h3>
+<table>
+<thead>
+<tr>
+<th style="text-align: center;"></th>
+<th style="text-align: center;">b0</th>
+<th style="text-align: center;">b1</th>
+<th style="text-align: center;">b2</th>
+<th style="text-align: center;">b3</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td style="text-align: center;"><strong>b0</strong></td>
+<td style="text-align: center;">1.000</td>
+<td style="text-align: center;">0.893</td>
+<td style="text-align: center;">0.889</td>
+<td style="text-align: center;">0.924</td>
+</tr>
+<tr>
+<td style="text-align: center;"><strong>b1</strong></td>
+<td style="text-align: center;">0.893</td>
+<td style="text-align: center;">1.000</td>
+<td style="text-align: center;">0.902</td>
+<td style="text-align: center;">0.892</td>
+</tr>
+<tr>
+<td style="text-align: center;"><strong>b2</strong></td>
+<td style="text-align: center;">0.889</td>
+<td style="text-align: center;">0.902</td>
+<td style="text-align: center;">1.000</td>
+<td style="text-align: center;">0.901</td>
+</tr>
+<tr>
+<td style="text-align: center;"><strong>b3</strong></td>
+<td style="text-align: center;">0.924</td>
+<td style="text-align: center;">0.892</td>
+<td style="text-align: center;">0.901</td>
+<td style="text-align: center;">1.000</td>
+</tr>
+</tbody>
+</table>
+<p>组内汇总：<strong>mean cos = 0.9003</strong>；reusable@0.99 ≈ <strong>57.0%</strong>（比例子 1 略好——框的区域更小、整图更同质）。<br />
+改动像素约 <strong>0.61%</strong>。</p>
+<p><strong>两例对比</strong>：一张横向条形、一张竖条；都是「只多几条红框线」，但 <strong>4 张 turn1 两两 cos 仍在 0.85–0.92</strong>，支持「同一原图的不同局部 draw refocus → group 内仍可共享大量 image token」。</p>
+<hr /></body>
+</html>
