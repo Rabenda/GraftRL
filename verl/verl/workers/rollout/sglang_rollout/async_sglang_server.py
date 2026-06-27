@@ -13,11 +13,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import asyncio
+import csv
 import dataclasses
+import inspect
 import json
 import logging
 import os
 import secrets
+import threading
+import time
 from pathlib import Path
 from typing import Any, Optional
 
@@ -46,6 +50,7 @@ from verl.utils.config import omega_conf_to_dataclass
 from verl.utils.device import get_visible_devices_keyword
 from verl.utils.net_utils import get_free_port, is_valid_ipv6_address
 from verl.utils.profiler import DistProfiler, build_sglang_profiler_args
+from verl.utils.tokenizer import get_processor_token_id
 from verl.workers.config import HFModelConfig, RolloutConfig
 from verl.workers.rollout.replica import RolloutMode, RolloutReplica, TokenOutput
 from verl.workers.rollout.sglang_rollout.sglang_rollout import _set_envs_and_config
@@ -54,6 +59,148 @@ from verl.workers.rollout.utils import get_max_position_embeddings, run_uvicorn
 
 logger = logging.getLogger(__file__)
 logger.setLevel(logging.INFO)
+
+VERL_SGLANG_GENERATE_LOG_ENABLED = os.environ.get("SGLANG_LOG_INFERENCE_STEP", "0").lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
+VERL_SGLANG_GENERATE_LOG_BASE = "verl_sglang_generate_log"
+_verl_sglang_generate_log_lock = threading.Lock()
+
+_SGLANG_RUNTIME_ENV_KEYS = (
+    "SGLANG_DISABLE_CUDNN_CHECK",
+    "SGLANG_LOG_INFERENCE_STEP",
+    "SGLANG_INFERENCE_LOG_DIR",
+    "SGLANG_INFERENCE_LOG_SUFFIX",
+    "SGLANG_GRPO_SIM_CACHE",
+    "SGLANG_GRPO_SIM_RAW_COSINE_THRESH",
+    "SGLANG_GRPO_SIM_RAW_COSINE_RATIO",
+    "SGLANG_GRPO_REUSE_MODE",
+    "SGLANG_GRPO_ENABLE_PARTIAL_VIT_REUSE",
+    "SGLANG_GRPO_PARTIAL_REUSE_THRESHOLD",
+    "SGLANG_GRPO_PARTIAL_REUSE_GRANULARITY",
+    "SGLANG_GRPO_SIM_TARGET_TURNS",
+    "SGLANG_GRPO_SIM_MAX_GROUPS",
+    "SGLANG_GRPO_SIM_MAX_REQUEST_META",
+    "TORCH_CUDA_ARCH_LIST",
+    "PYTHONPATH",
+)
+
+# Any env var with one of these prefixes is forwarded to the Ray SGLang server actors.
+# The SGLang side reads SGLANG_VLM_CACHEBLEND* at module import time, so the whole VLM
+# CacheBlend path is off inside the actor unless these are forwarded. Using a prefix
+# (rather than a fixed list) keeps new knobs working without updating two files.
+_SGLANG_RUNTIME_ENV_PREFIXES = ("SGLANG_VLM_CACHEBLEND",)
+
+
+def _sglang_runtime_env_vars() -> dict[str, str]:
+    """Forward profiling / compatibility env vars to Ray SGLang server actors."""
+    out: dict[str, str] = {}
+    for key in _SGLANG_RUNTIME_ENV_KEYS:
+        val = os.environ.get(key)
+        if val is not None and val != "":
+            out[key] = val
+    for key, val in os.environ.items():
+        if key in out or val == "":
+            continue
+        if key.startswith(_SGLANG_RUNTIME_ENV_PREFIXES):
+            out[key] = val
+    return out
+
+
+def _get_verl_sglang_generate_log_path() -> str:
+    log_dir = os.environ.get("SGLANG_INFERENCE_LOG_DIR", ".")
+    suffix = os.environ.get("SGLANG_INFERENCE_LOG_SUFFIX", "")
+    filename = (
+        f"{VERL_SGLANG_GENERATE_LOG_BASE}_{suffix}.csv"
+        if suffix
+        else f"{VERL_SGLANG_GENERATE_LOG_BASE}.csv"
+    )
+    return os.path.join(log_dir, filename)
+
+
+def _count_multimodal_leaves(data) -> int:
+    if data is None:
+        return 0
+    if isinstance(data, (str, bytes)):
+        return 1
+    if isinstance(data, dict):
+        return 1
+    if isinstance(data, (list, tuple)):
+        if not data:
+            return 0
+        return sum(_count_multimodal_leaves(item) for item in data)
+    return 1
+
+
+def _resolve_image_token_id(model_config: HFModelConfig) -> int | None:
+    processor = getattr(model_config, "processor", None)
+    image_token_id = get_processor_token_id(processor, "image")
+    if image_token_id is not None:
+        return image_token_id
+
+    hf_config = getattr(model_config, "hf_config", None)
+    if hf_config is not None:
+        config_image_token_id = getattr(hf_config, "image_token_id", None)
+        if config_image_token_id is not None:
+            return int(config_image_token_id)
+
+    return None
+
+
+def _prompt_image_text_token_stats(prompt_ids: list[int], model_config: HFModelConfig) -> dict[str, int | float]:
+    """Per-request prompt-level image pad vs text token counts from prompt_ids."""
+    prompt_tokens = len(prompt_ids)
+    image_token_id = _resolve_image_token_id(model_config)
+    if image_token_id is None or prompt_tokens == 0:
+        return {
+            "image_prompt_tokens": 0,
+            "text_prompt_tokens": prompt_tokens,
+            "image_prompt_ratio": 0.0,
+        }
+
+    image_prompt_tokens = sum(1 for token_id in prompt_ids if token_id == image_token_id)
+    text_prompt_tokens = prompt_tokens - image_prompt_tokens
+    image_prompt_ratio = image_prompt_tokens / prompt_tokens
+    return {
+        "image_prompt_tokens": image_prompt_tokens,
+        "text_prompt_tokens": text_prompt_tokens,
+        "image_prompt_ratio": image_prompt_ratio,
+    }
+
+
+def _meta_timing_ms(meta_info: dict, key: str) -> float | None:
+    """Extract SGLang meta_info timing; values are perf_counter deltas in seconds."""
+    val = meta_info.get(key)
+    if val is None:
+        return None
+    try:
+        seconds = float(val)
+    except (TypeError, ValueError):
+        return None
+    return seconds * 1000.0
+
+
+def _append_verl_sglang_generate_log(**row):
+    if not VERL_SGLANG_GENERATE_LOG_ENABLED:
+        return
+    csv_path = _get_verl_sglang_generate_log_path()
+    os.makedirs(os.path.dirname(os.path.abspath(csv_path)), exist_ok=True)
+    with _verl_sglang_generate_log_lock:
+        file_exists = os.path.exists(csv_path)
+        write_header = not file_exists or os.path.getsize(csv_path) == 0
+        if file_exists and not write_header:
+            with open(csv_path, "r", newline="") as f:
+                first_line = f.readline().strip()
+            write_header = first_line.split(",") != list(row.keys())
+        with open(csv_path, "a", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=list(row.keys()))
+            if write_header:
+                writer.writeheader()
+            writer.writerow(row)
+
 
 visible_devices_keyword = get_visible_devices_keyword()
 
@@ -329,6 +476,10 @@ class SGLangHttpServer:
             # start sglang metrics
             args["enable_metrics"] = True
 
+        # Per-request queue/prefill timing in meta_info (needs enable_metrics).
+        if VERL_SGLANG_GENERATE_LOG_ENABLED:
+            args["enable_metrics"] = True
+
         # enable_weights_cpu_backup is supported in sglang>=0.5.3
         if "enable_weights_cpu_backup" in [f.name for f in dataclasses.fields(ServerArgs)]:
             enable_weights_cpu_backup = (
@@ -371,33 +522,32 @@ class SGLangHttpServer:
         # https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/entrypoints/http_server.py
         sglang.srt.entrypoints.engine._set_envs_and_config = _set_envs_and_config
         os.environ["SGLANG_BLOCK_NONZERO_RANK_CHILDREN"] = "0"
+        if VERL_SGLANG_GENERATE_LOG_ENABLED and os.environ.get("SGLANG_DISABLE_CUDNN_CHECK") is None:
+            os.environ["SGLANG_DISABLE_CUDNN_CHECK"] = "1"
         server_args = ServerArgs(**args)
-        # For SGLang main branch or version >= 0.5.10
-        # The latest main branch of SGLang has wrapped the _launch_subprocesses function inside the Engine class
+        # Prefer signature detection over sglang.__version__: local patched/main
+        # builds can expose the newer launcher API while keeping an older version.
         if version.parse(sglang.__version__) >= version.parse("0.5.10"):
             from sglang.srt.entrypoints.http_server import Engine
 
-            self.tokenizer_manager, self.template_manager, self.scheduler_info, *_ = Engine._launch_subprocesses(
-                server_args=server_args,
-                init_tokenizer_manager_func=sglang.srt.entrypoints.engine.init_tokenizer_manager,
-                run_scheduler_process_func=sglang.srt.entrypoints.engine.run_scheduler_process,
-                run_detokenizer_process_func=sglang.srt.entrypoints.engine.run_detokenizer_process,
-            )
-        elif version.parse(sglang.__version__) >= version.parse("0.5.7"):
-            from sglang.srt.entrypoints.http_server import _launch_subprocesses
-
-            self.tokenizer_manager, self.template_manager, self.scheduler_info, *_ = _launch_subprocesses(
-                server_args=server_args,
-                init_tokenizer_manager_func=sglang.srt.entrypoints.engine.init_tokenizer_manager,
-                run_scheduler_process_func=sglang.srt.entrypoints.engine.run_scheduler_process,
-                run_detokenizer_process_func=sglang.srt.entrypoints.engine.run_detokenizer_process,
-            )
+            launch_subprocesses = Engine._launch_subprocesses
         else:
             from sglang.srt.entrypoints.http_server import _launch_subprocesses
 
-            self.tokenizer_manager, self.template_manager, self.scheduler_info, *_ = _launch_subprocesses(
-                server_args=server_args
+            launch_subprocesses = _launch_subprocesses
+
+        launch_kwargs = {"server_args": server_args}
+        launch_params = inspect.signature(launch_subprocesses).parameters
+        if "init_tokenizer_manager_func" in launch_params:
+            launch_kwargs.update(
+                {
+                    "init_tokenizer_manager_func": sglang.srt.entrypoints.engine.init_tokenizer_manager,
+                    "run_scheduler_process_func": sglang.srt.entrypoints.engine.run_scheduler_process,
+                    "run_detokenizer_process_func": sglang.srt.entrypoints.engine.run_detokenizer_process,
+                }
             )
+
+        self.tokenizer_manager, self.template_manager, self.scheduler_info, *_ = launch_subprocesses(**launch_kwargs)
 
         # In multi-node cases, non-zero rank nodes should not launch http server.
         if self.node_rank > 0:
@@ -503,6 +653,10 @@ class SGLangHttpServer:
         bootstrap_host: Optional[str] = None,
         bootstrap_port: Optional[int] = None,
         bootstrap_room: Optional[int] = None,
+        agent_request_id: Optional[str] = None,
+        agent_turn: Optional[int] = None,
+        agent_uid: Optional[str] = None,
+        rollout_idx: Optional[str] = None,
     ) -> TokenOutput:
         # PD top-level dispatch: prefill mints a bootstrap_room and fans out
         # paired local-prefill + remote-decode calls; decode returns the tokens
@@ -520,6 +674,10 @@ class SGLangHttpServer:
                 bootstrap_host=self._pd_bootstrap_host,
                 bootstrap_port=self._disaggregation_bootstrap_port,
                 bootstrap_room=room,
+                agent_request_id=agent_request_id,
+                agent_turn=agent_turn,
+                agent_uid=agent_uid,
+                rollout_idx=rollout_idx,
             )
             decode_coro = decode_peer.generate.remote(
                 prompt_ids,
@@ -530,11 +688,16 @@ class SGLangHttpServer:
                 bootstrap_host=self._pd_bootstrap_host,
                 bootstrap_port=self._disaggregation_bootstrap_port,
                 bootstrap_room=room,
+                agent_request_id=agent_request_id,
+                agent_turn=agent_turn,
+                agent_uid=agent_uid,
+                rollout_idx=rollout_idx,
             )
             _, decode_output = await asyncio.gather(prefill_coro, decode_coro)
             return decode_output
 
         # TODO(@wuxibin): switch to `/generate` http endpoint once multi-modal support ready.
+        generate_e2e_start = time.perf_counter()
         max_possible_tokens = self.config.max_model_len - len(prompt_ids) - 1
 
         if max_possible_tokens < 0:
@@ -577,6 +740,10 @@ class SGLangHttpServer:
             "sampling_params": sampling_params,
             "return_logprob": return_logprob,
             "image_data": image_data,
+            "agent_uid": agent_uid,
+            "agent_turn": agent_turn,
+            "agent_request_id": agent_request_id,
+            "rollout_idx": rollout_idx,
             # TODO: support video input for sglang
             # video_data=video_data,
         }
@@ -585,6 +752,9 @@ class SGLangHttpServer:
             request["logprob_start_len"] = 0
             if prompt_logprobs > 0:
                 request["top_logprobs_num"] = prompt_logprobs
+
+        if self.global_steps is not None:
+            request["training_global_step"] = self.global_steps
 
         if self.config.enable_rollout_routing_replay:
             request.update({"return_routed_experts": True})
@@ -601,7 +771,24 @@ class SGLangHttpServer:
         if self.model_config.lora_rank > 0:
             generate_request.lora_path = SGLANG_LORA_NAME
 
+        try:
+            from sglang.srt.mem_cache.grpo_similarity_cache import register_request_meta
+
+            register_request_meta(
+                request_id,
+                agent_uid=agent_uid,
+                agent_turn=agent_turn,
+                agent_request_id=agent_request_id,
+                global_step=self.global_steps,
+            )
+        except Exception:
+            pass
+
+        verl_prepare_ms = (time.perf_counter() - generate_e2e_start) * 1000
+        sglang_call_start = time.perf_counter()
         output = await self.tokenizer_manager.generate_request(generate_request, None).__anext__()
+        sglang_call_end = time.perf_counter()
+        sglang_call_ms = (sglang_call_end - sglang_call_start) * 1000
         meta_info = output.get("meta_info", {})
         finish_reason = meta_info.get("finish_reason")
         finish_reason = finish_reason["type"] if finish_reason else None
@@ -642,6 +829,38 @@ class SGLangHttpServer:
                 routed_experts = extract_routed_experts_from_meta_info(output).reshape(
                     -1, hf_config.num_hidden_layers, hf_config.num_experts_per_tok
                 )
+        verl_post_ms = (time.perf_counter() - sglang_call_end) * 1000
+        generate_e2e_ms = verl_prepare_ms + sglang_call_ms + verl_post_ms
+        prompt_token_stats = _prompt_image_text_token_stats(prompt_ids, self.model_config)
+        queue_ms = _meta_timing_ms(meta_info, "queue_time")
+        prefill_launch_delay_ms = _meta_timing_ms(meta_info, "prefill_launch_delay")
+        prefill_launch_latency_ms = _meta_timing_ms(meta_info, "prefill_launch_latency")
+        _append_verl_sglang_generate_log(
+            request_id=request_id,
+            agent_request_id=agent_request_id or "",
+            agent_turn="" if agent_turn is None else int(agent_turn),
+            agent_uid=agent_uid or "",
+            rollout_idx="" if rollout_idx is None else str(rollout_idx),
+            prompt_tokens=len(prompt_ids),
+            image_prompt_tokens=prompt_token_stats["image_prompt_tokens"],
+            text_prompt_tokens=prompt_token_stats["text_prompt_tokens"],
+            image_prompt_ratio=f"{prompt_token_stats['image_prompt_ratio']:.4f}",
+            output_tokens=len(token_ids),
+            max_new_tokens=max_new_tokens,
+            image_count=_count_multimodal_leaves(image_data),
+            has_image=int(image_data is not None),
+            generate_e2e_ms=f"{generate_e2e_ms:.2f}",
+            verl_prepare_ms=f"{verl_prepare_ms:.2f}",
+            sglang_call_ms=f"{sglang_call_ms:.2f}",
+            verl_post_ms=f"{verl_post_ms:.2f}",
+            queue_time_ms=f"{queue_ms:.2f}" if queue_ms is not None else "",
+            prefill_launch_delay_ms=f"{prefill_launch_delay_ms:.2f}" if prefill_launch_delay_ms is not None else "",
+            prefill_launch_latency_ms=f"{prefill_launch_latency_ms:.2f}"
+            if prefill_launch_latency_ms is not None
+            else "",
+            global_step=self.global_steps if self.global_steps is not None else -1,
+            finish_reason=finish_reason or "",
+        )
 
         extra_fields = {"global_steps": self.global_steps}
         if prompt_logprobs is not None:
@@ -773,7 +992,12 @@ class SGLangReplica(RolloutReplica):
                     node_id=node_id,
                     soft=False,
                 ),
-                runtime_env={"env_vars": {f"RAY_EXPERIMENTAL_NOSET_{visible_devices_keyword}": "1"}},
+                runtime_env={
+                    "env_vars": {
+                        f"RAY_EXPERIMENTAL_NOSET_{visible_devices_keyword}": "1",
+                        **_sglang_runtime_env_vars(),
+                    }
+                },
                 name=name,
                 max_concurrency=self.max_concurrency,
             ).remote(

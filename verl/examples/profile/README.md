@@ -1,8 +1,10 @@
 # Profiling Examples
 
-End-to-end GRPO runs that enable one of verl's profilers so you can capture a performance/memory trace without authoring a bespoke launcher. All scripts use the current `verl.trainer.main_ppo` entry point and the current Hydra API.
+Upstream verl profiler scripts (NPU / torch memory) live in this directory.
 
-## Canonical Scripts
+**Vision token reuse experiments** (Geo3K / Sokoban / Chart workloads) are documented in **[WORKLOADS.md](WORKLOADS.md)**.
+
+## Canonical Scripts (upstream)
 
 | Script                                  | Profiler      | Model              | Infer  | Train | Platform |
 |-----------------------------------------|---------------|--------------------|--------|-------|----------|

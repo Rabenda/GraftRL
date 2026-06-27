@@ -13,6 +13,7 @@
 # ==============================================================================
 """ModelRunner runs the forward passes of the models."""
 
+import csv
 import datetime
 import gc
 import inspect
@@ -228,6 +229,219 @@ UNBALANCED_MODEL_LOADING_TIMEOUT_S = 480  # leave more time for post data proces
 
 
 logger = logging.getLogger(__name__)
+
+
+LOG_INFERENCE_STEP = os.environ.get("SGLANG_LOG_INFERENCE_STEP", "0").lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
+GRPO_SIM_CACHE_ENABLED = os.environ.get("SGLANG_GRPO_SIM_CACHE", "0").lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
+VLM_CACHEBLEND_ENABLED = os.environ.get("SGLANG_VLM_CACHEBLEND", "0").lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
+LOG_INFERENCE_STEP_CSV_BASE = "model_forward_log"
+_inference_log_lock = threading.Lock()
+_CACHEBLEND_LOG_FIELDS = [
+    "cacheblend_role",
+    "cacheblend_used",
+    "cacheblend_eligible",
+    "cacheblend_fallback_reason",
+    "cacheblend_request_id",
+    "cacheblend_n_image_tokens",
+    "cacheblend_reused_tokens",
+    "cacheblend_recomputed_tokens",
+    "cacheblend_pos_mode",
+    "cacheblend_select_mode",
+    "cacheblend_recompute_ratio",
+    "cacheblend_extend_wall_ms",
+    "cacheblend_attention_skipped_tokens",
+    "cacheblend_attention_active_ranges",
+]
+
+
+def _get_inference_log_csv_path() -> str:
+    log_dir = os.environ.get("SGLANG_INFERENCE_LOG_DIR", ".")
+    suffix = os.environ.get("SGLANG_INFERENCE_LOG_SUFFIX", "")
+    filename = (
+        f"{LOG_INFERENCE_STEP_CSV_BASE}_{suffix}.csv"
+        if suffix
+        else f"{LOG_INFERENCE_STEP_CSV_BASE}.csv"
+    )
+    return os.path.join(log_dir, filename)
+
+
+def _append_inference_step_log(
+    *,
+    pass_id: int,
+    mode: str,
+    batch_size: int,
+    prefill_tokens: int,
+    decode_tokens: int,
+    avg_seq_len: float,
+    forward_time_ms: float,
+    global_step: int,
+    cacheblend_fields: Optional[dict] = None,
+):
+    csv_path = _get_inference_log_csv_path()
+    os.makedirs(os.path.dirname(os.path.abspath(csv_path)), exist_ok=True)
+    row = {
+        "timestamp": f"{time.time():.6f}",
+        "pid": os.getpid(),
+        "pass_id": pass_id,
+        "mode": mode,
+        "batch_size": batch_size,
+        "prefill_tokens": prefill_tokens,
+        "decode_tokens": decode_tokens,
+        "avg_seq_len": f"{avg_seq_len:.2f}",
+        "forward_time_ms": f"{forward_time_ms:.2f}",
+        "global_step": global_step,
+    }
+    if cacheblend_fields:
+        row.update(cacheblend_fields)
+    if VLM_CACHEBLEND_ENABLED:
+        for field in _CACHEBLEND_LOG_FIELDS:
+            row.setdefault(field, "")
+    with _inference_log_lock:
+        file_exists = os.path.exists(csv_path)
+        write_header = not file_exists or os.path.getsize(csv_path) == 0
+        with open(csv_path, "a", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=list(row.keys()))
+            if write_header:
+                writer.writeheader()
+            writer.writerow(row)
+
+
+def _forward_batch_request_ids(forward_batch) -> list[str]:
+    reqs = getattr(forward_batch, "reqs", None) or []
+    request_ids = []
+    for req in reqs:
+        rid = getattr(req, "rid", None)
+        if rid is not None and str(rid):
+            request_ids.append(str(rid))
+    return request_ids
+
+
+def _forward_batch_item_hash_to_rid(forward_batch) -> dict:
+    """Map each multimodal item hash to its owning request id.
+
+    A batched EXTEND runs one ViT call per request, but the profile context is set
+    once for the whole batch. Logging the full batch's request_ids on every encode
+    row makes per-request attribution impossible. This map lets the vision encoder
+    record the single request that each encode actually belongs to (keyed by the
+    item hash, so it is order-independent and robust to mixed image/text batches).
+    """
+    reqs = getattr(forward_batch, "reqs", None) or []
+    mapping: dict = {}
+    for req in reqs:
+        rid = getattr(req, "rid", None)
+        if rid is None or not str(rid):
+            continue
+        mm = getattr(req, "multimodal_inputs", None)
+        items = getattr(mm, "mm_items", None) if mm is not None else None
+        if not items:
+            continue
+        for it in items:
+            h = getattr(it, "hash", None)
+            if h is not None:
+                mapping[h] = str(rid)
+    return mapping
+
+
+def _register_grpo_request_meta_for_forward_batch(forward_batch) -> None:
+    if not (GRPO_SIM_CACHE_ENABLED or VLM_CACHEBLEND_ENABLED):
+        return
+    try:
+        from sglang.srt.mem_cache.grpo_similarity_cache import register_request_meta
+    except Exception:
+        return
+
+    reqs = getattr(forward_batch, "reqs", None) or []
+    for req in reqs:
+        rid = getattr(req, "rid", None)
+        if rid is None or not str(rid):
+            continue
+        try:
+            register_request_meta(
+                str(rid),
+                agent_uid=getattr(req, "agent_uid", None),
+                agent_turn=getattr(req, "agent_turn", None),
+                agent_request_id=getattr(req, "agent_request_id", None),
+                global_step=getattr(req, "training_global_step", None),
+            )
+        except Exception:
+            continue
+
+
+def _set_qwen25_vl_profile_context(
+    global_step: int,
+    pass_id: int,
+    mode: str,
+    prefill_tokens: int = 0,
+    request_ids: Optional[list[str]] = None,
+    item_hash_to_rid: Optional[dict] = None,
+):
+    try:
+        from sglang.srt.models.qwen2_5_vl import set_qwen25_vl_profile_context
+
+        set_qwen25_vl_profile_context(
+            global_step,
+            pass_id,
+            mode,
+            prefill_tokens,
+            request_ids=request_ids,
+            item_hash_to_rid=item_hash_to_rid,
+        )
+    except Exception:
+        pass
+
+
+def _set_vlm_cacheblend_context(forward_batch, image_token_id: Optional[int]) -> None:
+    try:
+        from sglang.srt.mem_cache import vlm_cacheblend
+
+        ctx = vlm_cacheblend.build_request_context_from_forward_batch(
+            forward_batch,
+            image_token_id=image_token_id,
+        )
+        vlm_cacheblend.set_request_context(ctx)
+    except Exception:
+        try:
+            from sglang.srt.mem_cache import vlm_cacheblend
+
+            vlm_cacheblend.set_request_context(None)
+        except Exception:
+            pass
+
+
+def _clear_vlm_cacheblend_context() -> None:
+    try:
+        from sglang.srt.mem_cache import vlm_cacheblend
+
+        vlm_cacheblend.set_request_context(None)
+    except Exception:
+        pass
+
+
+def _pop_vlm_cacheblend_log_fields() -> Optional[dict]:
+    try:
+        from sglang.srt.mem_cache import vlm_cacheblend
+
+        stats = vlm_cacheblend.pop_last_stats()
+        if stats is None:
+            stats = vlm_cacheblend.CacheBlendStats()
+        return stats.to_dict() if stats is not None else None
+    except Exception:
+        return None
 
 
 def resolve_language_model(model: nn.Module) -> nn.Module:
@@ -2227,32 +2441,31 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         split_forward_count: int = 1,
     ) -> ModelRunnerOutput:
         self.forward_pass_id += 1
-
-        with get_global_expert_distribution_recorder().with_forward_pass(
-            self.forward_pass_id,
-            forward_batch,
-        ) as recorder_outputs:
-            output = self._forward_raw(
-                forward_batch,
-                skip_attn_backend_init,
-                pp_proxy_tensors,
-                reinit_attn_backend,
-                split_forward_count,
+        inference_step_start = time.perf_counter()
+        if LOG_INFERENCE_STEP or GRPO_SIM_CACHE_ENABLED:
+            _register_grpo_request_meta_for_forward_batch(forward_batch)
+            _set_qwen25_vl_profile_context(
+                getattr(forward_batch, "training_global_step", -1),
+                self.forward_pass_id,
+                forward_batch.forward_mode.name,
+                forward_batch.extend_num_tokens
+                if forward_batch.forward_mode.is_extend()
+                else 0,
+                request_ids=_forward_batch_request_ids(forward_batch),
+                item_hash_to_rid=_forward_batch_item_hash_to_rid(forward_batch),
             )
-            elastic_ep_state = ElasticEPStateManager.instance()
-            if (
-                elastic_ep_state is not None
-                and not elastic_ep_state.is_active_equal_last()
-            ):
-                elastic_ep_state.snapshot_active_to_last()
-                elastic_ep_state.sync_active_to_cpu()
-                logging.info("EPLB due to rank faults")
-                gen = self.eplb_manager.rebalance()
-                while True:
-                    try:
-                        next(gen)
-                    except StopIteration:
-                        break
+        if VLM_CACHEBLEND_ENABLED:
+            _register_grpo_request_meta_for_forward_batch(forward_batch)
+            _set_vlm_cacheblend_context(
+                forward_batch,
+                getattr(self.model_config, "image_token_id", None),
+            )
+
+        try:
+            with get_global_expert_distribution_recorder().with_forward_pass(
+                self.forward_pass_id,
+                forward_batch,
+            ) as recorder_outputs:
                 output = self._forward_raw(
                     forward_batch,
                     skip_attn_backend_init,
@@ -2260,7 +2473,34 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     reinit_attn_backend,
                     split_forward_count,
                 )
+                elastic_ep_state = ElasticEPStateManager.instance()
+                if (
+                    elastic_ep_state is not None
+                    and not elastic_ep_state.is_active_equal_last()
+                ):
+                    elastic_ep_state.snapshot_active_to_last()
+                    elastic_ep_state.sync_active_to_cpu()
+                    logging.info("EPLB due to rank faults")
+                    gen = self.eplb_manager.rebalance()
+                    while True:
+                        try:
+                            next(gen)
+                        except StopIteration:
+                            break
+                    output = self._forward_raw(
+                        forward_batch,
+                        skip_attn_backend_init,
+                        pp_proxy_tensors,
+                        reinit_attn_backend,
+                        split_forward_count,
+                    )
+        finally:
+            if VLM_CACHEBLEND_ENABLED:
+                _clear_vlm_cacheblend_context()
         output.expert_distribution_metrics = recorder_outputs.get("metrics")
+        cacheblend_fields = (
+            _pop_vlm_cacheblend_log_fields() if VLM_CACHEBLEND_ENABLED else None
+        )
 
         # Copy cached routing experts' buffers back to CPU cache
         get_global_experts_capturer().on_forward_end(
@@ -2271,6 +2511,38 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         if self.eplb_manager is not None:
             self.eplb_manager.on_forward_pass_end()
+
+        if LOG_INFERENCE_STEP and self.tp_rank == 0:
+            try:
+                if self.device == "cuda":
+                    torch.cuda.synchronize()
+                elif hasattr(torch, self.device):
+                    getattr(torch, self.device).synchronize()
+            except Exception:
+                pass
+
+            forward_time_ms = (time.perf_counter() - inference_step_start) * 1000
+            batch_size = forward_batch.batch_size
+            prefill_tokens = (
+                forward_batch.extend_num_tokens
+                if forward_batch.forward_mode.is_extend()
+                else 0
+            )
+            decode_tokens = batch_size if forward_batch.forward_mode.is_decode() else 0
+            avg_seq_len = (
+                forward_batch.seq_lens_sum / batch_size if batch_size > 0 else 0.0
+            )
+            _append_inference_step_log(
+                pass_id=self.forward_pass_id,
+                mode=forward_batch.forward_mode.name,
+                batch_size=batch_size,
+                prefill_tokens=prefill_tokens,
+                decode_tokens=decode_tokens,
+                avg_seq_len=avg_seq_len,
+                forward_time_ms=forward_time_ms,
+                global_step=getattr(forward_batch, "training_global_step", -1),
+                cacheblend_fields=cacheblend_fields,
+            )
 
         return output
 

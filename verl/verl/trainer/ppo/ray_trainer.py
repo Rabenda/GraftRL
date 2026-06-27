@@ -427,6 +427,56 @@ class RayPPOTrainer:
 
         print(f"Dumped generations to {filename}")
 
+    @staticmethod
+    def _to_jsonable_list(values):
+        if isinstance(values, np.ndarray):
+            values = values.tolist()
+        if isinstance(values, torch.Tensor):
+            values = values.detach().cpu().tolist()
+        return values
+
+    def _rollout_profile_fields_to_dump(self, batch: DataProto) -> dict:
+        """Select per-sample non-tensor fields that make rollout dumps branch-addressable."""
+        default_keys = {
+            "__num_turns__",
+            "uid",
+            "request_id",
+            "rollout_idx",
+            "vtool_final_response_text",
+            "vtool_refocus_source",
+            "vtool_tool_attempted",
+            "vtool_tool_success",
+            "vtool_oracle_diversify",
+            "vtool_diversified_applied",
+            "vtool_diversified_variant",
+            "vtool_model_refocus_code",
+            "oracle_refocus",
+        }
+        extra_keys = {
+            key.strip()
+            for key in os.environ.get("VERL_ROLLOUT_DUMP_EXTRA_KEYS", "").split(",")
+            if key.strip()
+        }
+        selected = {}
+        for key in sorted(default_keys | extra_keys):
+            if key not in batch.non_tensor_batch:
+                continue
+            values = self._to_jsonable_list(batch.non_tensor_batch[key])
+            if len(values) == len(batch):
+                selected[key] = values
+
+        final_text = selected.get("vtool_final_response_text")
+        if final_text is not None:
+            selected.setdefault("final_response_text", final_text)
+            selected.setdefault("response_text", final_text)
+        uid = selected.get("uid")
+        if uid is not None:
+            selected.setdefault("agent_uid", uid)
+        turns = selected.get("__num_turns__")
+        if turns is not None:
+            selected.setdefault("num_turns", turns)
+        return selected
+
     def _log_rollout_data(
         self, batch: DataProto, reward_extra_infos_dict: dict, timing_raw: dict, rollout_data_dir: str
     ):
@@ -440,17 +490,20 @@ class RayPPOTrainer:
         with marked_timer("dump_rollout_generations", timing_raw, color="green"):
             inputs = self.tokenizer.batch_decode(batch.batch["prompts"], skip_special_tokens=True)
             outputs = self.tokenizer.batch_decode(batch.batch["responses"], skip_special_tokens=True)
-            scores = batch.batch["token_level_scores"].sum(-1).cpu().tolist()
+            if "token_level_scores" in batch.batch:
+                scores = batch.batch["token_level_scores"].sum(-1).cpu().tolist()
+            elif "rm_scores" in batch.batch:
+                scores = batch.batch["rm_scores"].sum(-1).cpu().tolist()
+            else:
+                scores = [None] * len(batch)
             sample_gts = [item.non_tensor_batch.get("reward_model", {}).get("ground_truth", None) for item in batch]
 
             reward_extra_infos_to_dump = {
                 k: (v.tolist() if isinstance(v, np.ndarray) else v) for k, v in reward_extra_infos_dict.items()
             }
-            if "request_id" in batch.non_tensor_batch:
-                reward_extra_infos_to_dump.setdefault(
-                    "request_id",
-                    batch.non_tensor_batch["request_id"].tolist(),
-                )
+            reward_extra_infos_to_dump.update(self._rollout_profile_fields_to_dump(batch))
+            reward_extra_infos_to_dump.setdefault("reward_score", scores)
+            reward_extra_infos_to_dump.setdefault("compute_score", scores)
 
             self._dump_generations(
                 inputs=inputs,
@@ -1431,6 +1484,14 @@ class RayPPOTrainer:
 
                         # extract reward_tensor and reward_extra_infos_dict for training
                         reward_tensor, reward_extra_infos_dict = extract_reward(batch)
+
+                    if os.environ.get("VERL_PROFILE_ROLLOUT_ONLY", "0") == "1":
+                        rollout_data_dir = self.config.trainer.get("rollout_data_dir", None)
+                        if rollout_data_dir:
+                            self._log_rollout_data(batch, reward_extra_infos_dict, timing_raw, rollout_data_dir)
+                        print("VERL_PROFILE_ROLLOUT_ONLY=1: exiting after rollout/reward dump.")
+                        progress_bar.close()
+                        return
 
                     # Operating Mode Selection:
                     # - Bypass mode: Sets old_log_probs = rollout_log_probs (2 policies: π_rollout, π_θ)
