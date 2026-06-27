@@ -1,0 +1,43 @@
+# Logs and profiling artifacts
+profile_logs*/
+**/image_dump*/
+**/rollout_data*/
+
+# Data and large binaries
+data/
+*.parquet
+*.arrow
+
+# Papers and local references (link in README instead)
+*.pdf
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+dist/
+build/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Environment
+.env
+.env.*
+venv/
+.venv/
+
+# IDE / OS
+.idea/
+.vscode/
+*.swp
+.DS_Store
+
+# CUDA / torch
+*.pt
+*.pth
+*.safetensors
+
+# Patch exports (prefer real commits)
+sglang_vision_profile.patch

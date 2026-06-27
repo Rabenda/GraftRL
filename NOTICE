@@ -1,0 +1,8 @@
+GraftRL monorepo
+
+This project bundles customized forks of:
+
+- verl (https://github.com/verl-project/verl)
+- SGLang (https://github.com/sgl-project/sglang)
+
+See LICENSE files in verl/ and sglang/ subtrees for upstream terms.
