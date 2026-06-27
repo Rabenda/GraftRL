@@ -145,6 +145,11 @@ class Session:
             top_logprobs_num=req.top_logprobs_num,
             token_ids_logprob=req.token_ids_logprob,
             vocab_size=vocab_size,
+            training_global_step=getattr(req, "training_global_step", None),
+            agent_uid=getattr(req, "agent_uid", None),
+            agent_turn=getattr(req, "agent_turn", None),
+            agent_request_id=getattr(req, "agent_request_id", None),
+            rollout_idx=getattr(req, "rollout_idx", None),
         )
         if last_req is not None:
             new_req.multimodal_inputs = last_req.multimodal_inputs

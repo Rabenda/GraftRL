@@ -1472,6 +1472,11 @@ class Scheduler(
                 ),
                 routing_key=recv_req.routing_key,
                 http_worker_ipc=recv_req.http_worker_ipc,
+                training_global_step=recv_req.training_global_step,
+                agent_uid=recv_req.agent_uid,
+                agent_turn=recv_req.agent_turn,
+                agent_request_id=recv_req.agent_request_id,
+                rollout_idx=recv_req.rollout_idx,
                 dllm_config=self.dllm_config,
             )
             req.tokenizer = self.tokenizer
