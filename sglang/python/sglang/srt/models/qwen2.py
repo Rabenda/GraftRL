@@ -55,7 +55,7 @@ from sglang.srt.utils import add_prefix, make_layers
 # VLM-CacheBlend (§6 LLM-prefill visual-KV reuse). Import is always safe; all behaviour
 # is gated behind the SGLANG_VLM_CACHEBLEND macro (default off) and a per-request
 # context, so the baseline path is unchanged when disabled.
-# Design: verl_vision/examples/profile/shared/docs/VLM_CACHEBLEND_DESIGN.md
+# Design: docs/GraftRL_项目全历程.md
 from sglang.srt.mem_cache import vlm_cacheblend as _vlm_cacheblend
 
 Qwen2Config = None

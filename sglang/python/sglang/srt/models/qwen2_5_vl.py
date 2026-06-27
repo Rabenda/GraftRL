@@ -532,8 +532,7 @@ class Qwen2_5_VisionPatchMerger(nn.Module):
 class Qwen2_5_VisionTransformer(nn.Module, RotaryPosMixin):
     """Qwen2.5-VL vision tower.
 
-    End-to-end image encoding pipeline (see also
-    verl_vision/.../PARTIAL_WINDOW_REUSE_EXPERIMENT_SUMMARY.md §9):
+    End-to-end image encoding pipeline (see also docs/GraftRL_项目全历程.md §4):
 
         image pixels
           ↓ 1. patch_embed          — patchify; ~4640 patch tokens (1280-d)

@@ -11,7 +11,7 @@ branches; only a small high-deviation subset of visual tokens is recomputed to r
 cross-attention.
 
 Design doc:
-    verl_vision/examples/profile/shared/docs/VLM_CACHEBLEND_DESIGN.md
+    docs/GraftRL_项目全历程.md (repo root graftrl/docs/)
 
 Everything is gated behind ``SGLANG_VLM_CACHEBLEND`` (default off). When disabled, the
 SGLang code path is byte-for-byte the original; this file is import-safe and never runs
