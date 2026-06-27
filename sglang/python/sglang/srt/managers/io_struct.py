@@ -239,6 +239,15 @@ class GenerateReqInput(BaseReq, APIServingTimingMixin):
     # Conversation id used for tracking requests
     conversation_id: Optional[str] = None
 
+    # Training step metadata for external profiling.
+    training_global_step: Optional[Union[List[Optional[int]], int]] = None
+
+    # Agent-loop metadata for external profiling and GRPO group-aware caches.
+    agent_uid: Optional[Union[List[Optional[str]], str]] = None
+    agent_turn: Optional[Union[List[Optional[int]], int]] = None
+    agent_request_id: Optional[Union[List[Optional[str]], str]] = None
+    rollout_idx: Optional[Union[List[Optional[str]], str]] = None
+
     # Priority for the request
     priority: Optional[int] = None
 
@@ -670,6 +679,31 @@ class GenerateReqInput(BaseReq, APIServingTimingMixin):
                 self.data_parallel_rank if self.data_parallel_rank is not None else None
             ),
             conversation_id=self.conversation_id,
+            training_global_step=(
+                self.training_global_step[i]
+                if isinstance(self.training_global_step, list)
+                else self.training_global_step
+            ),
+            agent_uid=(
+                self.agent_uid[i]
+                if isinstance(self.agent_uid, list)
+                else self.agent_uid
+            ),
+            agent_turn=(
+                self.agent_turn[i]
+                if isinstance(self.agent_turn, list)
+                else self.agent_turn
+            ),
+            agent_request_id=(
+                self.agent_request_id[i]
+                if isinstance(self.agent_request_id, list)
+                else self.agent_request_id
+            ),
+            rollout_idx=(
+                self.rollout_idx[i]
+                if isinstance(self.rollout_idx, list)
+                else self.rollout_idx
+            ),
             priority=self.priority,
             extra_key=self.extra_key,
             no_logs=self.no_logs,
@@ -740,6 +774,15 @@ class TokenizedGenerateReqInput(BaseReq):
 
     # For data parallel rank routing
     data_parallel_rank: Optional[int] = None
+
+    # Training step metadata for external profiling.
+    training_global_step: Optional[int] = None
+
+    # Agent-loop metadata for external profiling and GRPO group-aware caches.
+    agent_uid: Optional[str] = None
+    agent_turn: Optional[int] = None
+    agent_request_id: Optional[str] = None
+    rollout_idx: Optional[str] = None
 
     # Priority for the request
     priority: Optional[int] = None

@@ -523,6 +523,11 @@ class Req:
         routing_key: Optional[str] = None,
         dimensions: Optional[int] = None,
         http_worker_ipc: Optional[str] = None,
+        training_global_step: Optional[int] = None,
+        agent_uid: Optional[str] = None,
+        agent_turn: Optional[int] = None,
+        agent_request_id: Optional[str] = None,
+        rollout_idx: Optional[str] = None,
     ):
         # Input and output info
         self.rid = rid
@@ -562,6 +567,11 @@ class Req:
 
         # For multi-http worker
         self.http_worker_ipc = http_worker_ipc
+        self.training_global_step = training_global_step
+        self.agent_uid = agent_uid
+        self.agent_turn = agent_turn
+        self.agent_request_id = agent_request_id
+        self.rollout_idx = rollout_idx
 
         # Require reasoning for the request (hybrid reasoning model only)
         self.require_reasoning = require_reasoning
@@ -2237,6 +2247,12 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             dllm_config=self.dllm_config,
             reqs=self.reqs,
             has_grammar=self.has_grammar,
+            training_global_step=(
+                self.reqs[0].training_global_step
+                if self.reqs
+                and getattr(self.reqs[0], "training_global_step", None) is not None
+                else -1
+            ),
             mamba_track_indices=self.mamba_track_indices,
             mamba_track_mask=self.mamba_track_mask,
             mamba_track_seqlens=self.mamba_track_seqlens,
@@ -2419,6 +2435,9 @@ class ModelWorkerBatch:
     # FIXME(lsyin): remove this after fully overlap grammar
     reqs: Optional[List[Req]] = None
     has_grammar: bool = False
+
+    # Training step metadata for external profiling.
+    training_global_step: int = -1
 
     # For hidden states before normal
     return_hidden_states_before_norm: bool = False

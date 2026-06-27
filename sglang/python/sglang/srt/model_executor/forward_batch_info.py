@@ -61,7 +61,7 @@ from sglang.srt.utils.common import ceil_align
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
     from sglang.srt.layers.logits_processor import LogitsProcessorOutput
-    from sglang.srt.managers.schedule_batch import ModelWorkerBatch, MultimodalInputs
+    from sglang.srt.managers.schedule_batch import ModelWorkerBatch, MultimodalInputs, Req
     from sglang.srt.mem_cache.memory_pool import KVCache, ReqToTokenPool
     from sglang.srt.model_executor.model_runner import ModelRunner
     from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
@@ -375,6 +375,12 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # For hidden states before normal
     return_hidden_states_before_norm: bool = False
 
+    # Training step metadata for external profiling.
+    training_global_step: int = -1
+
+    # Source requests in this forward batch (for rollout profiling joins).
+    reqs: Optional[List["Req"]] = None
+
     @classmethod
     def init_new(
         cls,
@@ -419,6 +425,8 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             tbo_split_seq_index=batch.tbo_split_seq_index,
             dimensions=batch.dimensions,
             return_hidden_states_before_norm=batch.return_hidden_states_before_norm,
+            training_global_step=batch.training_global_step,
+            reqs=batch.reqs,
         )
         device = model_runner.device
 

@@ -52,6 +52,12 @@ from sglang.srt.model_loader.weight_utils import (
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import add_prefix, make_layers
 
+# VLM-CacheBlend (§6 LLM-prefill visual-KV reuse). Import is always safe; all behaviour
+# is gated behind the SGLANG_VLM_CACHEBLEND macro (default off) and a per-request
+# context, so the baseline path is unchanged when disabled.
+# Design: verl_vision/examples/profile/shared/docs/VLM_CACHEBLEND_DESIGN.md
+from sglang.srt.mem_cache import vlm_cacheblend as _vlm_cacheblend
+
 Qwen2Config = None
 
 
@@ -181,12 +187,67 @@ class Qwen2Attention(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
-        qkv, _ = self.qkv_proj(hidden_states)
+        reuse_idx = self._cacheblend_reuse_projection_skip_indices(
+            hidden_states, forward_batch
+        )
+        active_idx = None
+        if reuse_idx.numel() > 0 and reuse_idx.numel() < hidden_states.shape[0]:
+            active_mask = torch.ones(
+                hidden_states.shape[0], dtype=torch.bool, device=hidden_states.device
+            )
+            active_mask[reuse_idx] = False
+            active_idx = active_mask.nonzero(as_tuple=False).reshape(-1)
+            qkv = hidden_states.new_zeros(
+                (hidden_states.shape[0], self.q_size + 2 * self.kv_size)
+            )
+            qkv_active, _ = self.qkv_proj(hidden_states.index_select(0, active_idx))
+            qkv[active_idx] = qkv_active
+        elif reuse_idx.numel() >= hidden_states.shape[0]:
+            qkv = hidden_states.new_zeros(
+                (hidden_states.shape[0], self.q_size + 2 * self.kv_size)
+            )
+        else:
+            qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         q, k = self.rotary_emb(positions, q, k)
+        if _vlm_cacheblend.cacheblend_enabled():
+            object.__setattr__(
+                self.attn, "_vlm_cacheblend_rotary_emb", self.rotary_emb
+            )
         attn_output = self.attn(q, k, v, forward_batch)
-        output, _ = self.o_proj(attn_output)
+        if (
+            _vlm_cacheblend.cacheblend_enabled()
+            and _vlm_cacheblend.get_config().unsafe_post_attention_overlay
+        ):
+            _vlm_cacheblend.apply_recipient_kv_blend_for_layer(
+                forward_batch=forward_batch,
+                layer_id=self.attn.layer_id,
+                rotary_emb=self.rotary_emb,
+            )
+        if active_idx is not None:
+            output = hidden_states.new_zeros(hidden_states.shape)
+            projected_active, _ = self.o_proj(attn_output.index_select(0, active_idx))
+            output[active_idx] = projected_active
+        elif reuse_idx.numel() >= hidden_states.shape[0]:
+            output = hidden_states.new_zeros(hidden_states.shape)
+        else:
+            output, _ = self.o_proj(attn_output)
         return output
+
+    @staticmethod
+    def _cacheblend_reuse_projection_skip_indices(
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
+    ) -> torch.Tensor:
+        if not _vlm_cacheblend.cacheblend_enabled():
+            return torch.empty(0, dtype=torch.long, device=hidden_states.device)
+        cfg = _vlm_cacheblend.get_config()
+        if not cfg.fast_path or not cfg.skip_reuse_qkv_proj:
+            return torch.empty(0, dtype=torch.long, device=hidden_states.device)
+        return _vlm_cacheblend.recipient_reuse_token_indices(
+            getattr(forward_batch, "out_cache_loc", None),
+            device=hidden_states.device,
+        )
 
 
 class Qwen2DecoderLayer(nn.Module):
@@ -253,8 +314,36 @@ class Qwen2DecoderLayer(nn.Module):
 
         # Fully Connected
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
-        hidden_states = self.mlp(hidden_states)
+        reuse_idx = self._cacheblend_reuse_mlp_skip_indices(hidden_states, forward_batch)
+        if reuse_idx.numel() > 0 and reuse_idx.numel() < hidden_states.shape[0]:
+            active_mask = torch.ones(
+                hidden_states.shape[0], dtype=torch.bool, device=hidden_states.device
+            )
+            active_mask[reuse_idx] = False
+            active_idx = active_mask.nonzero(as_tuple=False).reshape(-1)
+            mlp_out = torch.zeros_like(hidden_states)
+            mlp_out[active_idx] = self.mlp(hidden_states.index_select(0, active_idx))
+            hidden_states = mlp_out
+        elif reuse_idx.numel() >= hidden_states.shape[0]:
+            hidden_states = torch.zeros_like(hidden_states)
+        else:
+            hidden_states = self.mlp(hidden_states)
         return hidden_states, residual
+
+    @staticmethod
+    def _cacheblend_reuse_mlp_skip_indices(
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
+    ) -> torch.Tensor:
+        if not _vlm_cacheblend.cacheblend_enabled():
+            return torch.empty(0, dtype=torch.long, device=hidden_states.device)
+        cfg = _vlm_cacheblend.get_config()
+        if not cfg.fast_path or not cfg.skip_reuse_mlp:
+            return torch.empty(0, dtype=torch.long, device=hidden_states.device)
+        return _vlm_cacheblend.recipient_reuse_token_indices(
+            getattr(forward_batch, "out_cache_loc", None),
+            device=hidden_states.device,
+        )
 
 
 class Qwen2Model(nn.Module):
@@ -352,6 +441,8 @@ class Qwen2Model(nn.Module):
             hidden_states = pp_proxy_tensors["hidden_states"]
             residual = pp_proxy_tensors["residual"]
 
+        self._cacheblend_prepare_recipient_fast_path(input_ids, forward_batch)
+
         aux_hidden_states = []
         for i in range(self.start_layer, self.end_layer):
             if i in self.layers_to_capture:
@@ -365,6 +456,15 @@ class Qwen2Model(nn.Module):
                 forward_batch,
                 residual,
             )
+
+        # [VLM-CacheBlend §6] donor capture / recipient eligibility probe. The
+        # recipient fast path is intentionally not enabled here yet; until the
+        # selective layer loop is implemented, recipient requests run full prefill and
+        # emit a structured fallback reason.
+        self._maybe_cacheblend_after_full_prefill(input_ids, forward_batch)
+        if _vlm_cacheblend.cacheblend_enabled():
+            _vlm_cacheblend.clear_recipient_blend_plans()
+
         if not self.pp_group.is_last_rank:
             return PPProxyTensors(
                 {
@@ -383,6 +483,334 @@ class Qwen2Model(nn.Module):
             return hidden_states
 
         return hidden_states, aux_hidden_states
+
+    def _cacheblend_prepare_recipient_fast_path(
+        self, input_ids: torch.Tensor, forward_batch: ForwardBatch
+    ) -> None:
+        if not _vlm_cacheblend.cacheblend_enabled():
+            return
+        _vlm_cacheblend.clear_recipient_blend_plans()
+        ctx = _vlm_cacheblend.get_request_context()
+        if ctx is None or not forward_batch.forward_mode.is_extend():
+            return
+        out_cache_loc = getattr(forward_batch, "out_cache_loc", None)
+        if out_cache_loc is None:
+            return
+        if input_ids is None:
+            input_ids = _vlm_cacheblend.get_source_input_ids()
+        if input_ids is None:
+            return
+        ctxs = tuple(getattr(ctx, "contexts", (ctx,)))
+        req_slices = self._cacheblend_request_slices(forward_batch, input_ids)
+        positions = getattr(forward_batch, "mrope_positions", None)
+        plans = []
+        for one_ctx in ctxs:
+            if getattr(one_ctx, "role", "") != "recipient":
+                continue
+            req_index = int(getattr(one_ctx, "request_index", 0))
+            if req_index < 0 or req_index >= len(req_slices):
+                continue
+            start, end = req_slices[req_index]
+            img_locs, img_positions, _ = self._cacheblend_locate_image_tokens(
+                one_ctx,
+                input_ids[start:end],
+                out_cache_loc[start:end],
+                forward_batch,
+                self._cacheblend_positions_slice(positions, start, end),
+            )
+            if img_locs.numel() == 0:
+                continue
+            plan, _ = _vlm_cacheblend.build_recipient_kv_blend_plan(
+                one_ctx, img_locs, img_positions
+            )
+            if plan is not None:
+                plans.append(plan)
+        if plans:
+            _vlm_cacheblend.set_recipient_blend_plans(tuple(plans))
+
+    def _maybe_cacheblend_after_full_prefill(
+        self, input_ids: torch.Tensor, forward_batch: ForwardBatch
+    ) -> None:
+        """Snapshot donor K/V or log recipient eligibility after full prefill.
+
+        Recipient blending, when enabled, is applied inside the attention backend before
+        prefill attention consumes the KV cache. This post-prefill hook only captures
+        donors and emits structured stats.
+        """
+        if not _vlm_cacheblend.cacheblend_enabled():
+            return
+        ctx = _vlm_cacheblend.get_request_context()
+        if ctx is None:
+            return
+        if not forward_batch.forward_mode.is_extend():
+            return
+        out_cache_loc = getattr(forward_batch, "out_cache_loc", None)
+        ctxs = tuple(getattr(ctx, "contexts", (ctx,)))
+        if out_cache_loc is None:
+            ctx0 = ctxs[0] if ctxs else ctx
+            _vlm_cacheblend.log_stats(
+                _vlm_cacheblend.CacheBlendStats(
+                    role=getattr(ctx0, "role", "none"),
+                    request_id=getattr(ctx0, "request_id", ""),
+                    fallback_reason="missing_out_cache_loc",
+                ).finalize()
+            )
+            return
+        if input_ids is None:
+            input_ids = _vlm_cacheblend.get_source_input_ids()
+        if input_ids is None:
+            ctx0 = ctxs[0] if ctxs else ctx
+            _vlm_cacheblend.log_stats(
+                _vlm_cacheblend.CacheBlendStats(
+                    role=getattr(ctx0, "role", "none"),
+                    request_id=getattr(ctx0, "request_id", ""),
+                    fallback_reason="missing_input_ids",
+                ).finalize()
+            )
+            return
+        req_slices = self._cacheblend_request_slices(forward_batch, input_ids)
+        stats_list = []
+        for one_ctx in ctxs:
+            req_index = int(getattr(one_ctx, "request_index", 0))
+            if req_index < 0 or req_index >= len(req_slices):
+                stats_list.append(
+                    _vlm_cacheblend.CacheBlendStats(
+                        role=getattr(one_ctx, "role", "none"),
+                        request_id=getattr(one_ctx, "request_id", ""),
+                        fallback_reason=f"request_slice_oob:{req_index}/{len(req_slices)}",
+                    ).finalize()
+                )
+                continue
+            start, end = req_slices[req_index]
+            stats_list.append(
+                self._cacheblend_handle_context(
+                    one_ctx,
+                    input_ids[start:end],
+                    out_cache_loc[start:end],
+                    forward_batch,
+                    layer_ids=list(range(self.start_layer, self.end_layer)),
+                    positions_slice=self._cacheblend_positions_slice(
+                        getattr(forward_batch, "mrope_positions", None), start, end
+                    ),
+                )
+            )
+        _vlm_cacheblend.log_stats(self._cacheblend_aggregate_stats(stats_list))
+
+    @staticmethod
+    def _cacheblend_request_slices(forward_batch: ForwardBatch, input_ids: torch.Tensor):
+        lens = getattr(forward_batch, "extend_seq_lens_cpu", None)
+        if lens is None:
+            lens = getattr(forward_batch, "extend_seq_lens", None)
+            if isinstance(lens, torch.Tensor):
+                lens = lens.detach().cpu().tolist()
+        if not lens:
+            lens = [int(input_ids.numel())]
+        slices = []
+        start = 0
+        total = int(input_ids.numel())
+        for length in lens:
+            end = min(total, start + int(length))
+            slices.append((start, end))
+            start = end
+        return slices
+
+    @staticmethod
+    def _cacheblend_positions_slice(positions, start: int, end: int):
+        if positions is None or not isinstance(positions, torch.Tensor):
+            return None
+        if positions.dim() == 2:
+            return positions[:, start:end]
+        return None
+
+    @staticmethod
+    def _cacheblend_locate_image_tokens(
+        ctx,
+        input_ids: torch.Tensor,
+        out_cache_loc: torch.Tensor,
+        forward_batch: ForwardBatch,
+        positions_slice,
+    ):
+        img_locs = _vlm_cacheblend.image_token_locs(
+            input_ids,
+            out_cache_loc,
+            ctx.image_token_id,
+            target_image_slot=ctx.target_image_slot,
+            image_token_values=ctx.image_token_values,
+        )
+        img_positions = None
+        if (
+            img_locs.numel() != 0
+            and positions_slice is not None
+            and positions_slice.dim() == 2
+        ):
+            img_mask = _vlm_cacheblend.image_token_mask_for_slot(
+                input_ids,
+                ctx.image_token_id,
+                target_image_slot=ctx.target_image_slot,
+                image_token_values=ctx.image_token_values,
+            )
+            img_positions = positions_slice[:, img_mask]
+        if img_locs.numel() == 0:
+            img_locs, img_positions, request_locs_reason = (
+                _vlm_cacheblend.image_token_locs_from_request(forward_batch, ctx)
+            )
+        else:
+            request_locs_reason = ""
+        return img_locs, img_positions, request_locs_reason
+
+    def _cacheblend_handle_context(
+        self,
+        ctx,
+        input_ids: torch.Tensor,
+        out_cache_loc: torch.Tensor,
+        forward_batch: ForwardBatch,
+        *,
+        layer_ids,
+        positions_slice,
+    ):
+        try:
+            img_locs, img_positions, request_locs_reason = (
+                self._cacheblend_locate_image_tokens(
+                    ctx,
+                    input_ids,
+                    out_cache_loc,
+                    forward_batch,
+                    positions_slice,
+                )
+            )
+            try:
+                _vlm_cacheblend.maybe_dump_request_debug(
+                    forward_batch=forward_batch,
+                    ctx=ctx,
+                    input_ids=input_ids,
+                    out_cache_loc=out_cache_loc,
+                    request_locs_reason=request_locs_reason,
+                    img_locs=img_locs,
+                )
+            except Exception as dump_exc:
+                logger.warning("VLM-CacheBlend request dump skipped: %s", dump_exc)
+            if img_locs.numel() == 0:
+                return (
+                    _vlm_cacheblend.CacheBlendStats(
+                        role=ctx.role,
+                        request_id=ctx.request_id,
+                        fallback_reason=(
+                            request_locs_reason or "no_target_image_tokens"
+                        ),
+                    ).finalize()
+                )
+            if ctx.role == "recipient":
+                return self._cacheblend_probe_recipient(ctx, img_locs, img_positions)
+            _vlm_cacheblend.capture_donor_kv(
+                forward_batch=forward_batch,
+                layer_ids=layer_ids,
+                img_locs=img_locs,
+                group_key=ctx.group_key,
+                grid_sig=ctx.grid_sig,
+                positions=img_positions,
+                to_cpu=_vlm_cacheblend.get_config().donor_to_cpu,
+            )
+            return (
+                _vlm_cacheblend.CacheBlendStats(
+                    role="donor",
+                    request_id=ctx.request_id,
+                    n_image_tokens=int(img_locs.numel()),
+                    pos_mode=_vlm_cacheblend.get_config().pos_mode,
+                    select_mode=_vlm_cacheblend.get_config().select_mode,
+                    fallback_reason="donor_captured",
+                ).finalize()
+            )
+        except Exception as exc:  # never break the forward pass on capture failure
+            logger.warning("VLM-CacheBlend donor capture skipped: %s", exc)
+            return (
+                _vlm_cacheblend.CacheBlendStats(
+                    role=getattr(ctx, "role", "none"),
+                    request_id=getattr(ctx, "request_id", ""),
+                    fallback_reason=f"hook_exception:{type(exc).__name__}",
+                ).finalize()
+            )
+
+    def _cacheblend_probe_recipient(self, ctx, img_locs, img_positions) -> None:
+        cfg = _vlm_cacheblend.get_config()
+        stats = _vlm_cacheblend.CacheBlendStats(
+            role="recipient",
+            request_id=ctx.request_id,
+            n_image_tokens=int(img_locs.numel()),
+            pos_mode=cfg.pos_mode,
+            select_mode=cfg.select_mode,
+        )
+        donor = _vlm_cacheblend.get_donor_store().lookup(ctx.group_key)
+        if donor is None or not donor.complete:
+            stats.fallback_reason = "donor_not_ready"
+            return stats.finalize()
+        if tuple(donor.grid_sig) != tuple(ctx.grid_sig):
+            stats.fallback_reason = "grid_mismatch"
+            return stats.finalize()
+        if int(donor.n_image_tokens) != int(img_locs.numel()):
+            stats.fallback_reason = "image_token_count_mismatch"
+            return stats.finalize()
+        if cfg.pos_mode == "same" and not _vlm_cacheblend.positions_match(
+            donor.positions, img_positions
+        ):
+            stats.fallback_reason = "position_mismatch"
+            return stats.finalize()
+
+        recompute_mask = _vlm_cacheblend.select_recompute_tokens(
+            int(img_locs.numel()),
+            cfg,
+            device=img_locs.device,
+        )
+        stats.eligible = True
+        stats.recomputed_tokens = int(recompute_mask.sum().item())
+        stats.reused_tokens = int(img_locs.numel()) - stats.recomputed_tokens
+        if _vlm_cacheblend.recipient_blend_was_used(ctx.request_id):
+            stats.used = True
+            stats.fallback_reason = "recipient_kv_blended"
+            (
+                stats.attention_skipped_tokens,
+                stats.attention_active_ranges,
+            ) = _vlm_cacheblend.recipient_attention_skip_stats(ctx.request_id)
+        else:
+            stats.fallback_reason = "recipient_fast_path_not_applied"
+        return stats.finalize()
+
+    @staticmethod
+    def _cacheblend_aggregate_stats(stats_list):
+        stats_list = [s for s in stats_list if s is not None]
+        if not stats_list:
+            return _vlm_cacheblend.CacheBlendStats()
+        if len(stats_list) == 1:
+            return stats_list[0]
+        priority = {"recipient": 3, "donor": 2, "none": 1}
+        role = max((s.role for s in stats_list), key=lambda r: priority.get(r, 0))
+        reasons = {}
+        for stats in stats_list:
+            reason = stats.fallback_reason or ""
+            if not reason:
+                continue
+            reasons[reason] = reasons.get(reason, 0) + 1
+        fallback = "batch:" + ";".join(
+            f"{reason}={count}" for reason, count in sorted(reasons.items())
+        )
+        cfg = _vlm_cacheblend.get_config()
+        return _vlm_cacheblend.CacheBlendStats(
+            role=role,
+            used=any(s.used for s in stats_list),
+            eligible=any(s.eligible for s in stats_list),
+            fallback_reason=fallback,
+            request_id=",".join(s.request_id for s in stats_list if s.request_id)[:256],
+            n_image_tokens=sum(int(s.n_image_tokens) for s in stats_list),
+            reused_tokens=sum(int(s.reused_tokens) for s in stats_list),
+            recomputed_tokens=sum(int(s.recomputed_tokens) for s in stats_list),
+            pos_mode=cfg.pos_mode,
+            select_mode=cfg.select_mode,
+            attention_skipped_tokens=sum(
+                int(getattr(s, "attention_skipped_tokens", 0)) for s in stats_list
+            ),
+            attention_active_ranges=sum(
+                int(getattr(s, "attention_active_ranges", 0)) for s in stats_list
+            ),
+        ).finalize()
 
     # If this function is called, it should always initialize KV cache scale
     # factors (or else raise an exception). Thus, handled exceptions should
