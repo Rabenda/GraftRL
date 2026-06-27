@@ -746,6 +746,20 @@ class FlashAttentionBackend(AttentionBackend):
                     forward_batch.token_to_kv_pool.set_kv_buffer(
                         layer, cache_loc, k, v, layer.k_scale, layer.v_scale
                     )
+                    if not layer.is_cross_attention:
+                        from sglang.srt.mem_cache import vlm_cacheblend
+
+                        if vlm_cacheblend.cacheblend_enabled():
+                            vlm_cacheblend.apply_recipient_kv_blend_for_layer(
+                                forward_batch=forward_batch,
+                                layer_id=layer.layer_id,
+                                cache_locs=cache_loc,
+                                k=k,
+                                v=v,
+                                rotary_emb=getattr(
+                                    layer, "_vlm_cacheblend_rotary_emb", None
+                                ),
+                            )
                 else:
                     forward_batch.token_to_kv_pool.set_mla_kv_buffer(
                         layer,
@@ -856,25 +870,81 @@ class FlashAttentionBackend(AttentionBackend):
                 cu_seqlens_k = metadata.encoder_cu_seqlens_k
                 window_size = (-1, -1)
 
-            result = flash_attn_with_kvcache(
-                q=q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
-                k_cache=key_cache,
-                v_cache=value_cache,
-                page_table=page_table,
-                cache_seqlens=cache_seqlens,
-                cu_seqlens_q=cu_seqlens_q,
-                cu_seqlens_k_new=cu_seqlens_k if not use_local_attn else None,
-                max_seqlen_q=max_seqlen_q,
-                softmax_scale=layer.scaling,
-                causal=False if use_cascade_attn else causal,
-                window_size=window_size,
-                softcap=layer.logit_cap,
-                k_descale=k_descale,
-                v_descale=v_descale,
-                return_softmax_lse=use_cascade_attn,
-                num_splits=self.num_splits,
-                **kwargs,
-            )
+            q_full = q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim)
+            active_ranges = None
+            if (
+                not use_local_attn
+                and not use_cascade_attn
+                and not layer.is_cross_attention
+                and not is_swa_layer
+            ):
+                from sglang.srt.mem_cache import vlm_cacheblend
+
+                cfg = vlm_cacheblend.get_config()
+                if vlm_cacheblend.cacheblend_enabled() and cfg.skip_reuse_attention:
+                    active_ranges = vlm_cacheblend.recipient_active_query_ranges(
+                        forward_batch
+                    )
+
+            if active_ranges is not None:
+                query_indices = active_ranges.query_indices.to(
+                    device=q_full.device, dtype=torch.long
+                )
+                range_batch_indices = active_ranges.range_batch_indices.to(
+                    device=page_table.device, dtype=torch.long
+                )
+                active_cache_seqlens = active_ranges.range_end_lens.to(
+                    device=cache_seqlens.device, dtype=torch.int32
+                )
+                active_cu_seqlens_k = torch.nn.functional.pad(
+                    torch.cumsum(active_cache_seqlens, dim=0, dtype=torch.int32),
+                    (1, 0),
+                )
+                result_active = flash_attn_with_kvcache(
+                    q=q_full.index_select(0, query_indices),
+                    k_cache=key_cache,
+                    v_cache=value_cache,
+                    page_table=page_table.index_select(0, range_batch_indices),
+                    cache_seqlens=active_cache_seqlens,
+                    cu_seqlens_q=active_ranges.cu_seqlens_q.to(
+                        device=cu_seqlens_q.device, dtype=torch.int32
+                    ),
+                    cu_seqlens_k_new=active_cu_seqlens_k,
+                    max_seqlen_q=active_ranges.max_seqlen_q,
+                    softmax_scale=layer.scaling,
+                    causal=causal,
+                    window_size=window_size,
+                    softcap=layer.logit_cap,
+                    k_descale=k_descale,
+                    v_descale=v_descale,
+                    return_softmax_lse=False,
+                    num_splits=self.num_splits,
+                    **kwargs,
+                )
+                vlm_cacheblend.mark_recipient_attention_skip_used(active_ranges)
+                o = torch.zeros_like(q_full)
+                o.index_copy_(0, query_indices, result_active)
+                result = o
+            else:
+                result = flash_attn_with_kvcache(
+                    q=q_full,
+                    k_cache=key_cache,
+                    v_cache=value_cache,
+                    page_table=page_table,
+                    cache_seqlens=cache_seqlens,
+                    cu_seqlens_q=cu_seqlens_q,
+                    cu_seqlens_k_new=cu_seqlens_k if not use_local_attn else None,
+                    max_seqlen_q=max_seqlen_q,
+                    softmax_scale=layer.scaling,
+                    causal=False if use_cascade_attn else causal,
+                    window_size=window_size,
+                    softcap=layer.logit_cap,
+                    k_descale=k_descale,
+                    v_descale=v_descale,
+                    return_softmax_lse=use_cascade_attn,
+                    num_splits=self.num_splits,
+                    **kwargs,
+                )
 
             if use_cascade_attn:
                 o, softmax_lse, *rest = result

@@ -767,6 +767,20 @@ class FlashInferAttnBackend(AttentionBackend):
                     forward_batch.token_to_kv_pool.set_kv_buffer(
                         layer, cache_loc, k, v, layer.k_scale, layer.v_scale
                     )
+                    if not layer.is_cross_attention:
+                        from sglang.srt.mem_cache import vlm_cacheblend
+
+                        if vlm_cacheblend.cacheblend_enabled():
+                            vlm_cacheblend.apply_recipient_kv_blend_for_layer(
+                                forward_batch=forward_batch,
+                                layer_id=layer.layer_id,
+                                cache_locs=cache_loc,
+                                k=k,
+                                v=v,
+                                rotary_emb=getattr(
+                                    layer, "_vlm_cacheblend_rotary_emb", None
+                                ),
+                            )
 
             o = prefill_wrapper_paged.forward(
                 q.view(-1, layer.tp_q_head_num, layer.head_dim),
@@ -808,6 +822,24 @@ class FlashInferAttnBackend(AttentionBackend):
                 causal = False
             if save_kv_cache and layer.attn_type == AttentionType.ENCODER_ONLY:
                 save_kv_cache = False
+
+            if (
+                save_kv_cache
+                and k is not None
+                and v is not None
+                and not layer.is_cross_attention
+            ):
+                from sglang.srt.mem_cache import vlm_cacheblend
+
+                if vlm_cacheblend.cacheblend_enabled():
+                    vlm_cacheblend.apply_recipient_kv_blend_for_layer(
+                        forward_batch=forward_batch,
+                        layer_id=layer.layer_id,
+                        cache_locs=cache_loc,
+                        k=k,
+                        v=v,
+                        rotary_emb=getattr(layer, "_vlm_cacheblend_rotary_emb", None),
+                    )
 
             if self.forward_metadata.extend_no_prefix:
                 # NOTE: FlashInfer currently has limitations with head_dim = 32 or other dimensions

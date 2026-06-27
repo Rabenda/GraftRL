@@ -1,0 +1,7 @@
+- name: vtool_agent
+  _target_: examples.profile.shared.agent.vtool_agent_loop.VToolAgentLoop
+  tool_timeout_seconds: 10.0
+  # Model-driven refocus: each GRPO branch parses its own turn0 assistant output.
+  # Requires VTOOL_ORACLE_REFOCUS=0 (set by run_rollout_profile.sh when VTOOL_MODEL_REFOCUS=1).
+  force_oracle_refocus: false
+  oracle_diversify_by_branch: false

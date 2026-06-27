@@ -105,7 +105,7 @@ def test_hf_rollout(n: int = 1, do_sample: bool = True, validate: bool = False):
     local_rank, rank, world_size = initialize_global_process_group()
 
     # Initialize model and tokenizer
-    local_cache_path = "~/.cache/verl/rlhf"
+    local_cache_path = "/data/verl/rlhf"
     local_cache_path = os.path.expanduser(local_cache_path)
     hdfs_path = "Qwen/Qwen2-7B-Instruct"
     local_model_path = copy_to_local(src=hdfs_path, cache_dir=local_cache_path)

@@ -210,6 +210,18 @@ class TorchNativeAttnBackend(AttentionBackend):
 
         if save_kv_cache:
             forward_batch.token_to_kv_pool.set_kv_buffer(layer, cache_loc, k, v)
+            if not layer.is_cross_attention:
+                from sglang.srt.mem_cache import vlm_cacheblend
+
+                if vlm_cacheblend.cacheblend_enabled():
+                    vlm_cacheblend.apply_recipient_kv_blend_for_layer(
+                        forward_batch=forward_batch,
+                        layer_id=layer.layer_id,
+                        cache_locs=cache_loc,
+                        k=k,
+                        v=v,
+                        rotary_emb=getattr(layer, "_vlm_cacheblend_rotary_emb", None),
+                    )
 
         use_gqa = layer.tp_q_head_num != layer.tp_k_head_num
 
