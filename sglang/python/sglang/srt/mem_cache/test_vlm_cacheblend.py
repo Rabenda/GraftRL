@@ -299,6 +299,14 @@ def test_kv_deviation_and_blend_full():
     print("ok test_kv_deviation_and_blend_full")
 
 
+def test_kv_cosine_similarity():
+    donor_k = torch.tensor([[[1.0, 0.0]], [[1.0, 1.0]], [[0.0, 2.0]]])
+    rec_k = torch.tensor([[[1.0, 0.0]], [[1.0, -1.0]], [[0.0, 4.0]]])
+    sim = cb.kv_cosine_similarity(rec_k, donor_k)
+    assert torch.allclose(sim, torch.tensor([1.0, 0.0, 1.0]), atol=1e-6), sim
+    print("ok test_kv_cosine_similarity")
+
+
 def test_apply_recipient_kv_blend_updates_pool_and_direct_tensors():
     cb._CONFIG = _cfg(fast_path=True)
     cb._DONOR_STORE = cb.DonorKVStore(max_groups=4)
@@ -511,6 +519,85 @@ def test_finalize_recipient_plan_deviation_picks_high_deviation():
     assert not bool(plan.recompute_mask[5])
     assert plan.recomputed_tokens == 2 and plan.reused_tokens == n - 2
     print("ok test_finalize_recipient_plan_deviation_picks_high_deviation")
+
+
+def test_finalize_recipient_plan_similarity_picks_low_cosine():
+    # sim finalize must recompute low-cosine tokens and reuse high-cosine tokens.
+    cfg = _cfg(select_mode="sim", sim_threshold=0.5, recompute_ratio=0.5)
+    n = 4
+    donor_k = torch.tensor(
+        [
+            [[1.0, 0.0]],
+            [[0.0, 1.0]],
+            [[1.0, 1.0]],
+            [[2.0, 0.0]],
+        ]
+    )
+    recipient_k = torch.tensor(
+        [
+            [[1.0, 0.0]],   # cos 1.0
+            [[0.0, -1.0]],  # cos -1.0
+            [[-1.0, -1.0]], # cos -1.0
+            [[3.0, 0.0]],   # cos 1.0
+        ]
+    )
+    plan = cb.RecipientKVBlendPlan(
+        request_id="rs",
+        group_key=("g",),
+        img_locs=torch.arange(n, dtype=torch.long),
+        positions=None,
+        recompute_mask=torch.ones(n, dtype=torch.bool),
+        grid_sig=(1, 1, n),
+        n_image_tokens=n,
+        reused_tokens=0,
+        recomputed_tokens=n,
+        pos_mode="same",
+        select_mode="sim",
+        bootstrap_layer_id=0,
+        pending_deviation=True,
+    )
+    sim = cb.finalize_recipient_plan_similarity(plan, recipient_k, donor_k, cfg)
+    assert sim.shape == (n,)
+    assert plan.pending_deviation is False
+    assert int(plan.recompute_mask.sum()) == 2, int(plan.recompute_mask.sum())
+    assert bool(plan.recompute_mask[1]) and bool(plan.recompute_mask[2])
+    assert not bool(plan.recompute_mask[0]) and not bool(plan.recompute_mask[3])
+    assert plan.recomputed_tokens == 2 and plan.reused_tokens == 2
+    print("ok test_finalize_recipient_plan_similarity_picks_low_cosine")
+
+
+def test_build_plan_deferred_for_sim():
+    cb._CONFIG = _cfg(select_mode="sim", recompute_ratio=0.25, fast_path=True)
+    cb._DONOR_STORE = cb.DonorKVStore(max_groups=4)
+    cb.clear_recipient_blend_plans()
+
+    ctx = cb.RequestContext(
+        group_key=("g",),
+        role="recipient",
+        image_token_id=999,
+        request_id="rs2",
+        agent_turn=1,
+        grid_sig=(1, 1, 4),
+    )
+    positions = torch.arange(12, dtype=torch.long).reshape(3, 4)
+    entry = cb.get_donor_store().get_or_create_donor(
+        ("g",), n_image_tokens=4, grid_sig=(1, 1, 4), positions=positions
+    )
+    entry.record_layer(0, torch.zeros(4, 1, 2), torch.zeros(4, 1, 2))
+    cb.get_donor_store().mark_complete(("g",))
+
+    plan, stats = cb.build_recipient_kv_blend_plan(
+        ctx,
+        torch.arange(4, dtype=torch.long),
+        positions,
+    )
+    assert plan is not None
+    assert plan.pending_deviation is True
+    assert plan.select_mode == "sim"
+    assert bool(plan.recompute_mask.all())
+    assert stats.fallback_reason == "recipient_kv_blend_deferred_sim"
+    cb.clear_recipient_blend_plans()
+    print("ok test_build_plan_deferred_for_sim")
 
 
 def test_apply_kvdev_bootstrap_finalizes_then_reuses_next_layer():

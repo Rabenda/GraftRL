@@ -203,10 +203,11 @@ class RecipientKVBlendPlan:
     recomputed_tokens: int
     pos_mode: str
     select_mode: str
-    # For select_mode="kvdev": the recompute set is not known until a bootstrap layer
-    # has measured per-token KV deviation against the donor. Until then the mask marks
-    # every token "recompute" (so no reuse/skip happens) and ``pending_deviation`` is
-    # True; ``bootstrap_layer_id`` is the layer that finalizes the mask.
+    # For bootstrap modes ("kvdev" and "sim"), the recompute set is not known until a
+    # bootstrap layer has compared the recipient's own K against the donor. Until then
+    # the mask marks every token "recompute" (so no reuse/skip happens) and
+    # ``pending_deviation`` is True; ``bootstrap_layer_id`` is the layer that finalizes
+    # the mask. The field name is kept for compatibility with the original kvdev path.
     bootstrap_layer_id: int = -1
     pending_deviation: bool = False
 
@@ -468,6 +469,26 @@ def kv_deviation(
     return torch.linalg.vector_norm(diff, dim=-1)
 
 
+def kv_cosine_similarity(
+    recipient_k: torch.Tensor,
+    donor_k_aligned: torch.Tensor,
+    *,
+    eps: float = 1e-12,
+) -> torch.Tensor:
+    """Per-token cosine similarity over flattened K heads, shape ``[n_img_tok]``.
+
+    Used by select_mode="sim". A low cosine means the donor token's K is a poor local
+    proxy for the recipient token, so that token should stay on the recompute path.
+    """
+    recipient = recipient_k.reshape(recipient_k.shape[0], -1).float()
+    donor = donor_k_aligned.reshape(donor_k_aligned.shape[0], -1).float()
+    numerator = (recipient * donor).sum(dim=-1)
+    denom = torch.linalg.vector_norm(recipient, dim=-1) * torch.linalg.vector_norm(
+        donor, dim=-1
+    )
+    return numerator / denom.clamp_min(eps)
+
+
 def finalize_recipient_plan_deviation(
     plan: "RecipientKVBlendPlan",
     recipient_k: torch.Tensor,
@@ -490,6 +511,24 @@ def finalize_recipient_plan_deviation(
     plan.reused_tokens = int(plan.n_image_tokens - plan.recomputed_tokens)
     plan.pending_deviation = False
     return deviation
+
+
+def finalize_recipient_plan_similarity(
+    plan: "RecipientKVBlendPlan",
+    recipient_k: torch.Tensor,
+    donor_k_aligned: torch.Tensor,
+    cfg: VLMCacheBlendConfig,
+) -> torch.Tensor:
+    """Resolve a deferred ``sim`` plan from bootstrap-layer cosine similarity."""
+    similarity = kv_cosine_similarity(recipient_k, donor_k_aligned)
+    mask = select_recompute_tokens(
+        plan.n_image_tokens, cfg, similarity=similarity, device=similarity.device
+    )
+    plan.recompute_mask = mask.to(device=plan.recompute_mask.device, dtype=torch.bool)
+    plan.recomputed_tokens = int(plan.recompute_mask.sum().item())
+    plan.reused_tokens = int(plan.n_image_tokens - plan.recomputed_tokens)
+    plan.pending_deviation = False
+    return similarity
 
 
 # --------------------------------------------------------------------------- #
@@ -552,10 +591,10 @@ def build_recipient_kv_blend_plan(
     n_img = int(img_locs.numel())
     bootstrap_layer_id = -1
     pending_deviation = False
-    if cfg.select_mode == "kvdev" and donor.layers:
+    if cfg.select_mode in ("kvdev", "sim") and donor.layers:
         # Defer the recompute selection: mark every token "recompute" so no reuse/skip
-        # happens until the bootstrap (lowest donor) layer measures the recipient's true
-        # per-token KV deviation, then reuse the low-deviation tokens from the next layer.
+        # happens until the bootstrap (lowest donor) layer compares the recipient's true
+        # K against the donor, then reuse the low-risk tokens from the next layer.
         bootstrap_layer_id = min(int(layer) for layer in donor.layers.keys())
         pending_deviation = True
         recompute_mask = torch.ones(n_img, dtype=torch.bool, device=img_locs.device)
@@ -565,7 +604,7 @@ def build_recipient_kv_blend_plan(
     stats.recomputed_tokens = int(recompute_mask.sum().item())
     stats.reused_tokens = n_img - stats.recomputed_tokens
     stats.fallback_reason = (
-        "recipient_kv_blend_deferred_kvdev"
+        f"recipient_kv_blend_deferred_{cfg.select_mode}"
         if pending_deviation
         else "recipient_kv_blend_planned"
     )
@@ -650,13 +689,13 @@ def apply_recipient_kv_blend_for_layer(
         if plan.pending_deviation and layer_id == plan.bootstrap_layer_id:
             # Bootstrap layer: the recipient's own K for the image span is already in the
             # pool (set_kv_buffer ran before this hook) and not yet overwritten by the
-            # donor. Measure per-token KV deviation NOW (before any overwrite), finalize
-            # the high-deviation ("high-risk") recompute set, then fall through so this
-            # SAME layer also writes donor K/V for the reused tokens. Falling through is
-            # required for correctness: the attention active-query ranges and the MLP skip
-            # later in this layer read the just-finalized mask and will skip the reused
-            # tokens, so those tokens must already hold donor K/V here (not the recipient's
-            # own K/V). ``pending_deviation`` is cleared so this runs only once.
+            # donor. Measure token risk NOW (before any overwrite), finalize the
+            # recompute set, then fall through so this SAME layer also writes donor K/V
+            # for the reused tokens. Falling through is required for correctness: the
+            # attention active-query ranges and the MLP skip later in this layer read the
+            # just-finalized mask and will skip the reused tokens, so those tokens must
+            # already hold donor K/V here (not the recipient's own K/V).
+            # ``pending_deviation`` is cleared so this runs only once.
             if img_locs.numel() > 0:
                 donor_k_boot = _rerotate_plan_keys_if_needed(
                     donor_layer.k.to(device=k_buf.device, dtype=k_buf.dtype),
@@ -665,9 +704,15 @@ def apply_recipient_kv_blend_for_layer(
                     pos_mode=plan.pos_mode,
                     rotary_emb=rotary_emb,
                 )
-                finalize_recipient_plan_deviation(
-                    plan, k_buf[img_locs], donor_k_boot, get_config()
-                )
+                cfg = get_config()
+                if plan.select_mode == "sim":
+                    finalize_recipient_plan_similarity(
+                        plan, k_buf[img_locs], donor_k_boot, cfg
+                    )
+                else:
+                    finalize_recipient_plan_deviation(
+                        plan, k_buf[img_locs], donor_k_boot, cfg
+                    )
             else:
                 plan.pending_deviation = False
         recompute_mask = plan.recompute_mask.to(device=k_buf.device, dtype=torch.bool)
