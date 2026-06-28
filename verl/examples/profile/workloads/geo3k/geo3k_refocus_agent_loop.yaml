@@ -1,0 +1,7 @@
+- name: geo3k_refocus_agent
+  _target_: examples.profile.workloads.geo3k.geo3k_refocus_agent_loop.Geo3KRefocusAgentLoop
+  refocus_mode: exact
+  roi_ratio: 0.72
+  dim_alpha: 0
+  first_turn_max_new_tokens: 16
+  final_turn_max_new_tokens: 64
