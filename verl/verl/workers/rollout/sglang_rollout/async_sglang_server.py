@@ -788,7 +788,11 @@ class SGLangHttpServer:
                 global_step=effective_global_step,
             )
         except Exception:
-            pass
+            logger.warning(
+                "Failed to register SGLang request metadata for request_id=%s",
+                request_id,
+                exc_info=True,
+            )
 
         verl_prepare_ms = (time.perf_counter() - generate_e2e_start) * 1000
         sglang_call_start = time.perf_counter()

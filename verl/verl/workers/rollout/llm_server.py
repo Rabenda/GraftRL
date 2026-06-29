@@ -131,6 +131,13 @@ def _vlm_cacheblend_warmup_timeout_s() -> float:
         return 300.0
 
 
+def _vlm_cacheblend_warmup_timeout_action() -> str:
+    action = os.environ.get("SGLANG_VLM_CACHEBLEND_WARMUP_BARRIER_TIMEOUT_ACTION", "fail").strip().lower()
+    if action in ("fallback", "continue", "warn"):
+        return "fallback"
+    return "fail"
+
+
 def _normalize_global_step(global_step: Optional[Any]) -> Optional[int]:
     if global_step is None:
         return None
@@ -630,6 +637,34 @@ class LLMServerClient:
                     warmup_key,
                     _vlm_cacheblend_warmup_timeout_s(),
                 )
+                if not donor_ready:
+                    wait_ms = (time.perf_counter() - wait_start) * 1000.0
+                    message = (
+                        "VLM CacheBlend warmup barrier timed out before donor KV was ready "
+                        f"(request_id={request_id}, agent_uid={agent_uid}, agent_turn={agent_turn}, "
+                        f"rollout_idx={rollout_idx}, global_step={warmup_global_step}, warmup_key={warmup_key}, "
+                        f"wait_ms={wait_ms:.3f})"
+                    )
+                    if _vlm_cacheblend_warmup_timeout_action() == "fail":
+                        await self._cacheblend_coordinator.mark_failed.remote(warmup_key)
+                        await self._log_cacheblend_barrier_event(
+                            request_id=str(request_id),
+                            agent_uid=agent_uid,
+                            agent_turn=agent_turn,
+                            rollout_idx=rollout_idx,
+                            global_step=warmup_global_step,
+                            warmup_key=warmup_key,
+                            barrier_role="recipient",
+                            wait_ms=wait_ms,
+                            donor_ready=False,
+                            routing_request_id=str(routing_request_id),
+                            server_id="",
+                        )
+                        raise TimeoutError(message)
+                    logger.warning(
+                        "%s; continuing because SGLANG_VLM_CACHEBLEND_WARMUP_BARRIER_TIMEOUT_ACTION=fallback",
+                        message,
+                    )
             output, server_id = await _call_server()
             await self._log_cacheblend_barrier_event(
                 request_id=str(request_id),

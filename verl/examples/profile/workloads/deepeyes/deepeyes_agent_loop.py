@@ -94,6 +94,7 @@ class DeepEyesAgentLoop(AgentLoopBase):
     async def run(self, sampling_params: dict[str, Any], **kwargs) -> AgentLoopOutput:
         messages = list(kwargs["raw_prompt"])
         uid = str(kwargs.get("uid") or uuid4())
+        global_step = kwargs.get("global_step")
         request_id = uuid4().hex
         rollout_idx = kwargs.get("index")
         dump_dir = _image_dump_dir()
@@ -152,6 +153,7 @@ class DeepEyesAgentLoop(AgentLoopBase):
                     agent_turn=assistant_turns,
                     agent_uid=uid,
                     rollout_idx=str(rollout_idx) if rollout_idx is not None else None,
+                    training_global_step=global_step,
                 )
 
             current_resp_start = len(response_mask)

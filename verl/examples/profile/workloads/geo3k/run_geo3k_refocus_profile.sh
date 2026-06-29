@@ -49,6 +49,24 @@ NGPUS="${NGPUS:-${trainer_n_gpus_per_node:-4}}"
 AGENT_NUM_WORKERS="${AGENT_NUM_WORKERS:-1}"
 DATA_PARENT="${DATA_PARENT:-${VERL_ROOT}/data}"
 
+env_flag_enabled() {
+  local value
+  value="$(printf '%s' "${1:-0}" | tr '[:upper:]' '[:lower:]')"
+  [[ "${value}" == "1" || "${value}" == "true" || "${value}" == "yes" || "${value}" == "on" ]]
+}
+
+has_hydra_override() {
+  local key="$1"
+  shift || true
+  local arg
+  for arg in "$@"; do
+    if [[ "${arg}" == "${key}="* || "${arg}" == "+${key}="* || "${arg}" == "++${key}="* ]]; then
+      return 0
+    fi
+  done
+  return 1
+}
+
 prepare_if_missing() {
   local variant="$1"
   local data_dir="${DATA_PARENT}/geo3k_refocus_${variant}"
@@ -88,6 +106,12 @@ run_one() {
   export VERL_PROFILE_ROLLOUT_ONLY="${VERL_PROFILE_ROLLOUT_ONLY:-1}"
   # Long-trajectory workloads can narrow this to "1" or "1,3" to reduce per-turn warmup barriers.
   export SGLANG_VLM_CACHEBLEND_TARGET_TURNS="${SGLANG_VLM_CACHEBLEND_TARGET_TURNS:-all}"
+
+  local chunked_prefill_args=()
+  local chunked_prefill_key="actor_rollout_ref.rollout.engine_kwargs.sglang.chunked_prefill_size"
+  if env_flag_enabled "${SGLANG_VLM_CACHEBLEND:-0}" && ! has_hydra_override "${chunked_prefill_key}" "$@"; then
+    chunked_prefill_args=("+${chunked_prefill_key}=${CACHEBLEND_CHUNKED_PREFILL_SIZE:--1}")
+  fi
 
   mkdir -p "${log_root}" "${PROFILE_IMAGE_DUMP_DIR}" "${PROFILE_ROLLOUT_DATA_DIR}"
   if [[ "${CLEAN_PROFILE_LOGS:-1}" == "1" ]]; then
@@ -146,6 +170,7 @@ PY
     actor_rollout_ref.rollout.response_length="${max_response_length}" \
     data.filter_overlong_prompts="${FILTER_OVERLONG_PROMPTS:-False}" \
     actor_rollout_ref.model.use_fused_kernels=False \
+    "${chunked_prefill_args[@]}" \
     "$@"
 
   echo ""

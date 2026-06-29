@@ -204,6 +204,7 @@ class SokobanAgentLoop(AgentLoopBase):
     async def run(self, sampling_params: dict[str, Any], **kwargs) -> AgentLoopOutput:
         group_idx = int(kwargs.get("index", 0))
         uid = str(kwargs.get("uid") or uuid4())
+        global_step = kwargs.get("global_step")
         branch_idx = await _allocate_branch(group_idx, self.rollout_n)
         dump_dir = _image_dump_dir()
         request_id = uuid4().hex
@@ -252,6 +253,7 @@ class SokobanAgentLoop(AgentLoopBase):
                         agent_turn=assistant_turns,
                         agent_uid=uid,
                         rollout_idx=str(group_idx),
+                        training_global_step=global_step,
                     )
 
                 remaining = self.response_length - len(response_mask)

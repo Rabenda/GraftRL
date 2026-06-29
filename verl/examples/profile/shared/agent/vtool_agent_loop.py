@@ -180,6 +180,7 @@ class VToolAgentLoop(AgentLoopBase):
     async def run(self, sampling_params: dict[str, Any], **kwargs) -> AgentLoopOutput:
         messages = list(kwargs["raw_prompt"])
         uid = str(kwargs.get("uid") or uuid4())
+        global_step = kwargs.get("global_step")
         extra_info = kwargs.get("extra_info") or {}
         tools_kwargs = kwargs.get("tools_kwargs") or {}
         if not tools_kwargs.get("metadata"):
@@ -256,6 +257,7 @@ class VToolAgentLoop(AgentLoopBase):
                     agent_turn=assistant_turns,
                     agent_uid=uid,
                     rollout_idx=str(rollout_idx) if rollout_idx is not None else None,
+                    training_global_step=global_step,
                 )
 
             if metrics.get("num_preempted") is None:
