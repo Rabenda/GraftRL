@@ -1,14 +1,15 @@
 #!/usr/bin/env bash
-# Two-GPU semantic gate for Geo3K VLM-CacheBlend selectors.
+# Semantic gate for Geo3K VLM-CacheBlend selectors.
 #
 # Runs CacheBlend off, kvdev, and cosine selector in sequence, then compares
-# rollout semantics and timing from logs. Defaults are intentionally small enough
-# for CUDA_VISIBLE_DEVICES=6,7 while keeping ROLLOUT_N>=4 so each GRPO group can
-# produce one donor plus recipients.
+# rollout semantics and timing from logs. Defaults use the minimum useful RL
+# rollout profile size: TRAIN_BATCH_SIZE=64 and ROLLOUT_N=4. Smaller batches are
+# only for debugging initialization or routing failures, not for reporting
+# experiment progress.
 #
 # Usage:
 #   bash examples/profile/workloads/geo3k/run_geo3k_cacheblend_semantic_ab.sh exact
-#   SELECTORS="off kvdev cos" TRAIN_BATCH_SIZE=8 ROLLOUT_N=4 \
+#   CUDA_VISIBLE_DEVICES=4,5,6,7 SELECTORS="off kvdev cos" TRAIN_BATCH_SIZE=64 ROLLOUT_N=4 \
 #     bash examples/profile/workloads/geo3k/run_geo3k_cacheblend_semantic_ab.sh diversified
 
 set -euo pipefail
@@ -18,21 +19,25 @@ if [[ "${VARIANT}" != "exact" && "${VARIANT}" != "diversified" && "${VARIANT}" !
   echo "Usage: $0 [exact|diversified|stress]" >&2
   exit 1
 fi
+shift || true
+EXTRA_OVERRIDES=("$@")
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 VERL_ROOT="$(cd "${SCRIPT_DIR}/../../../.." && pwd)"
 cd "${VERL_ROOT}"
 
-export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-6,7}"
-export NGPUS="${NGPUS:-2}"
-export TRAIN_BATCH_SIZE="${TRAIN_BATCH_SIZE:-8}"
+export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-4,5,6,7}"
+export NGPUS="${NGPUS:-4}"
+export TRAIN_BATCH_SIZE="${TRAIN_BATCH_SIZE:-64}"
 export ROLLOUT_N="${ROLLOUT_N:-4}"
 export TOTAL_STEPS="${TOTAL_STEPS:-1}"
-export GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-0.15}"
+export GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-0.25}"
 export CLEAN_PROFILE_LOGS="${CLEAN_PROFILE_LOGS:-1}"
 export VERL_PROFILE_ROLLOUT_ONLY="${VERL_PROFILE_ROLLOUT_ONLY:-1}"
 export GEO3K_REFOCUS_FIRST_TURN_MAX_NEW_TOKENS="${GEO3K_REFOCUS_FIRST_TURN_MAX_NEW_TOKENS:-16}"
 export GEO3K_REFOCUS_FINAL_TURN_MAX_NEW_TOKENS="${GEO3K_REFOCUS_FINAL_TURN_MAX_NEW_TOKENS:-64}"
+# Long-trajectory workloads can narrow this to "1" or "1,3" to reduce per-turn warmup barriers.
+export SGLANG_VLM_CACHEBLEND_TARGET_TURNS="${SGLANG_VLM_CACHEBLEND_TARGET_TURNS:-all}"
 export SGLANG_VLM_CACHEBLEND_TARGET_TURN="${SGLANG_VLM_CACHEBLEND_TARGET_TURN:-1}"
 export SGLANG_VLM_CACHEBLEND_TARGET_IMAGE_SLOT="${SGLANG_VLM_CACHEBLEND_TARGET_IMAGE_SLOT:--1}"
 export SGLANG_VLM_CACHEBLEND_POS_MODE="${SGLANG_VLM_CACHEBLEND_POS_MODE:-same}"
@@ -91,7 +96,8 @@ run_selector() {
     actor_rollout_ref.rollout.temperature=0 \
     actor_rollout_ref.rollout.top_p=1 \
     actor_rollout_ref.rollout.top_k=-1 \
-    "+actor_rollout_ref.rollout.engine_kwargs.sglang.chunked_prefill_size=${CACHEBLEND_CHUNKED_PREFILL_SIZE:--1}"
+    "+actor_rollout_ref.rollout.engine_kwargs.sglang.chunked_prefill_size=${CACHEBLEND_CHUNKED_PREFILL_SIZE:--1}" \
+    "${EXTRA_OVERRIDES[@]}"
 }
 
 for selector in ${SELECTORS}; do

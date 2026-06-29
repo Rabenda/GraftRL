@@ -46,6 +46,7 @@ TRAIN_BATCH_SIZE="${TRAIN_BATCH_SIZE:-64}"
 ROLLOUT_N="${ROLLOUT_N:-4}"
 TOTAL_STEPS="${TOTAL_STEPS:-2}"
 NGPUS="${NGPUS:-${trainer_n_gpus_per_node:-4}}"
+AGENT_NUM_WORKERS="${AGENT_NUM_WORKERS:-1}"
 DATA_PARENT="${DATA_PARENT:-${VERL_ROOT}/data}"
 
 prepare_if_missing() {
@@ -85,6 +86,8 @@ run_one() {
   export GEO3K_REFOCUS_FIRST_TURN_MAX_NEW_TOKENS="${GEO3K_REFOCUS_FIRST_TURN_MAX_NEW_TOKENS:-16}"
   export GEO3K_REFOCUS_FINAL_TURN_MAX_NEW_TOKENS="${GEO3K_REFOCUS_FINAL_TURN_MAX_NEW_TOKENS:-64}"
   export VERL_PROFILE_ROLLOUT_ONLY="${VERL_PROFILE_ROLLOUT_ONLY:-1}"
+  # Long-trajectory workloads can narrow this to "1" or "1,3" to reduce per-turn warmup barriers.
+  export SGLANG_VLM_CACHEBLEND_TARGET_TURNS="${SGLANG_VLM_CACHEBLEND_TARGET_TURNS:-all}"
 
   mkdir -p "${log_root}" "${PROFILE_IMAGE_DUMP_DIR}" "${PROFILE_ROLLOUT_DATA_DIR}"
   if [[ "${CLEAN_PROFILE_LOGS:-1}" == "1" ]]; then
@@ -107,7 +110,7 @@ PY
     exit 1
   fi
 
-  echo "[geo3k-refocus] variant=${variant} mode=${GEO3K_REFOCUS_MODE} batch=${TRAIN_BATCH_SIZE} n=${ROLLOUT_N} steps=${TOTAL_STEPS}"
+  echo "[geo3k-refocus] variant=${variant} mode=${GEO3K_REFOCUS_MODE} batch=${TRAIN_BATCH_SIZE} n=${ROLLOUT_N} steps=${TOTAL_STEPS} agent_workers=${AGENT_NUM_WORKERS}"
   echo "[geo3k-refocus] train=${train_file} log_root=${log_root} suffix=${suffix}"
 
   INFER_BACKEND=sglang \
@@ -130,7 +133,7 @@ PY
     actor_rollout_ref.rollout.tensor_model_parallel_size=1 \
     actor_rollout_ref.rollout.gpu_memory_utilization="${GPU_MEMORY_UTILIZATION:-0.25}" \
     actor_rollout_ref.rollout.enforce_eager=True \
-    actor_rollout_ref.rollout.agent.num_workers=1 \
+    actor_rollout_ref.rollout.agent.num_workers="${AGENT_NUM_WORKERS}" \
     actor_rollout_ref.rollout.agent.default_agent_loop=geo3k_refocus_agent \
     actor_rollout_ref.rollout.agent.agent_loop_config_path=examples/profile/workloads/geo3k/geo3k_refocus_agent_loop.yaml \
     actor_rollout_ref.rollout.multi_turn.enable=True \

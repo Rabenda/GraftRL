@@ -33,7 +33,7 @@ examples/profile/
 
 ## Quick start (bs64 × n4)
 
-Chart workload is always **64 groups × 4 GRPO branches = 256 rollouts** per step. Do not use smaller `TRAIN_BATCH_SIZE` for profiling.
+RL rollout profiling starts at **64 groups × 4 GRPO branches = 256 rollouts** per step. Do not use smaller `TRAIN_BATCH_SIZE` for experiment progress; smaller runs are only smoke tests for initialization or routing failures.
 
 | Workload | Prepare data | Rollout | Similarity analysis |
 |----------|--------------|---------|-------------------|
@@ -73,10 +73,8 @@ default gate is strict: no reward `correct_to_wrong`, no answer `correct_to_wron
 no score drop, and no explicit boxed-answer changes.
 
 ```bash
-# 2-GPU convenience runner; defaults to CUDA_VISIBLE_DEVICES=6,7 and off/kvdev/cos.
-# It still uses the normal verl training-style entrypoint, so it may not fit if the
-# two GPUs are already occupied or if actor/ref/rollout colocation is too tight.
-SELECTORS="off kvdev cos" TRAIN_BATCH_SIZE=4 ROLLOUT_N=4 \
+# 4-GPU runner; defaults to CUDA_VISIBLE_DEVICES=4,5,6,7 and off/kvdev/cos.
+SELECTORS="off kvdev cos" TRAIN_BATCH_SIZE=64 ROLLOUT_N=4 \
   bash examples/profile/workloads/geo3k/run_geo3k_cacheblend_semantic_ab.sh exact
 
 # CPU-only/log-only gate on existing runs.
