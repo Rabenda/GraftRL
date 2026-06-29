@@ -152,6 +152,7 @@ class Geo3KRefocusAgentLoop(AgentLoopBase):
         uid = str(kwargs.get("uid") or uuid4())
         request_id = uuid4().hex
         rollout_idx = str(kwargs.get("index")) if kwargs.get("index") is not None else None
+        global_step = kwargs.get("global_step")
         dump_dir = _image_dump_dir()
         extra_info = kwargs.get("extra_info") or {}
         mode = str(extra_info.get("geo3k_refocus_mode") or self.refocus_mode)
@@ -207,6 +208,7 @@ class Geo3KRefocusAgentLoop(AgentLoopBase):
                 agent_turn=0,
                 agent_uid=uid,
                 rollout_idx=rollout_idx,
+                training_global_step=global_step,
             )
 
         full_ids = prompt_ids + first.token_ids
@@ -272,6 +274,7 @@ class Geo3KRefocusAgentLoop(AgentLoopBase):
                     agent_turn=1,
                     agent_uid=uid,
                     rollout_idx=rollout_idx,
+                    training_global_step=global_step,
                 )
             full_ids += second.token_ids
             response_mask += [1] * len(second.token_ids)

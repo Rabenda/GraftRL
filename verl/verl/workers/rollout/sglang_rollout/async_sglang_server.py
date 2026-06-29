@@ -657,6 +657,7 @@ class SGLangHttpServer:
         agent_turn: Optional[int] = None,
         agent_uid: Optional[str] = None,
         rollout_idx: Optional[str] = None,
+        training_global_step: Optional[int] = None,
     ) -> TokenOutput:
         # PD top-level dispatch: prefill mints a bootstrap_room and fans out
         # paired local-prefill + remote-decode calls; decode returns the tokens
@@ -678,6 +679,7 @@ class SGLangHttpServer:
                 agent_turn=agent_turn,
                 agent_uid=agent_uid,
                 rollout_idx=rollout_idx,
+                training_global_step=training_global_step,
             )
             decode_coro = decode_peer.generate.remote(
                 prompt_ids,
@@ -692,6 +694,7 @@ class SGLangHttpServer:
                 agent_turn=agent_turn,
                 agent_uid=agent_uid,
                 rollout_idx=rollout_idx,
+                training_global_step=training_global_step,
             )
             _, decode_output = await asyncio.gather(prefill_coro, decode_coro)
             return decode_output
@@ -753,8 +756,11 @@ class SGLangHttpServer:
             if prompt_logprobs > 0:
                 request["top_logprobs_num"] = prompt_logprobs
 
-        if self.global_steps is not None:
-            request["training_global_step"] = self.global_steps
+        effective_global_step = training_global_step
+        if effective_global_step is None:
+            effective_global_step = self.global_steps
+        if effective_global_step is not None:
+            request["training_global_step"] = effective_global_step
 
         if self.config.enable_rollout_routing_replay:
             request.update({"return_routed_experts": True})
@@ -779,7 +785,7 @@ class SGLangHttpServer:
                 agent_uid=agent_uid,
                 agent_turn=agent_turn,
                 agent_request_id=agent_request_id,
-                global_step=self.global_steps,
+                global_step=effective_global_step,
             )
         except Exception:
             pass
@@ -858,11 +864,11 @@ class SGLangHttpServer:
             prefill_launch_latency_ms=f"{prefill_launch_latency_ms:.2f}"
             if prefill_launch_latency_ms is not None
             else "",
-            global_step=self.global_steps if self.global_steps is not None else -1,
+            global_step=effective_global_step if effective_global_step is not None else -1,
             finish_reason=finish_reason or "",
         )
 
-        extra_fields = {"global_steps": self.global_steps}
+        extra_fields = {"global_steps": effective_global_step}
         if prompt_logprobs is not None:
             _extract_prompt_logprobs_sglang(
                 meta_info=meta_info,

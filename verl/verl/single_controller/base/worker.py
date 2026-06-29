@@ -277,6 +277,10 @@ class Worker(WorkerHelper):
             # so we need to set local rank when the flag is set.
             device_name = "NPU" if is_npu_available else "GPU"
             local_rank = ray.get_runtime_context().get_accelerator_ids()[device_name][0]
+            visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES", "")
+            visible_device_ids = [item.strip() for item in visible_devices.split(",") if item.strip()]
+            if visible_device_ids and local_rank in visible_device_ids:
+                local_rank = str(visible_device_ids.index(local_rank))
             os.environ["LOCAL_RANK"] = local_rank
             get_torch_device().set_device(int(local_rank))
 

@@ -573,6 +573,7 @@ class AgentLoopWorker:
                 data_config=DictConfigWrap(self.config.data),
                 tools=ToolListWrap(self.tools),
             )
+            kwargs.setdefault("global_step", trajectory["step"])
             output: AgentLoopOutput = await agent_loop.run(sampling_params, **kwargs)
             return await self._agent_loop_postprocess(output, trajectory["validate"], **kwargs)
 

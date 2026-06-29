@@ -20,6 +20,7 @@ Utility classes for manage and request LLM servers:
 
 import asyncio
 import csv
+import fcntl
 import logging
 import os
 import time
@@ -77,11 +78,77 @@ def _vlm_cacheblend_target_turn() -> int:
         return 1
 
 
+def _vlm_cacheblend_target_turns_spec() -> str:
+    return os.environ.get(
+        "SGLANG_VLM_CACHEBLEND_TARGET_TURNS",
+        os.environ.get("SGLANG_VLM_CACHEBLEND_TARGET_TURN", "1"),
+    ).strip().lower()
+
+
+def _vlm_cacheblend_turn_enabled(agent_turn: int) -> bool:
+    if agent_turn < 1:
+        return False
+    spec = _vlm_cacheblend_target_turns_spec()
+    if spec in ("all", "*"):
+        return True
+    turns: set[int] = set()
+    for part in spec.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            turns.add(int(part))
+        except ValueError:
+            logger.warning("Invalid SGLANG_VLM_CACHEBLEND_TARGET_TURNS entry: %s", part)
+    if turns:
+        return agent_turn in turns
+    return agent_turn == _vlm_cacheblend_target_turn()
+
+
+def _vlm_cacheblend_prefix_warmup_enabled() -> bool:
+    return os.environ.get("SGLANG_VLM_CACHEBLEND_PREFIX_WARMUP_BARRIER", "1").lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+
+
 def _vlm_cacheblend_warmup_keep_steps() -> int:
     try:
         return max(1, int(os.environ.get("SGLANG_VLM_CACHEBLEND_WARMUP_BARRIER_KEEP_STEPS", "4")))
     except (TypeError, ValueError):
         return 4
+
+
+def _vlm_cacheblend_warmup_timeout_s() -> float:
+    try:
+        return max(
+            0.0,
+            float(os.environ.get("SGLANG_VLM_CACHEBLEND_WARMUP_BARRIER_TIMEOUT_S", "300")),
+        )
+    except (TypeError, ValueError):
+        return 300.0
+
+
+def _normalize_global_step(global_step: Optional[Any]) -> Optional[int]:
+    if global_step is None:
+        return None
+    try:
+        return int(global_step)
+    except (TypeError, ValueError):
+        return None
+
+
+def _cacheblend_group_key(agent_uid: str, global_step: Optional[Any]) -> str:
+    step = _normalize_global_step(global_step)
+    if step is None:
+        return str(agent_uid)
+    return f"{step}:{agent_uid}"
+
+
+def _warmup_key_matches_step(key: str, step: int) -> bool:
+    return key.startswith(f"{step}:") or f":{step}:" in key
 
 
 def _prune_warmed_uids_for_step(
@@ -96,12 +163,90 @@ def _prune_warmed_uids_for_step(
         recent_steps.append(current_step)
     while len(recent_steps) > keep_steps:
         old_step = recent_steps.pop(0)
-        prefix = f"{old_step}:"
-        drop = {key for key in warmed_uids if key.startswith(prefix)}
+        drop = {key for key in warmed_uids if _warmup_key_matches_step(key, old_step)}
         warmed_uids.difference_update(drop)
 
 
 BarrierRole = Literal["donor", "recipient", "bypass"]
+WarmupAcquireRole = Literal["donor", "recipient", "recipient_wait"]
+
+
+@ray.remote(max_concurrency=1000)
+class GlobalCacheBlendCoordinator:
+    """Global CacheBlend rollout-side coordinator shared by all AgentLoopWorkers.
+
+    The actor does not move or store KV. It only serializes the first target-turn
+    request for a GRPO group so that the selected SGLang replica can capture donor
+    KV before recipient branches are sent to the same sticky route.
+    """
+
+    def __init__(self, keep_steps: int = 4):
+        self._lock = asyncio.Lock()
+        self._changed = asyncio.Condition(self._lock)
+        self._states: dict[str, str] = {}
+        self._recent_steps: list[int] = []
+        self._keep_steps = max(1, int(keep_steps))
+
+    def _prune_locked(self, global_step: Optional[Any]) -> None:
+        step = _normalize_global_step(global_step)
+        if step is None:
+            return
+        if step not in self._recent_steps:
+            self._recent_steps.append(step)
+        while len(self._recent_steps) > self._keep_steps:
+            old_step = self._recent_steps.pop(0)
+            for key in [key for key in self._states if _warmup_key_matches_step(key, old_step)]:
+                self._states.pop(key, None)
+
+    async def begin_warmup(self, key: str, global_step: Optional[Any]) -> WarmupAcquireRole:
+        async with self._changed:
+            self._prune_locked(global_step)
+            state = self._states.get(key)
+            if state == "ready":
+                return "recipient"
+            if state == "in_progress":
+                return "recipient_wait"
+            self._states[key] = "in_progress"
+            self._changed.notify_all()
+            return "donor"
+
+    async def mark_ready(self, key: str) -> None:
+        async with self._changed:
+            self._states[key] = "ready"
+            self._changed.notify_all()
+
+    async def mark_failed(self, key: str) -> None:
+        async with self._changed:
+            if self._states.get(key) == "in_progress":
+                self._states[key] = "failed"
+            self._changed.notify_all()
+
+    async def wait_until_ready(self, key: str, timeout_s: float) -> bool:
+        deadline = time.monotonic() + timeout_s if timeout_s > 0 else None
+        async with self._changed:
+            while self._states.get(key) == "in_progress":
+                if deadline is None:
+                    await self._changed.wait()
+                    continue
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return False
+                try:
+                    await asyncio.wait_for(self._changed.wait(), timeout=remaining)
+                except asyncio.TimeoutError:
+                    return False
+            return self._states.get(key) == "ready"
+
+    async def get_status(self) -> dict[str, Any]:
+        async with self._changed:
+            counts: dict[str, int] = {}
+            for state in self._states.values():
+                counts[state] = counts.get(state, 0) + 1
+            return {
+                "states": counts,
+                "num_keys": len(self._states),
+                "recent_steps": list(self._recent_steps),
+            }
 
 
 @ray.remote
@@ -218,6 +363,7 @@ class LLMServerClient:
         self,
         config: DictConfig,
         load_balancer_handle: ray.actor.ActorHandle,
+        cacheblend_coordinator_handle: Optional[ray.actor.ActorHandle] = None,
         **kwargs,
     ):
         """Initialize the LLMServerClient.
@@ -229,11 +375,13 @@ class LLMServerClient:
         """
         self.config = config
         self._load_balancer = load_balancer_handle
+        self._cacheblend_coordinator = cacheblend_coordinator_handle
         self._vlm_cacheblend_warmed_uids: set[str] = set()
         self._vlm_cacheblend_warmup_locks: dict[str, asyncio.Lock] = {}
         self._vlm_cacheblend_warmup_recent_steps: list[int] = []
         self._vlm_cacheblend_barrier_log_lock = asyncio.Lock()
         self._vlm_cacheblend_barrier_log_ready = False
+        self._vlm_cacheblend_missing_step_warned = False
 
     def _vlm_cacheblend_warmup_key(
         self,
@@ -251,11 +399,11 @@ class LLMServerClient:
             turn = int(agent_turn)
         except (TypeError, ValueError):
             return None
-        if turn != _vlm_cacheblend_target_turn():
+        if turn == 0 and _vlm_cacheblend_prefix_warmup_enabled():
+            return f"prefix:{_cacheblend_group_key(str(agent_uid), global_step)}:turn0"
+        if not _vlm_cacheblend_turn_enabled(turn):
             return None
-        if global_step is None:
-            return str(agent_uid)
-        return f"{global_step}:{agent_uid}"
+        return f"cacheblend:{_cacheblend_group_key(str(agent_uid), global_step)}:turn{turn}"
 
     def _vlm_cacheblend_warmup_lock(self, key: str) -> asyncio.Lock:
         lock = self._vlm_cacheblend_warmup_locks.get(key)
@@ -300,8 +448,10 @@ class LLMServerClient:
         barrier_role: BarrierRole,
         wait_ms: float,
         donor_ready: bool,
+        routing_request_id: Optional[str] = None,
+        server_id: Optional[str] = None,
     ) -> None:
-        target_turn = _vlm_cacheblend_target_turn()
+        target_turn = _vlm_cacheblend_target_turns_spec()
         barrier_enabled = _vlm_cacheblend_enabled() and _vlm_cacheblend_warmup_barrier_enabled()
         fields = {
             "barrier_enabled": barrier_enabled,
@@ -313,6 +463,8 @@ class LLMServerClient:
             "global_step": global_step if global_step is not None else "",
             "request_id": request_id,
             "warmup_key": warmup_key or "",
+            "routing_request_id": routing_request_id or "",
+            "server_id": server_id or "",
             "wait_ms": f"{wait_ms:.3f}",
             "donor_ready": donor_ready,
         }
@@ -330,12 +482,16 @@ class LLMServerClient:
         }
         async with self._vlm_cacheblend_barrier_log_lock:
             log_path.parent.mkdir(parents=True, exist_ok=True)
-            write_header = not self._vlm_cacheblend_barrier_log_ready and not log_path.exists()
-            with log_path.open("a", encoding="utf-8", newline="") as handle:
+            with log_path.open("a+", encoding="utf-8", newline="") as handle:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+                handle.seek(0, os.SEEK_END)
+                write_header = handle.tell() == 0
                 writer = csv.DictWriter(handle, fieldnames=list(row.keys()))
                 if write_header:
                     writer.writeheader()
                 writer.writerow(row)
+                handle.flush()
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
             self._vlm_cacheblend_barrier_log_ready = True
 
     async def _acquire_server(self, request_id: str) -> tuple[str, ray.actor.ActorHandle]:
@@ -373,15 +529,26 @@ class LLMServerClient:
         Returns:
             TokenOutput | DiffusionOutput: token or diffusion output
         """
+        warmup_global_step = kwargs.pop("training_global_step", kwargs.pop("global_step", None))
+        if warmup_global_step is not None:
+            kwargs["training_global_step"] = warmup_global_step
+        elif _vlm_cacheblend_enabled() and agent_uid and not self._vlm_cacheblend_missing_step_warned:
+            self._vlm_cacheblend_missing_step_warned = True
+            logger.warning(
+                "VLM CacheBlend request has agent_uid=%s but no training_global_step/global_step; "
+                "routing and warmup keys will fall back to agent_uid only.",
+                agent_uid,
+            )
         routing_request_id = request_id
-        if (_grpo_sim_cache_enabled() or _vlm_cacheblend_enabled()) and agent_uid:
+        if _vlm_cacheblend_enabled() and agent_uid:
+            routing_request_id = f"cacheblend_group:{_cacheblend_group_key(str(agent_uid), warmup_global_step)}"
+        elif _grpo_sim_cache_enabled() and agent_uid:
             routing_request_id = f"grpo_agent_uid:{agent_uid}"
 
-        warmup_global_step = kwargs.get("training_global_step", kwargs.get("global_step"))
         self._maybe_prune_warmed_uids(warmup_global_step)
         warmup_key = self._vlm_cacheblend_warmup_key(agent_uid, agent_turn, warmup_global_step)
 
-        async def _call_server() -> TokenOutput:
+        async def _call_server() -> tuple[TokenOutput, str]:
             server_id, server = await self._acquire_server(routing_request_id)
             try:
                 multimodal_kwargs = {}
@@ -395,7 +562,7 @@ class LLMServerClient:
                 else:
                     sglang_request_id = uuid4().hex
 
-                return await server.generate.remote(
+                output = await server.generate.remote(
                     request_id=sglang_request_id,
                     prompt_ids=prompt_ids,
                     sampling_params=sampling_params,
@@ -408,10 +575,12 @@ class LLMServerClient:
                     **multimodal_kwargs,
                     **kwargs,
                 )
+                return output, str(server_id)
             finally:
                 self._release_server(server_id)
 
         if warmup_key is None:
+            output, server_id = await _call_server()
             await self._log_cacheblend_barrier_event(
                 request_id=str(request_id),
                 agent_uid=agent_uid,
@@ -422,10 +591,63 @@ class LLMServerClient:
                 barrier_role="bypass",
                 wait_ms=0.0,
                 donor_ready=False,
+                routing_request_id=str(routing_request_id),
+                server_id=server_id,
             )
-            return await _call_server()
+            return output
+
+        if self._cacheblend_coordinator is not None:
+            wait_start = time.perf_counter()
+            acquire_role = await self._cacheblend_coordinator.begin_warmup.remote(
+                warmup_key,
+                warmup_global_step,
+            )
+            if acquire_role == "donor":
+                try:
+                    output, server_id = await _call_server()
+                except Exception:
+                    await self._cacheblend_coordinator.mark_failed.remote(warmup_key)
+                    raise
+                await self._cacheblend_coordinator.mark_ready.remote(warmup_key)
+                await self._log_cacheblend_barrier_event(
+                    request_id=str(request_id),
+                    agent_uid=agent_uid,
+                    agent_turn=agent_turn,
+                    rollout_idx=rollout_idx,
+                    global_step=warmup_global_step,
+                    warmup_key=warmup_key,
+                    barrier_role="donor",
+                    wait_ms=(time.perf_counter() - wait_start) * 1000.0,
+                    donor_ready=True,
+                    routing_request_id=str(routing_request_id),
+                    server_id=server_id,
+                )
+                return output
+
+            donor_ready = True
+            if acquire_role == "recipient_wait":
+                donor_ready = await self._cacheblend_coordinator.wait_until_ready.remote(
+                    warmup_key,
+                    _vlm_cacheblend_warmup_timeout_s(),
+                )
+            output, server_id = await _call_server()
+            await self._log_cacheblend_barrier_event(
+                request_id=str(request_id),
+                agent_uid=agent_uid,
+                agent_turn=agent_turn,
+                rollout_idx=rollout_idx,
+                global_step=warmup_global_step,
+                warmup_key=warmup_key,
+                barrier_role="recipient",
+                wait_ms=(time.perf_counter() - wait_start) * 1000.0,
+                donor_ready=donor_ready,
+                routing_request_id=str(routing_request_id),
+                server_id=server_id,
+            )
+            return output
 
         if warmup_key in self._vlm_cacheblend_warmed_uids:
+            output, server_id = await _call_server()
             await self._log_cacheblend_barrier_event(
                 request_id=str(request_id),
                 agent_uid=agent_uid,
@@ -436,14 +658,16 @@ class LLMServerClient:
                 barrier_role="recipient",
                 wait_ms=0.0,
                 donor_ready=True,
+                routing_request_id=str(routing_request_id),
+                server_id=server_id,
             )
-            return await _call_server()
+            return output
 
         wait_start = time.perf_counter()
         async with self._vlm_cacheblend_warmup_lock(warmup_key):
             wait_ms = (time.perf_counter() - wait_start) * 1000.0
             if warmup_key not in self._vlm_cacheblend_warmed_uids:
-                output = await _call_server()
+                output, server_id = await _call_server()
                 self._vlm_cacheblend_warmed_uids.add(warmup_key)
                 await self._log_cacheblend_barrier_event(
                     request_id=str(request_id),
@@ -455,8 +679,11 @@ class LLMServerClient:
                     barrier_role="donor",
                     wait_ms=wait_ms,
                     donor_ready=True,
+                    routing_request_id=str(routing_request_id),
+                    server_id=server_id,
                 )
                 return output
+            output, server_id = await _call_server()
             await self._log_cacheblend_barrier_event(
                 request_id=str(request_id),
                 agent_uid=agent_uid,
@@ -467,8 +694,10 @@ class LLMServerClient:
                 barrier_role="recipient",
                 wait_ms=wait_ms,
                 donor_ready=True,
+                routing_request_id=str(routing_request_id),
+                server_id=server_id,
             )
-        return await _call_server()
+            return output
 
 
 class LLMServerManager:
@@ -590,6 +819,9 @@ class LLMServerManager:
             servers=dict(zip(self.server_addresses, self.server_handles, strict=True)),
             max_cache_size=DEFAULT_ROUTING_CACHE_SIZE,
         )
+        self.global_cacheblend_coordinator = GlobalCacheBlendCoordinator.remote(
+            keep_steps=_vlm_cacheblend_warmup_keep_steps(),
+        )
 
     def get_client(self, client_cls=LLMServerClient, **kwargs) -> LLMServerClient:
         """Get the LLMServerClient to request LLM server replicas.
@@ -602,6 +834,7 @@ class LLMServerManager:
         return client_cls(
             config=self.config,
             load_balancer_handle=self.global_load_balancer,
+            cacheblend_coordinator_handle=self.global_cacheblend_coordinator,
             **kwargs,
         )
 
