@@ -26,9 +26,16 @@ branches when turn0 responses diverge and refocus images are similar but not ide
 | verl | `verl-project/verl` | `802256a7` |
 | sglang | `sgl-project/sglang` | `0189f41` |
 
+## Documentation
+
+**中文总览（从建仓到现在做了什么、算法步骤、代码位置）：**  
+[`docs/GraftRL_项目全历程.md`](docs/GraftRL_项目全历程.md)
+
+版本标签说明：[`docs/RELEASES.md`](docs/RELEASES.md)
+
 ## Quick start (profiling)
 
-See `verl/examples/profile/README.md` and `docs/RELEASES.md` for staged milestones.
+See `verl/examples/profile/README.md` for how to run workloads.
 
 Typical CacheBlend profiling (Chart refocus):
 
