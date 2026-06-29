@@ -70,8 +70,11 @@ class VLMCacheBlendConfig:
     recompute_ratio: float = 0.15
     # for select_mode="sim": tokens with similarity < this are forced to recompute.
     sim_threshold: float = 0.90
-    # only act on these turns (turn1 is the GRPO refocus turn).
+    # Legacy single-turn selector. Kept for compatibility when target_turns is unset.
     target_turn: int = 1
+    # Turn selector for CacheBlend: "all" or a comma-separated list such as "1,2,3".
+    # "all" means every agent turn >= 1. Turn0 is handled by prefix warmup, not KV grafting.
+    target_turns: str = "1"
     # Which logical image slot to cache. -1 means the last image span, which is the
     # refocus image in the turn1 prompts used by this experiment.
     target_image_slot: int = -1
@@ -115,6 +118,12 @@ class VLMCacheBlendConfig:
             recompute_ratio=_env_float("SGLANG_VLM_CACHEBLEND_RECOMPUTE_RATIO", 0.15),
             sim_threshold=_env_float("SGLANG_VLM_CACHEBLEND_SIM_THRESHOLD", 0.90),
             target_turn=_env_int("SGLANG_VLM_CACHEBLEND_TARGET_TURN", 1),
+            target_turns=os.environ.get(
+                "SGLANG_VLM_CACHEBLEND_TARGET_TURNS",
+                os.environ.get("SGLANG_VLM_CACHEBLEND_TARGET_TURN", "1"),
+            )
+            .strip()
+            .lower(),
             target_image_slot=_env_int("SGLANG_VLM_CACHEBLEND_TARGET_IMAGE_SLOT", -1),
             max_groups=_env_int("SGLANG_VLM_CACHEBLEND_MAX_GROUPS", 64),
             verbose=_env_flag("SGLANG_VLM_CACHEBLEND_VERBOSE", "0"),
@@ -145,6 +154,32 @@ def get_config() -> VLMCacheBlendConfig:
 
 def cacheblend_enabled() -> bool:
     return _CONFIG.enabled
+
+
+def target_turn_enabled(agent_turn: int, cfg: Optional[VLMCacheBlendConfig] = None) -> bool:
+    """Return True when the given turn should use VLM CacheBlend.
+
+    Turn0 is intentionally excluded: identical first-turn images are prefix-cache
+    material and should be handled by rollout-side warmup, not donor KV grafting.
+    """
+    if agent_turn < 1:
+        return False
+    cfg = cfg or get_config()
+    spec = (cfg.target_turns or str(cfg.target_turn)).strip().lower()
+    if spec in ("all", "*"):
+        return True
+    turns = set()
+    for part in spec.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            turns.add(int(part))
+        except ValueError:
+            continue
+    if turns:
+        return agent_turn in turns
+    return agent_turn == int(cfg.target_turn)
 
 
 def reload_config_from_env() -> VLMCacheBlendConfig:
@@ -1469,12 +1504,12 @@ def _build_request_context_for_req(
         return None
     cfg = get_config()
     agent_turn = int(agent_turn)
-    if agent_turn != int(cfg.target_turn):
+    if not target_turn_enabled(agent_turn, cfg):
         log_stats(
             CacheBlendStats(
                 role="none",
                 request_id=rid,
-                fallback_reason=f"agent_turn_mismatch:{agent_turn}",
+                fallback_reason=f"agent_turn_mismatch:{agent_turn}:targets={cfg.target_turns}",
             ).finalize()
         )
         return None

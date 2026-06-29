@@ -79,6 +79,19 @@ def test_select_sim_threshold():
     print("ok test_select_sim_threshold")
 
 
+def test_target_turn_enabled_all_and_list():
+    cfg_all = _cfg(target_turns="all")
+    assert not cb.target_turn_enabled(0, cfg_all)
+    assert cb.target_turn_enabled(1, cfg_all)
+    assert cb.target_turn_enabled(15, cfg_all)
+
+    cfg_list = _cfg(target_turns="1,3,15")
+    assert cb.target_turn_enabled(1, cfg_list)
+    assert not cb.target_turn_enabled(2, cfg_list)
+    assert cb.target_turn_enabled(15, cfg_list)
+    print("ok test_target_turn_enabled_all_and_list")
+
+
 def test_positions_match():
     a = torch.arange(12).reshape(3, 4)
     b = a.clone()
