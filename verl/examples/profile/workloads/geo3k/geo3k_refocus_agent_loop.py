@@ -139,6 +139,11 @@ class Geo3KRefocusAgentLoop(AgentLoopBase):
             os.environ.get("GEO3K_REFOCUS_FINAL_TURN_MAX_NEW_TOKENS", final_turn_max_new_tokens)
         )
         self.second_user_text = os.environ.get("GEO3K_REFOCUS_SECOND_USER_TEXT", second_user_text)
+        # Experimental prefill-donor warmup (SGLANG_VLM_CACHEBLEND_PREFILL_DONOR=1). Rollout
+        # profiling uses the standard warm barrier in llm_server.generate instead.
+        # self.cacheblend_prefill_donor = os.environ.get(
+        #     "SGLANG_VLM_CACHEBLEND_PREFILL_DONOR", "0"
+        # ).strip().lower() in ("1", "true", "yes", "on")
 
     def _sampling_params(self, sampling_params: dict[str, Any], max_new_tokens: int) -> dict[str, Any]:
         params = dict(sampling_params)
@@ -262,6 +267,22 @@ class Geo3KRefocusAgentLoop(AgentLoopBase):
 
         remaining_budget = min(self.final_turn_max_new_tokens, self.response_length - len(response_mask))
         if remaining_budget > 0:
+            # if self.cacheblend_prefill_donor:
+            #     with simple_timer("cacheblend_prefill_warmup", metrics):
+            #         warmup_ready = await self.server_manager.cacheblend_prefill_warmup(
+            #             request_id=request_id,
+            #             prompt_ids=full_ids,
+            #             sampling_params=self._sampling_params(sampling_params, 1),
+            #             image_data=images,
+            #             video_data=videos,
+            #             audio_data=audios,
+            #             mm_processor_kwargs=mm_processor_kwargs,
+            #             agent_turn=1,
+            #             agent_uid=uid,
+            #             rollout_idx=rollout_idx,
+            #             training_global_step=global_step,
+            #         )
+            #     metrics["cacheblend_prefill_warmup_ready"] = 1.0 if warmup_ready else 0.0
             with simple_timer("generate_sequences_second_turn", metrics):
                 second: TokenOutput = await self.server_manager.generate(
                     request_id=request_id,

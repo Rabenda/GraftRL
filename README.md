@@ -37,6 +37,59 @@ branches when turn0 responses diverge and refocus images are similar but not ide
 
 See `verl/examples/profile/README.md` for how to run workloads.
 
+### Geo3K rollout demo — baseline vs E+P optimization
+
+The fastest way to reproduce **CacheBlend off vs kvdev + warm barrier** on the Geo3K
+refocus workload (**64×4**, standard PPO recompute — no training bypass):
+
+**Prerequisites**
+
+- 4 GPUs (80GB recommended), conda env with patched `verl` + `sglang` from this repo
+- Run from `graftrl/verl`
+
+```bash
+cd verl
+export CUDA_VISIBLE_DEVICES=0,1,2,3   # use your 4 GPUs
+conda activate verl_vision            # or your env name
+export RAY_TMPDIR=/dev/shm/rsg        # short path; avoids Ray socket issues
+export RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES=1
+mkdir -p "${RAY_TMPDIR}"
+```
+
+**ARM A — baseline** (CacheBlend off):
+
+```bash
+bash examples/profile/workloads/geo3k/run_geo3k_rollout_demo.sh baseline
+```
+
+**ARM B — rollout E+P optimized** (kvdev + warm barrier + bounded wait):
+
+```bash
+bash examples/profile/workloads/geo3k/run_geo3k_rollout_demo.sh optimized
+```
+
+Each run executes **2 training steps**; **analyze step 2** (step 1 is warmup).
+
+```bash
+# Whole-step timing (rollout = timing_s/gen)
+grep 'step:2' profile_logs_geo3k_rollout_ab/geo3k_refocus_exact_demo_off_*.log | grep timing_s
+grep 'step:2' profile_logs_geo3k_rollout_ab/geo3k_refocus_exact_demo_kvdev_*.log | grep timing_s
+
+# Per-request turn1 E+P report
+python3 examples/profile/shared/analysis/analyze_profiling_logs.py \
+  --log-dir profile_logs_geo3k_refocus_exact_demo_kvdev_slotslast_fa0_cp0 \
+  --suffix geo3k_refocus_exact_demo_kvdev_slotslast_fa0_cp0_bs64_n4 --report
+```
+
+If optimized runs show `donor_ready=0%` in `cacheblend_barrier_log_*.csv`, raise wait
+time: `SGLANG_VLM_CACHEBLEND_WARMUP_BARRIER_MAX_WAIT_S=10 bash ... optimized` (demo
+defaults to 10s).
+
+More context: [`docs/GraftRL_项目全历程.md`](docs/GraftRL_项目全历程.md) §11,
+[`verl/docs/geo3k_profiling_archive_0702.md`](verl/docs/geo3k_profiling_archive_0702.md).
+
+### Chart refocus (legacy quick start)
+
 Typical CacheBlend profiling (Chart refocus):
 
 ```bash
