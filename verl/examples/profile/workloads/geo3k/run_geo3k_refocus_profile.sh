@@ -106,6 +106,12 @@ run_one() {
   export VERL_PROFILE_ROLLOUT_ONLY="${VERL_PROFILE_ROLLOUT_ONLY:-1}"
   # Long-trajectory workloads can narrow this to "1" or "1,3" to reduce per-turn warmup barriers.
   export SGLANG_VLM_CACHEBLEND_TARGET_TURNS="${SGLANG_VLM_CACHEBLEND_TARGET_TURNS:-all}"
+  if env_flag_enabled "${SGLANG_VLM_CACHEBLEND:-0}"; then
+    # Strictly waiting for donor full generation preserves reuse but splits decode batches.
+    # Bounded wait keeps the barrier fail-open so recipients can still join large decode batches.
+    export SGLANG_VLM_CACHEBLEND_WARMUP_BARRIER_WAIT_POLICY="${SGLANG_VLM_CACHEBLEND_WARMUP_BARRIER_WAIT_POLICY:-bounded}"
+    export SGLANG_VLM_CACHEBLEND_WARMUP_BARRIER_MAX_WAIT_S="${SGLANG_VLM_CACHEBLEND_WARMUP_BARRIER_MAX_WAIT_S:-0.05}"
+  fi
 
   local chunked_prefill_args=()
   local chunked_prefill_key="actor_rollout_ref.rollout.engine_kwargs.sglang.chunked_prefill_size"
@@ -118,7 +124,8 @@ run_one() {
     rm -f \
       "${log_root}/model_forward_log_${suffix}.csv" \
       "${log_root}/vision_encoder_log_${suffix}.csv" \
-      "${log_root}/verl_sglang_generate_log_${suffix}.csv"
+      "${log_root}/verl_sglang_generate_log_${suffix}.csv" \
+      "${log_root}/cacheblend_barrier_log_${suffix}.csv"
     rm -rf "${PROFILE_IMAGE_DUMP_DIR}" "${PROFILE_ROLLOUT_DATA_DIR}"
     mkdir -p "${PROFILE_IMAGE_DUMP_DIR}" "${PROFILE_ROLLOUT_DATA_DIR}"
   fi

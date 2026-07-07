@@ -35,6 +35,22 @@ def test_cacheblend_barrier_timeout_is_not_silent_fallback() -> None:
     assert "donor_ready=False" in source
 
 
+def test_cacheblend_barrier_supports_bounded_wait_policy() -> None:
+    source = LLM_SERVER_SOURCE.read_text(encoding="utf-8")
+    assert "SGLANG_VLM_CACHEBLEND_WARMUP_BARRIER_WAIT_POLICY" in source
+    assert "SGLANG_VLM_CACHEBLEND_WARMUP_BARRIER_MAX_WAIT_S" in source
+    assert "_vlm_cacheblend_warmup_wait_timeout_s()" in source
+    assert "continuing with bounded CacheBlend barrier" in source
+    assert "if timeout_s <= 0:" in source
+
+
+def test_cacheblend_barrier_log_splits_wait_and_server_time() -> None:
+    source = LLM_SERVER_SOURCE.read_text(encoding="utf-8")
+    assert '"barrier_wait_ms": f"{barrier_wait_ms:.3f}"' in source
+    assert '"server_call_ms": f"{server_call_ms:.3f}"' in source
+    assert '"wait_policy": wait_policy' in source
+
+
 def test_cacheblend_metadata_registration_failure_is_logged() -> None:
     source = SGLANG_SERVER_SOURCE.read_text(encoding="utf-8")
     assert "Failed to register SGLang request metadata" in source
@@ -46,6 +62,13 @@ def test_refocus_profile_disables_chunked_prefill_when_cacheblend_is_enabled() -
     assert "SGLANG_VLM_CACHEBLEND" in source
     assert "actor_rollout_ref.rollout.engine_kwargs.sglang.chunked_prefill_size" in source
     assert "CACHEBLEND_CHUNKED_PREFILL_SIZE:--1" in source
+
+
+def test_refocus_profile_defaults_cacheblend_to_bounded_barrier() -> None:
+    source = REFOCUS_PROFILE_SCRIPT.read_text(encoding="utf-8")
+    assert "SGLANG_VLM_CACHEBLEND_WARMUP_BARRIER_WAIT_POLICY" in source
+    assert "SGLANG_VLM_CACHEBLEND_WARMUP_BARRIER_MAX_WAIT_S" in source
+    assert "cacheblend_barrier_log_${suffix}.csv" in source
 
 
 def test_profile_agent_loops_forward_training_global_step_with_agent_uid() -> None:
