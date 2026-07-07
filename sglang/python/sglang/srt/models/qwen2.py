@@ -244,6 +244,10 @@ class Qwen2Attention(nn.Module):
         cfg = _vlm_cacheblend.get_config()
         if not cfg.fast_path or not cfg.skip_reuse_qkv_proj:
             return torch.empty(0, dtype=torch.long, device=hidden_states.device)
+        # Compact prefill already dropped reused tokens from the stream; there is nothing
+        # left to skip within the active-only hidden states.
+        if getattr(forward_batch, "_cacheblend_compact", False):
+            return torch.empty(0, dtype=torch.long, device=hidden_states.device)
         return _vlm_cacheblend.recipient_reuse_token_indices(
             getattr(forward_batch, "out_cache_loc", None),
             device=hidden_states.device,
@@ -339,6 +343,9 @@ class Qwen2DecoderLayer(nn.Module):
             return torch.empty(0, dtype=torch.long, device=hidden_states.device)
         cfg = _vlm_cacheblend.get_config()
         if not cfg.fast_path or not cfg.skip_reuse_mlp:
+            return torch.empty(0, dtype=torch.long, device=hidden_states.device)
+        # Compact prefill already dropped reused tokens from the stream.
+        if getattr(forward_batch, "_cacheblend_compact", False):
             return torch.empty(0, dtype=torch.long, device=hidden_states.device)
         return _vlm_cacheblend.recipient_reuse_token_indices(
             getattr(forward_batch, "out_cache_loc", None),
@@ -443,12 +450,36 @@ class Qwen2Model(nn.Module):
 
         self._cacheblend_prepare_recipient_fast_path(input_ids, forward_batch)
 
+        # [VLM-CacheBlend Method C] compact prefill: drop donor-reused image tokens from
+        # the layer loop so layernorm/rotary/residual/QKV/MLP/attention run on the shorter
+        # active sequence. Reused tokens' K/V is supplied by the donor (written to the pool
+        # by apply), so the attention context stays complete.
+        #
+        # kvdev/sim selection only finalizes the recompute mask at a bootstrap layer (it
+        # needs the recipient's own image-token K), so we compact *mid-stack* at the first
+        # layer where all plans are finalized: layer 0 for static masks, bootstrap+1 for
+        # deferred masks. Compaction drops reused rows from hidden_states + residual +
+        # positions; we decompact once after the final norm.
+        compact_ok = self._cacheblend_compact_enabled()
+        compact_active = None
+
         aux_hidden_states = []
         for i in range(self.start_layer, self.end_layer):
             if i in self.layers_to_capture:
                 aux_hidden_states.append(
                     hidden_states + residual if residual is not None else hidden_states
                 )
+            if compact_ok and compact_active is None:
+                compact_active = self._cacheblend_maybe_compact(
+                    forward_batch, hidden_states
+                )
+                if compact_active is not None:
+                    hidden_states = hidden_states.index_select(0, compact_active)
+                    if residual is not None:
+                        residual = residual.index_select(0, compact_active)
+                    positions = self._cacheblend_compact_positions(
+                        positions, compact_active
+                    )
             layer = self.layers[i]
             hidden_states, residual = layer(
                 positions,
@@ -479,10 +510,83 @@ class Qwen2Model(nn.Module):
                 else:
                     hidden_states, _ = self.norm(hidden_states, residual)
 
+        # [VLM-CacheBlend Method C] decompact: scatter active-token hidden states back to
+        # full length so the logits processor (which gathers each sequence's last token by
+        # absolute position) is unchanged. Reused image tokens are never a sequence's last
+        # token, so their zeroed rows here are never read for logits.
+        if compact_active is not None:
+            hidden_states = self._cacheblend_compact_end(
+                forward_batch, hidden_states, compact_active
+            )
+
         if len(aux_hidden_states) == 0:
             return hidden_states
 
         return hidden_states, aux_hidden_states
+
+    def _cacheblend_compact_enabled(self) -> bool:
+        """Whether compact prefill may run for this forward.
+
+        Restricted to a single pipeline stage (first==last rank) and to forwards without
+        aux-hidden capture, so the compaction stays fully contained here and the compact
+        residual stream never leaks to another stage.
+        """
+        if not (self.pp_group.is_first_rank and self.pp_group.is_last_rank):
+            return False
+        if self.layers_to_capture:
+            return False
+        cfg = _vlm_cacheblend.get_config() if _vlm_cacheblend.cacheblend_enabled() else None
+        return bool(cfg is not None and cfg.fast_path and cfg.compact_prefill)
+
+    def _cacheblend_maybe_compact(
+        self, forward_batch: ForwardBatch, hidden_states: torch.Tensor
+    ) -> Optional[torch.Tensor]:
+        """Return active-token indices to compact from this layer on, or None.
+
+        Called at the start of each layer until it fires once. It only returns indices
+        once all recipient plans are finalized (so the bootstrap layer's recipient K has
+        already been computed for deferred kvdev/sim masks).
+        """
+        active = _vlm_cacheblend.recipient_compact_active_indices(forward_batch)
+        if active is None:
+            return None
+        active = active.to(device=hidden_states.device, dtype=torch.long)
+        # Degenerate guards: nothing to drop, or shape inconsistent with the batch.
+        if active.numel() == 0 or active.numel() >= hidden_states.shape[0]:
+            return None
+        object.__setattr__(forward_batch, "_cacheblend_compact", True)
+        object.__setattr__(forward_batch, "_cacheblend_compact_active", active)
+        return active
+
+    @staticmethod
+    def _cacheblend_compact_positions(
+        positions: torch.Tensor, active: torch.Tensor
+    ) -> torch.Tensor:
+        if positions is None or not isinstance(positions, torch.Tensor):
+            return positions
+        if positions.dim() == 2:  # mrope [3, n]
+            return positions.index_select(1, active)
+        if positions.dim() == 1:
+            return positions.index_select(0, active)
+        return positions
+
+    @staticmethod
+    def _cacheblend_compact_end(
+        forward_batch: ForwardBatch,
+        compact_hidden: torch.Tensor,
+        active: torch.Tensor,
+    ) -> torch.Tensor:
+        try:
+            total = int(getattr(forward_batch, "out_cache_loc").numel())
+        except Exception:
+            total = None
+        if total is None or total < compact_hidden.shape[0]:
+            total = int(active.max().item()) + 1
+        full = compact_hidden.new_zeros((total, compact_hidden.shape[-1]))
+        full.index_copy_(0, active, compact_hidden)
+        object.__setattr__(forward_batch, "_cacheblend_compact", False)
+        object.__setattr__(forward_batch, "_cacheblend_compact_active", None)
+        return full
 
     def _cacheblend_prepare_recipient_fast_path(
         self, input_ids: torch.Tensor, forward_batch: ForwardBatch
@@ -701,7 +805,7 @@ class Qwen2Model(nn.Module):
                 )
             if ctx.role == "recipient":
                 return self._cacheblend_probe_recipient(ctx, img_locs, img_positions)
-            _vlm_cacheblend.capture_donor_kv(
+            donor_entry = _vlm_cacheblend.capture_donor_kv(
                 forward_batch=forward_batch,
                 layer_ids=layer_ids,
                 img_locs=img_locs,
@@ -710,6 +814,9 @@ class Qwen2Model(nn.Module):
                 positions=img_positions,
                 to_cpu=_vlm_cacheblend.get_config().donor_to_cpu,
             )
+            notified_ready = False
+            if donor_entry is not None:
+                notified_ready = _vlm_cacheblend.notify_donor_prefill_ready(ctx)
             return (
                 _vlm_cacheblend.CacheBlendStats(
                     role="donor",
@@ -717,7 +824,11 @@ class Qwen2Model(nn.Module):
                     n_image_tokens=int(img_locs.numel()),
                     pos_mode=_vlm_cacheblend.get_config().pos_mode,
                     select_mode=_vlm_cacheblend.get_config().select_mode,
-                    fallback_reason="donor_captured",
+                    fallback_reason=(
+                        "donor_captured_prefill_ready"
+                        if notified_ready
+                        else "donor_captured"
+                    ),
                 ).finalize()
             )
         except Exception as exc:  # never break the forward pass on capture failure
@@ -760,16 +871,33 @@ class Qwen2Model(nn.Module):
             cfg,
             device=img_locs.device,
         )
+        plan = _vlm_cacheblend.get_recipient_blend_plan_for(
+            ctx.request_id, getattr(ctx, "group_key", None)
+        )
         stats.eligible = True
-        stats.recomputed_tokens = int(recompute_mask.sum().item())
-        stats.reused_tokens = int(img_locs.numel()) - stats.recomputed_tokens
+        if plan is not None:
+            stats.recomputed_tokens = int(plan.recomputed_tokens)
+            stats.reused_tokens = int(plan.reused_tokens)
+            stats.plan_wall_ms = float(plan.plan_wall_ms)
+            stats.bootstrap_wall_ms = float(plan.bootstrap_wall_ms)
+            stats.apply_wall_ms = float(plan.apply_wall_ms)
+            stats.applied_layers = int(plan.applied_layers)
+            stats.gate_reason = str(plan.gate_reason or "")
+        else:
+            stats.recomputed_tokens = int(recompute_mask.sum().item())
+            stats.reused_tokens = int(img_locs.numel()) - stats.recomputed_tokens
+        if stats.gate_reason:
+            stats.fallback_reason = stats.gate_reason
+            return stats.finalize()
         if _vlm_cacheblend.recipient_blend_was_used(ctx.request_id):
             stats.used = True
             stats.fallback_reason = "recipient_kv_blended"
             (
                 stats.attention_skipped_tokens,
                 stats.attention_active_ranges,
-            ) = _vlm_cacheblend.recipient_attention_skip_stats(ctx.request_id)
+            ) = _vlm_cacheblend.recipient_attention_skip_stats(
+                ctx.request_id, getattr(ctx, "group_key", None)
+            )
         else:
             stats.fallback_reason = "recipient_fast_path_not_applied"
         return stats.finalize()
@@ -793,6 +921,15 @@ class Qwen2Model(nn.Module):
             f"{reason}={count}" for reason, count in sorted(reasons.items())
         )
         cfg = _vlm_cacheblend.get_config()
+
+        def _sum_ms(field):
+            values = [
+                float(getattr(s, field, -1.0))
+                for s in stats_list
+                if float(getattr(s, field, -1.0)) >= 0
+            ]
+            return sum(values) if values else -1.0
+
         return _vlm_cacheblend.CacheBlendStats(
             role=role,
             used=any(s.used for s in stats_list),
@@ -804,6 +941,19 @@ class Qwen2Model(nn.Module):
             recomputed_tokens=sum(int(s.recomputed_tokens) for s in stats_list),
             pos_mode=cfg.pos_mode,
             select_mode=cfg.select_mode,
+            plan_wall_ms=_sum_ms("plan_wall_ms"),
+            bootstrap_wall_ms=_sum_ms("bootstrap_wall_ms"),
+            apply_wall_ms=_sum_ms("apply_wall_ms"),
+            applied_layers=sum(int(getattr(s, "applied_layers", 0)) for s in stats_list),
+            gate_reason=";".join(
+                sorted(
+                    {
+                        str(getattr(s, "gate_reason", ""))
+                        for s in stats_list
+                        if str(getattr(s, "gate_reason", ""))
+                    }
+                )
+            ),
             attention_skipped_tokens=sum(
                 int(getattr(s, "attention_skipped_tokens", 0)) for s in stats_list
             ),

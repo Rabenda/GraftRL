@@ -78,6 +78,14 @@ class VLMCacheBlendConfig:
     # Which logical image slot to cache. -1 means the last image span, which is the
     # refocus image in the turn1 prompts used by this experiment.
     target_image_slot: int = -1
+    # Multi-slot selector. Overrides ``target_image_slot`` when set to something other
+    # than the legacy default. Accepted values:
+    #   ""/"-1"/"legacy" : single slot given by ``target_image_slot`` (back-compat).
+    #   "all"/"*"        : every image span in the request (e.g. original + refocus).
+    #   "0,1" / "0,-1"   : an explicit comma-separated list of slots.
+    # Reusing the original (byte-identical across GRPO branches) image slot in addition
+    # to the refocus slot is the main lever for lifting recipient reuse coverage.
+    target_image_slots: str = "-1"
     # max number of groups kept in the donor store (LRU).
     max_groups: int = 64
     # emit per-request stats to stderr/log for profiling.
@@ -99,6 +107,20 @@ class VLMCacheBlendConfig:
     # Skip attention queries for reusable image tokens when the backend can preserve
     # the original causal alignment by running only active contiguous query ranges.
     skip_reuse_attention: bool = True
+    # Method B (fast apply): memoize the per-forward reuse-token index mapping and the
+    # donor->pool scatter indices so they are computed once instead of recomputed at
+    # every layer/op. This is numerically identical (bit-for-bit) to the slow path; it
+    # exists only to stop the O(reuse x tokens) index rebuild that otherwise scales with
+    # reuse coverage and eats the wall-clock gains from higher-coverage grafting.
+    fast_apply: bool = False
+    # Method C (compact prefill): physically drop donor-reused image tokens from the
+    # decoder layer loop. The residual stream is compacted to active-only tokens once at
+    # model entry and decompacted once at exit, so layernorm/rotary/residual/QKV/MLP and
+    # the attention run on the shorter active sequence instead of full length. Reused
+    # tokens' K/V comes entirely from the donor (written to the pool by apply), so the
+    # attention context stays complete. Default off; validate with GPU logit parity
+    # before trusting training output. Requires fast_path and the FA3 backend.
+    compact_prefill: bool = False
     # Legacy diagnostic path that overwrites KV after attention has already consumed the
     # recipient cache. This is unsafe for rollout quality and must stay off unless one is
     # explicitly debugging the old plumbing.
@@ -108,6 +130,11 @@ class VLMCacheBlendConfig:
     # on reuse. With ``max_groups`` donors x num_layers x image-span K/V this is the main
     # GPU-memory lever for the LLM side.
     donor_to_cpu: bool = False
+    # Low-value recipient gate. Disabled by default. When enabled, a recipient plan is
+    # converted to full recompute if the final reuse set is too small to justify the
+    # coordination/copy overhead.
+    min_reused_tokens: int = 0
+    min_reuse_ratio: float = 0.0
 
     @staticmethod
     def from_env() -> "VLMCacheBlendConfig":
@@ -125,9 +152,16 @@ class VLMCacheBlendConfig:
             .strip()
             .lower(),
             target_image_slot=_env_int("SGLANG_VLM_CACHEBLEND_TARGET_IMAGE_SLOT", -1),
+            target_image_slots=os.environ.get(
+                "SGLANG_VLM_CACHEBLEND_TARGET_IMAGE_SLOTS", "-1"
+            )
+            .strip()
+            .lower(),
             max_groups=_env_int("SGLANG_VLM_CACHEBLEND_MAX_GROUPS", 64),
             verbose=_env_flag("SGLANG_VLM_CACHEBLEND_VERBOSE", "0"),
             fast_path=_env_flag("SGLANG_VLM_CACHEBLEND_FAST_PATH", "1"),
+            fast_apply=_env_flag("SGLANG_VLM_CACHEBLEND_FAST_APPLY", "0"),
+            compact_prefill=_env_flag("SGLANG_VLM_CACHEBLEND_COMPACT_PREFILL", "0"),
             skip_reuse_mlp=_env_flag("SGLANG_VLM_CACHEBLEND_SKIP_REUSE_MLP", "1"),
             skip_reuse_qkv_proj=_env_flag(
                 "SGLANG_VLM_CACHEBLEND_SKIP_REUSE_QKV_PROJ", "1"
@@ -139,6 +173,8 @@ class VLMCacheBlendConfig:
                 "SGLANG_VLM_CACHEBLEND_UNSAFE_POST_ATTENTION_OVERLAY", "0"
             ),
             donor_to_cpu=_env_flag("SGLANG_VLM_CACHEBLEND_DONOR_TO_CPU", "0"),
+            min_reused_tokens=_env_int("SGLANG_VLM_CACHEBLEND_MIN_REUSED_TOKENS", 0),
+            min_reuse_ratio=_env_float("SGLANG_VLM_CACHEBLEND_MIN_REUSE_RATIO", 0.0),
         )
 
 
@@ -146,6 +182,9 @@ _CONFIG = VLMCacheBlendConfig.from_env()
 _DUMP_ONCE_ENABLED = _env_flag("SGLANG_VLM_CACHEBLEND_DUMP_ONCE", "0")
 _DUMP_ONCE_LOCK = threading.Lock()
 _DUMP_ONCE_DONE = False
+_PREFILL_READY_ACTOR = None
+_PREFILL_READY_ACTOR_LOCK = threading.Lock()
+_PREFILL_READY_LAST_WARN_S = 0.0
 
 
 def get_config() -> VLMCacheBlendConfig:
@@ -184,10 +223,11 @@ def target_turn_enabled(agent_turn: int, cfg: Optional[VLMCacheBlendConfig] = No
 
 def reload_config_from_env() -> VLMCacheBlendConfig:
     """Re-read env (useful for tests)."""
-    global _CONFIG, _DUMP_ONCE_ENABLED, _DUMP_ONCE_DONE
+    global _CONFIG, _DUMP_ONCE_ENABLED, _DUMP_ONCE_DONE, _PREFILL_READY_ACTOR
     _CONFIG = VLMCacheBlendConfig.from_env()
     _DUMP_ONCE_ENABLED = _env_flag("SGLANG_VLM_CACHEBLEND_DUMP_ONCE", "0")
     _DUMP_ONCE_DONE = False
+    _PREFILL_READY_ACTOR = None
     return _CONFIG
 
 
@@ -245,6 +285,15 @@ class RecipientKVBlendPlan:
     # the mask. The field name is kept for compatibility with the original kvdev path.
     bootstrap_layer_id: int = -1
     pending_deviation: bool = False
+    gate_reason: str = ""
+    plan_wall_ms: float = 0.0
+    bootstrap_wall_ms: float = 0.0
+    apply_wall_ms: float = 0.0
+    applied_layers: int = 0
+    # Method B (fast apply): per-forward memo of layer-invariant scatter indices
+    # (pool dst + optional direct-tensor donor->kv mapping). Keyed by a signature that
+    # changes when the recompute mask is finalized at the bootstrap layer.
+    apply_cache: Dict = field(default_factory=dict, repr=False, compare=False)
 
 
 @dataclass(frozen=True)
@@ -545,6 +594,7 @@ def finalize_recipient_plan_deviation(
     plan.recomputed_tokens = int(plan.recompute_mask.sum().item())
     plan.reused_tokens = int(plan.n_image_tokens - plan.recomputed_tokens)
     plan.pending_deviation = False
+    apply_low_value_gate(plan, cfg)
     return deviation
 
 
@@ -563,7 +613,45 @@ def finalize_recipient_plan_similarity(
     plan.recomputed_tokens = int(plan.recompute_mask.sum().item())
     plan.reused_tokens = int(plan.n_image_tokens - plan.recomputed_tokens)
     plan.pending_deviation = False
+    apply_low_value_gate(plan, cfg)
     return similarity
+
+
+def apply_low_value_gate(
+    plan: "RecipientKVBlendPlan",
+    cfg: Optional[VLMCacheBlendConfig] = None,
+) -> bool:
+    """Disable recipient reuse when the finalized reuse set is too small.
+
+    Returns True if the plan was converted to full recompute. The gate is intentionally
+    opt-in via env vars so existing experiments keep identical behavior.
+    """
+    cfg = cfg or get_config()
+    min_tokens = max(0, int(getattr(cfg, "min_reused_tokens", 0) or 0))
+    min_ratio = max(0.0, float(getattr(cfg, "min_reuse_ratio", 0.0) or 0.0))
+    if min_tokens <= 0 and min_ratio <= 0.0:
+        return False
+    n_img = max(0, int(plan.n_image_tokens))
+    reused = max(0, int(plan.reused_tokens))
+    ratio = (reused / n_img) if n_img > 0 else 0.0
+    reasons = []
+    if min_tokens > 0 and reused < min_tokens:
+        reasons.append(f"reused_tokens<{min_tokens}")
+    if min_ratio > 0.0 and ratio < min_ratio:
+        reasons.append(f"reuse_ratio<{min_ratio:.4f}")
+    if not reasons:
+        return False
+
+    plan.recompute_mask = torch.ones(
+        n_img,
+        dtype=torch.bool,
+        device=plan.recompute_mask.device,
+    )
+    plan.recomputed_tokens = n_img
+    plan.reused_tokens = 0
+    plan.pending_deviation = False
+    plan.gate_reason = "low_value_gate:" + ",".join(reasons)
+    return True
 
 
 # --------------------------------------------------------------------------- #
@@ -595,6 +683,7 @@ def build_recipient_kv_blend_plan(
     img_locs: torch.Tensor,
     img_positions: Optional[torch.Tensor],
 ) -> Tuple[Optional[RecipientKVBlendPlan], "CacheBlendStats"]:
+    started = time.perf_counter()
     cfg = get_config()
     stats = CacheBlendStats(
         role="recipient",
@@ -657,7 +746,14 @@ def build_recipient_kv_blend_plan(
         select_mode=cfg.select_mode,
         bootstrap_layer_id=bootstrap_layer_id,
         pending_deviation=pending_deviation,
+        plan_wall_ms=(time.perf_counter() - started) * 1000.0,
     )
+    if not pending_deviation:
+        if apply_low_value_gate(plan, cfg):
+            stats.recomputed_tokens = plan.recomputed_tokens
+            stats.reused_tokens = plan.reused_tokens
+            stats.fallback_reason = plan.gate_reason
+        stats.extend_wall_ms = plan.plan_wall_ms
     return plan, stats.finalize()
 
 
@@ -686,6 +782,42 @@ def _rerotate_plan_keys_if_needed(
     )
 
 
+def _apply_direct_tensor_mapping(
+    plan: "RecipientKVBlendPlan",
+    dst: torch.Tensor,
+    cache_locs: torch.Tensor,
+    device: torch.device,
+    reuse_count: int,
+) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+    """Map reused pool slots (``dst``) to positions in the current batch's direct k/v.
+
+    Returns ``(donor_idx, kv_idx)`` such that ``k[kv_idx] = donor_reuse[donor_idx]``.
+    This mapping only depends on ``cache_locs`` and the finalized reuse set, both of
+    which are constant across the decoder layers of one forward. With ``fast_apply`` we
+    memoize it on the plan (keyed by a per-forward signature) so it is computed once
+    instead of rebuilt at every layer; the numerical result is identical.
+    """
+
+    def _compute() -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+        locs = cache_locs.to(device=device, dtype=torch.long).reshape(-1)
+        matches = dst.to(device=device).reshape(-1, 1).eq(locs.reshape(1, -1))
+        d_idx, k_idx = matches.nonzero(as_tuple=True)
+        if k_idx.numel() == 0:
+            return None, None
+        return d_idx, k_idx
+
+    if not get_config().fast_apply:
+        return _compute()
+
+    sig = (int(cache_locs.data_ptr()), int(cache_locs.numel()), str(device), int(reuse_count))
+    cached = plan.apply_cache.get("direct_tensor")
+    if cached is not None and cached[0] == sig:
+        return cached[1], cached[2]
+    donor_idx, kv_idx = _compute()
+    plan.apply_cache["direct_tensor"] = (sig, donor_idx, kv_idx)
+    return donor_idx, kv_idx
+
+
 def apply_recipient_kv_blend_for_layer(
     *,
     forward_batch: Any,
@@ -694,6 +826,7 @@ def apply_recipient_kv_blend_for_layer(
     k: Optional[torch.Tensor] = None,
     v: Optional[torch.Tensor] = None,
     rotary_emb: Any = None,
+    reads_kv_from_pool: bool = False,
 ) -> int:
     """Blend donor K/V into recipient image-token slots for one layer.
 
@@ -701,10 +834,17 @@ def apply_recipient_kv_blend_for_layer(
     before the prefill attention kernel consumes those K/V. It updates both the
     token-to-KV pool and, when supplied, the direct ``k``/``v`` tensors used by
     ragged/triton extend kernels.
+
+    ``reads_kv_from_pool`` is a backend hint: the FA3 prefill kernel reads K/V from
+    the token-to-KV pool (page-table indexed) and never re-reads the direct ``k``/``v``
+    tensors after ``set_kv_buffer``. For such backends the direct-tensor overwrite is a
+    dead write, so with ``fast_apply`` we skip it (Method B). Other extend kernels
+    (triton/ragged) do consume the direct tensors, so the default keeps writing them.
     """
     plans = get_recipient_blend_plans()
     if not plans:
         return 0
+    skip_direct_write = bool(reads_kv_from_pool) and get_config().fast_apply
     pool = getattr(forward_batch, "token_to_kv_pool", None)
     if pool is None:
         return 0
@@ -716,67 +856,85 @@ def apply_recipient_kv_blend_for_layer(
 
     total_reused = 0
     for plan in plans:
-        donor = get_donor_store().lookup(plan.group_key)
-        if donor is None or not donor.complete or not donor.has_layer(layer_id):
-            continue
-        donor_layer = donor.layers[layer_id]
-        img_locs = plan.img_locs.to(device=k_buf.device, dtype=torch.long)
-        if plan.pending_deviation and layer_id == plan.bootstrap_layer_id:
-            # Bootstrap layer: the recipient's own K for the image span is already in the
-            # pool (set_kv_buffer ran before this hook) and not yet overwritten by the
-            # donor. Measure token risk NOW (before any overwrite), finalize the
-            # recompute set, then fall through so this SAME layer also writes donor K/V
-            # for the reused tokens. Falling through is required for correctness: the
-            # attention active-query ranges and the MLP skip later in this layer read the
-            # just-finalized mask and will skip the reused tokens, so those tokens must
-            # already hold donor K/V here (not the recipient's own K/V).
-            # ``pending_deviation`` is cleared so this runs only once.
-            if img_locs.numel() > 0:
-                donor_k_boot = _rerotate_plan_keys_if_needed(
-                    donor_layer.k.to(device=k_buf.device, dtype=k_buf.dtype),
-                    donor.positions,
-                    plan.positions,
-                    pos_mode=plan.pos_mode,
-                    rotary_emb=rotary_emb,
-                )
-                cfg = get_config()
-                if plan.select_mode == "sim":
-                    finalize_recipient_plan_similarity(
-                        plan, k_buf[img_locs], donor_k_boot, cfg
+        plan_started = time.perf_counter()
+        try:
+            donor = get_donor_store().lookup(plan.group_key)
+            if donor is None or not donor.complete or not donor.has_layer(layer_id):
+                continue
+            donor_layer = donor.layers[layer_id]
+            img_locs = plan.img_locs.to(device=k_buf.device, dtype=torch.long)
+            if plan.pending_deviation and layer_id == plan.bootstrap_layer_id:
+                # Bootstrap layer: the recipient's own K for the image span is already in
+                # the pool (set_kv_buffer ran before this hook) and not yet overwritten by
+                # the donor. Measure token risk NOW, finalize the recompute set, then fall
+                # through so this SAME layer also writes donor K/V for the reused tokens.
+                # Falling through is required for correctness: the attention active-query
+                # ranges and MLP skip later in this layer read the just-finalized mask.
+                if img_locs.numel() > 0:
+                    bootstrap_started = time.perf_counter()
+                    donor_k_boot = _rerotate_plan_keys_if_needed(
+                        donor_layer.k.to(device=k_buf.device, dtype=k_buf.dtype),
+                        donor.positions,
+                        plan.positions,
+                        pos_mode=plan.pos_mode,
+                        rotary_emb=rotary_emb,
                     )
+                    cfg = get_config()
+                    if plan.select_mode == "sim":
+                        finalize_recipient_plan_similarity(
+                            plan, k_buf[img_locs], donor_k_boot, cfg
+                        )
+                    else:
+                        finalize_recipient_plan_deviation(
+                            plan, k_buf[img_locs], donor_k_boot, cfg
+                        )
+                    plan.bootstrap_wall_ms += (
+                        time.perf_counter() - bootstrap_started
+                    ) * 1000.0
                 else:
-                    finalize_recipient_plan_deviation(
-                        plan, k_buf[img_locs], donor_k_boot, cfg
-                    )
-            else:
-                plan.pending_deviation = False
-        recompute_mask = plan.recompute_mask.to(device=k_buf.device, dtype=torch.bool)
-        reuse_mask = ~recompute_mask
-        if img_locs.numel() == 0 or not bool(reuse_mask.any()):
-            continue
-        donor_k = donor_layer.k.to(device=k_buf.device, dtype=k_buf.dtype)
-        donor_v = donor_layer.v.to(device=v_buf.device, dtype=v_buf.dtype)
-        donor_k = _rerotate_plan_keys_if_needed(
-            donor_k,
-            donor.positions,
-            plan.positions,
-            pos_mode=plan.pos_mode,
-            rotary_emb=rotary_emb,
-        ).to(device=k_buf.device, dtype=k_buf.dtype)
-        dst = img_locs[reuse_mask]
-        donor_k_reuse = donor_k[reuse_mask]
-        donor_v_reuse = donor_v[reuse_mask]
-        k_buf[dst] = donor_k_reuse
-        v_buf[dst] = donor_v_reuse
-        if cache_locs is not None and k is not None and v is not None:
-            locs = cache_locs.to(device=k.device, dtype=torch.long).reshape(-1)
-            matches = dst.to(device=k.device).reshape(-1, 1).eq(locs.reshape(1, -1))
-            donor_idx, kv_idx = matches.nonzero(as_tuple=True)
-            if kv_idx.numel() > 0:
-                k[kv_idx] = donor_k_reuse.to(device=k.device, dtype=k.dtype)[donor_idx]
-                v[kv_idx] = donor_v_reuse.to(device=v.device, dtype=v.dtype)[donor_idx]
-        total_reused += int(dst.numel())
-        mark_recipient_blend_used(plan.request_id)
+                    plan.pending_deviation = False
+            recompute_mask = plan.recompute_mask.to(device=k_buf.device, dtype=torch.bool)
+            reuse_mask = ~recompute_mask
+            if img_locs.numel() == 0 or not bool(reuse_mask.any()):
+                continue
+            donor_k = donor_layer.k.to(device=k_buf.device, dtype=k_buf.dtype)
+            donor_v = donor_layer.v.to(device=v_buf.device, dtype=v_buf.dtype)
+            donor_k = _rerotate_plan_keys_if_needed(
+                donor_k,
+                donor.positions,
+                plan.positions,
+                pos_mode=plan.pos_mode,
+                rotary_emb=rotary_emb,
+            ).to(device=k_buf.device, dtype=k_buf.dtype)
+            dst = img_locs[reuse_mask]
+            donor_k_reuse = donor_k[reuse_mask]
+            donor_v_reuse = donor_v[reuse_mask]
+            k_buf[dst] = donor_k_reuse
+            v_buf[dst] = donor_v_reuse
+            if (
+                not skip_direct_write
+                and cache_locs is not None
+                and k is not None
+                and v is not None
+            ):
+                # The dst->direct-tensor mapping is layer-invariant within a forward.
+                # Method B (fast apply) memoizes it so the O(reuse x tokens) match matrix
+                # is built once instead of at every layer; the result is identical.
+                donor_idx, kv_idx = _apply_direct_tensor_mapping(
+                    plan, dst, cache_locs, k.device, int(reuse_mask.sum())
+                )
+                if kv_idx is not None and kv_idx.numel() > 0:
+                    k[kv_idx] = donor_k_reuse.to(device=k.device, dtype=k.dtype)[
+                        donor_idx
+                    ]
+                    v[kv_idx] = donor_v_reuse.to(device=v.device, dtype=v.dtype)[
+                        donor_idx
+                    ]
+            total_reused += int(dst.numel())
+            plan.applied_layers += 1
+            mark_recipient_blend_used(plan.request_id)
+        finally:
+            plan.apply_wall_ms += (time.perf_counter() - plan_started) * 1000.0
     return total_reused
 
 
@@ -797,12 +955,28 @@ class CacheBlendStats:
     select_mode: str = ""
     recompute_ratio_effective: float = 0.0
     extend_wall_ms: float = -1.0
+    plan_wall_ms: float = -1.0
+    bootstrap_wall_ms: float = -1.0
+    apply_wall_ms: float = -1.0
+    applied_layers: int = 0
+    gate_reason: str = ""
+    reuse_ratio_effective: float = 0.0
     attention_skipped_tokens: int = 0
     attention_active_ranges: int = 0
 
     def finalize(self) -> "CacheBlendStats":
         if self.n_image_tokens > 0:
             self.recompute_ratio_effective = self.recomputed_tokens / self.n_image_tokens
+            self.reuse_ratio_effective = self.reused_tokens / self.n_image_tokens
+        if self.extend_wall_ms < 0:
+            total = 0.0
+            have = False
+            for value in (self.plan_wall_ms, self.apply_wall_ms):
+                if value >= 0:
+                    total += float(value)
+                    have = True
+            if have:
+                self.extend_wall_ms = total
         return self
 
     def to_dict(self) -> Dict[str, str]:
@@ -821,6 +995,18 @@ class CacheBlendStats:
             "cacheblend_extend_wall_ms": (
                 "" if self.extend_wall_ms < 0 else f"{self.extend_wall_ms:.3f}"
             ),
+            "cacheblend_plan_wall_ms": (
+                "" if self.plan_wall_ms < 0 else f"{self.plan_wall_ms:.3f}"
+            ),
+            "cacheblend_bootstrap_wall_ms": (
+                "" if self.bootstrap_wall_ms < 0 else f"{self.bootstrap_wall_ms:.3f}"
+            ),
+            "cacheblend_apply_wall_ms": (
+                "" if self.apply_wall_ms < 0 else f"{self.apply_wall_ms:.3f}"
+            ),
+            "cacheblend_applied_layers": str(self.applied_layers),
+            "cacheblend_gate_reason": self.gate_reason,
+            "cacheblend_reuse_ratio": f"{self.reuse_ratio_effective:.4f}",
             "cacheblend_attention_skipped_tokens": str(self.attention_skipped_tokens),
             "cacheblend_attention_active_ranges": str(self.attention_active_ranges),
         }
@@ -884,6 +1070,9 @@ _RECIPIENT_BLEND_PLANS = threading.local()
 _RECIPIENT_BLEND_USED = threading.local()
 _RECIPIENT_ATTENTION_SKIP = threading.local()
 _RECIPIENT_ACTIVE_QUERY_RANGES = threading.local()
+# Method B (fast apply): per-forward memo for recipient_reuse_token_indices so the
+# O(reuse x tokens) index rebuild runs once instead of at every layer/op.
+_RECIPIENT_REUSE_IDX = threading.local()
 
 
 def set_request_context(ctx: Optional[RequestContext]) -> None:
@@ -892,6 +1081,109 @@ def set_request_context(ctx: Optional[RequestContext]) -> None:
 
 def get_request_context() -> Optional[RequestContext]:
     return getattr(_REQUEST_CTX, "value", None)
+
+
+def _prefill_ready_notify_enabled() -> bool:
+    return _env_flag("SGLANG_VLM_CACHEBLEND_PREFILL_READY_NOTIFY", "0")
+
+
+def _prefill_ready_actor_name() -> str:
+    name = os.environ.get(
+        "SGLANG_VLM_CACHEBLEND_COORDINATOR_ACTOR",
+        "vlm_cacheblend_coordinator",
+    ).strip()
+    return name or "vlm_cacheblend_coordinator"
+
+
+def _prefill_ready_actor_namespace() -> str:
+    namespace = os.environ.get(
+        "SGLANG_VLM_CACHEBLEND_COORDINATOR_NAMESPACE",
+        "vlm_cacheblend",
+    ).strip()
+    return namespace or "vlm_cacheblend"
+
+
+def _prefill_ready_warmup_key(ctx: RequestContext) -> Optional[str]:
+    agent_uid = str(getattr(ctx, "agent_uid", "") or "")
+    agent_turn = int(getattr(ctx, "agent_turn", -1))
+    if not agent_uid or agent_turn < 1:
+        return None
+    try:
+        global_step = int(getattr(ctx, "global_step", -1))
+    except Exception:
+        global_step = -1
+    group = f"{global_step}:{agent_uid}" if global_step >= 0 else agent_uid
+    return f"cacheblend:{group}:turn{agent_turn}"
+
+
+def _warn_prefill_ready_once(message: str) -> None:
+    global _PREFILL_READY_LAST_WARN_S
+    if not get_config().verbose:
+        return
+    now = time.monotonic()
+    if now - _PREFILL_READY_LAST_WARN_S < 30.0:
+        return
+    _PREFILL_READY_LAST_WARN_S = now
+    import sys
+
+    print(f"[VLM-CacheBlend] prefill_ready_notify={message}", file=sys.stderr, flush=True)
+
+
+def _get_prefill_ready_actor():
+    global _PREFILL_READY_ACTOR
+    actor = _PREFILL_READY_ACTOR
+    if actor is not None:
+        return actor
+    with _PREFILL_READY_ACTOR_LOCK:
+        actor = _PREFILL_READY_ACTOR
+        if actor is not None:
+            return actor
+        try:
+            import ray
+
+            if hasattr(ray, "is_initialized") and not ray.is_initialized():
+                ray.init(
+                    address="auto",
+                    namespace=_prefill_ready_actor_namespace(),
+                    ignore_reinit_error=True,
+                    logging_level="ERROR",
+                )
+            try:
+                actor = ray.get_actor(
+                    _prefill_ready_actor_name(),
+                    namespace=_prefill_ready_actor_namespace(),
+                )
+            except Exception:
+                actor = ray.get_actor(_prefill_ready_actor_name())
+        except Exception as exc:
+            _warn_prefill_ready_once(f"actor_lookup_failed:{type(exc).__name__}")
+            return None
+        _PREFILL_READY_ACTOR = actor
+        return actor
+
+
+def notify_donor_prefill_ready(ctx: RequestContext) -> bool:
+    """Tell the rollout coordinator that donor KV is available.
+
+    This is intentionally best-effort. If Ray lookup/RPC fails, rollout-side donor
+    completion still marks the same key ready after generation returns.
+    """
+    if not (cacheblend_enabled() and _prefill_ready_notify_enabled()):
+        return False
+    if getattr(ctx, "role", None) != "donor":
+        return False
+    warmup_key = _prefill_ready_warmup_key(ctx)
+    if not warmup_key:
+        return False
+    actor = _get_prefill_ready_actor()
+    if actor is None:
+        return False
+    try:
+        actor.mark_ready.remote(warmup_key)
+        return True
+    except Exception as exc:
+        _warn_prefill_ready_once(f"mark_ready_failed:{type(exc).__name__}")
+        return False
 
 
 def set_source_input_ids(input_ids: Optional[torch.Tensor]) -> None:
@@ -907,10 +1199,36 @@ def set_recipient_blend_plans(plans: Optional[Tuple[RecipientKVBlendPlan, ...]])
     _RECIPIENT_BLEND_USED.value = set()
     _RECIPIENT_ATTENTION_SKIP.value = {}
     _RECIPIENT_ACTIVE_QUERY_RANGES.value = None
+    _RECIPIENT_REUSE_IDX.value = None
 
 
 def get_recipient_blend_plans() -> Tuple[RecipientKVBlendPlan, ...]:
     return tuple(getattr(_RECIPIENT_BLEND_PLANS, "value", ()) or ())
+
+
+def get_recipient_blend_plan(request_id: str) -> Optional[RecipientKVBlendPlan]:
+    request_id = str(request_id)
+    for plan in get_recipient_blend_plans():
+        if str(plan.request_id) == request_id:
+            return plan
+    return None
+
+
+def get_recipient_blend_plan_for(
+    request_id: str, group_key: Optional[Tuple]
+) -> Optional[RecipientKVBlendPlan]:
+    """Return the plan matching both request_id and group_key (slot-aware).
+
+    With multi-slot grafting a single request can own several plans (one per image
+    slot); ``group_key`` disambiguates which slot's plan to report. Falls back to
+    the first plan for the request when ``group_key`` is not provided or unmatched.
+    """
+    request_id = str(request_id)
+    if group_key is not None:
+        for plan in get_recipient_blend_plans():
+            if str(plan.request_id) == request_id and plan.group_key == group_key:
+                return plan
+    return get_recipient_blend_plan(request_id)
 
 
 def clear_recipient_blend_plans() -> None:
@@ -918,6 +1236,26 @@ def clear_recipient_blend_plans() -> None:
     _RECIPIENT_BLEND_USED.value = set()
     _RECIPIENT_ATTENTION_SKIP.value = {}
     _RECIPIENT_ACTIVE_QUERY_RANGES.value = None
+    _RECIPIENT_REUSE_IDX.value = None
+
+
+def _reuse_idx_cache_signature(
+    cache_locs: torch.Tensor,
+    device: torch.device,
+    plans: Tuple[RecipientKVBlendPlan, ...],
+) -> Tuple:
+    """Per-forward signature for the reuse-index memo.
+
+    Plan objects are rebuilt every forward, so the only intra-forward change is the
+    recompute mask being finalized at the bootstrap layer; ``int(sum)`` per plan is a
+    cheap ``O(n_image)`` op that captures that transition and invalidates the memo.
+    """
+    return (
+        int(cache_locs.data_ptr()),
+        int(cache_locs.numel()),
+        str(device),
+        tuple(int(p.recompute_mask.sum().item()) for p in plans),
+    )
 
 
 def recipient_reuse_token_indices(
@@ -931,7 +1269,22 @@ def recipient_reuse_token_indices(
     plans = get_recipient_blend_plans()
     if not plans:
         return torch.empty(0, dtype=torch.long, device=device or cache_locs.device)
-    locs = cache_locs.reshape(-1).to(device=device or cache_locs.device, dtype=torch.long)
+    dev = device or cache_locs.device
+
+    # Method B (fast apply): memoize per forward. Numerically identical to the slow
+    # path; only avoids rebuilding the O(reuse x tokens) match matrix at every op/layer.
+    use_cache = get_config().fast_apply
+    sig = None
+    if use_cache:
+        try:
+            sig = _reuse_idx_cache_signature(cache_locs, dev, plans)
+            cached = getattr(_RECIPIENT_REUSE_IDX, "value", None)
+            if cached is not None and cached[0] == sig:
+                return cached[1]
+        except Exception:
+            sig = None
+
+    locs = cache_locs.reshape(-1).to(device=dev, dtype=torch.long)
     pieces = []
     for plan in plans:
         reuse_mask = ~plan.recompute_mask.to(device=locs.device, dtype=torch.bool)
@@ -943,8 +1296,12 @@ def recipient_reuse_token_indices(
         if kv_idx.numel() > 0:
             pieces.append(kv_idx)
     if not pieces:
-        return torch.empty(0, dtype=torch.long, device=locs.device)
-    return torch.unique(torch.cat(pieces), sorted=True)
+        result = torch.empty(0, dtype=torch.long, device=locs.device)
+    else:
+        result = torch.unique(torch.cat(pieces), sorted=True)
+    if use_cache and sig is not None:
+        _RECIPIENT_REUSE_IDX.value = (sig, result)
+    return result
 
 
 def _active_query_ranges_cache_key(forward_batch: Any) -> Optional[Tuple]:
@@ -1066,6 +1423,44 @@ def recipient_active_query_ranges(forward_batch: Any) -> Optional[RecipientActiv
     return ranges
 
 
+def recipient_plans_finalized() -> bool:
+    """True when every active recipient plan has finalized its recompute mask.
+
+    kvdev/sim selection defers the recompute decision to a bootstrap layer (needs the
+    recipient's own image-token K). Compact prefill must not drop reused tokens until the
+    mask is final, otherwise it would remove the very tokens the bootstrap layer measures.
+    """
+    plans = get_recipient_blend_plans()
+    if not plans:
+        return False
+    return all(not bool(getattr(p, "pending_deviation", False)) for p in plans)
+
+
+def recipient_compact_active_indices(forward_batch: Any) -> Optional[torch.Tensor]:
+    """Return active (non-donor-reused) token indices for compact prefill, or None.
+
+    The indices are exactly ``recipient_active_query_ranges(...).query_indices`` (sorted
+    ascending over the concatenated extend batch), so a residual stream compacted with
+    these indices stays consistent with the attention range metadata. Returns None when
+    compact prefill is disabled, plans are not yet finalized (bootstrap pending), there is
+    no reuse, or every token is reused (degenerate).
+    """
+    if not cacheblend_enabled():
+        return None
+    cfg = get_config()
+    if not cfg.fast_path or not cfg.compact_prefill:
+        return None
+    if not recipient_plans_finalized():
+        return None
+    ranges = recipient_active_query_ranges(forward_batch)
+    if ranges is None:
+        return None
+    qi = ranges.query_indices
+    if qi is None or qi.numel() == 0:
+        return None
+    return qi
+
+
 def mark_recipient_blend_used(request_id: str) -> None:
     used = getattr(_RECIPIENT_BLEND_USED, "value", None)
     if used is None:
@@ -1075,7 +1470,12 @@ def mark_recipient_blend_used(request_id: str) -> None:
 
 
 def mark_recipient_attention_skip_used(active_ranges: RecipientActiveQueryRanges) -> None:
-    """Record that a backend successfully skipped reusable attention queries."""
+    """Record that a backend successfully skipped reusable attention queries.
+
+    Stats are keyed by ``(request_id, group_key)`` so multi-slot grafting attributes
+    skipped tokens per image slot; this keeps ``cacheblend_attention_skipped_tokens``
+    accurate (summed over slots) instead of double counting a shared request id.
+    """
     skipped = getattr(_RECIPIENT_ATTENTION_SKIP, "value", None)
     if skipped is None:
         skipped = {}
@@ -1084,7 +1484,7 @@ def mark_recipient_attention_skip_used(active_ranges: RecipientActiveQueryRanges
         if plan.reused_tokens <= 0:
             continue
         entry = skipped.setdefault(
-            str(plan.request_id),
+            (str(plan.request_id), plan.group_key),
             {"tokens": 0, "ranges": 0},
         )
         entry["tokens"] = max(int(entry.get("tokens", 0)), int(plan.reused_tokens))
@@ -1092,10 +1492,24 @@ def mark_recipient_attention_skip_used(active_ranges: RecipientActiveQueryRanges
     _RECIPIENT_ATTENTION_SKIP.value = skipped
 
 
-def recipient_attention_skip_stats(request_id: str) -> Tuple[int, int]:
+def recipient_attention_skip_stats(
+    request_id: str, group_key: Optional[Tuple] = None
+) -> Tuple[int, int]:
     skipped = getattr(_RECIPIENT_ATTENTION_SKIP, "value", {}) or {}
-    entry = skipped.get(str(request_id), {})
-    return int(entry.get("tokens", 0)), int(entry.get("ranges", 0))
+    request_id = str(request_id)
+    if group_key is not None:
+        entry = skipped.get((request_id, group_key))
+        if entry is not None:
+            return int(entry.get("tokens", 0)), int(entry.get("ranges", 0))
+    # Fall back to summing every slot recorded for this request id.
+    tokens = 0
+    ranges = 0
+    for key, entry in skipped.items():
+        key_rid = key[0] if isinstance(key, tuple) else key
+        if str(key_rid) == request_id:
+            tokens += int(entry.get("tokens", 0))
+            ranges = max(ranges, int(entry.get("ranges", 0)))
+    return tokens, ranges
 
 
 def recipient_blend_was_used(request_id: str) -> bool:
@@ -1475,13 +1889,70 @@ def select_grid_sig_for_req(
     return slot, grids[slot]
 
 
-def _build_request_context_for_req(
+def _resolve_target_slots(
+    req: Any, cfg: "VLMCacheBlendConfig", image_token_id: Optional[int]
+) -> List[int]:
+    """Resolve the list of image-span slot indices to graft for this request.
+
+    ``target_image_slots`` controls the behaviour:
+      * ""/"-1"/"legacy" : single slot (``target_image_slot``), original behaviour.
+      * "all"/"*"        : every image span present in the request.
+      * "0,1" / "0,-1"   : explicit slots (negative counts from the end).
+    Each resolved slot is normalized to a concrete span index via
+    ``select_grid_sig_for_req`` and de-duplicated while preserving order.
+    """
+    spec = (getattr(cfg, "target_image_slots", "") or "").strip().lower()
+    n_spans = _image_span_count_from_req(req, image_token_id)
+
+    if spec in ("", "-1", "legacy"):
+        requested: List[int] = [cfg.target_image_slot]
+    elif spec in ("all", "*"):
+        requested = list(range(n_spans)) if n_spans > 0 else [-1]
+    else:
+        requested = []
+        for part in spec.split(","):
+            part = part.strip()
+            if not part:
+                continue
+            try:
+                requested.append(int(part))
+            except ValueError:
+                logger.warning(
+                    "Invalid SGLANG_VLM_CACHEBLEND_TARGET_IMAGE_SLOTS entry: %s", part
+                )
+        if not requested:
+            requested = [cfg.target_image_slot]
+
+    resolved: List[int] = []
+    seen = set()
+    for slot in requested:
+        span_slot, grid_sig = select_grid_sig_for_req(
+            req, slot, image_token_id=image_token_id
+        )
+        if not grid_sig:
+            continue
+        if span_slot in seen:
+            continue
+        seen.add(span_slot)
+        resolved.append(span_slot)
+    return resolved
+
+
+def _build_request_contexts_for_req(
     forward_batch: Any,
     req: Any,
     req_index: int,
     *,
     image_token_id: int,
-) -> Optional[RequestContext]:
+) -> List[RequestContext]:
+    """Build one CacheBlend context per targeted image slot for a request.
+
+    Returns a list so a single request can graft multiple image spans (e.g. the
+    byte-identical original image *and* the refocus image). Downstream plan
+    building, reuse-index computation and per-layer KV apply all iterate over the
+    resulting per-slot plans, so multi-slot requests are handled without further
+    changes to the attention path.
+    """
     rid = str(getattr(req, "rid", "") or "")
     meta = _lookup_request_meta(rid)
     agent_uid = str(getattr(req, "agent_uid", "") or "")
@@ -1501,7 +1972,7 @@ def _build_request_context_for_req(
                 fallback_reason="missing_agent_meta",
             ).finalize()
         )
-        return None
+        return []
     cfg = get_config()
     agent_turn = int(agent_turn)
     if not target_turn_enabled(agent_turn, cfg):
@@ -1512,7 +1983,7 @@ def _build_request_context_for_req(
                 fallback_reason=f"agent_turn_mismatch:{agent_turn}:targets={cfg.target_turns}",
             ).finalize()
         )
-        return None
+        return []
     global_step = getattr(req, "training_global_step", None)
     if global_step is None:
         global_step = meta.get("global_step")
@@ -1522,10 +1993,9 @@ def _build_request_context_for_req(
         global_step = int(global_step)
     except Exception:
         global_step = -1
-    image_slot, grid_sig = select_grid_sig_for_req(
-        req, cfg.target_image_slot, image_token_id=image_token_id
-    )
-    if not grid_sig:
+
+    slots = _resolve_target_slots(req, cfg, image_token_id)
+    if not slots:
         log_stats(
             CacheBlendStats(
                 role="none",
@@ -1533,38 +2003,50 @@ def _build_request_context_for_req(
                 fallback_reason="missing_image_grid",
             ).finalize()
         )
-        return None
-    group_key = build_group_key(
-        agent_uid,
-        agent_turn,
-        grid_sig,
-        global_step=global_step,
-        image_slot=image_slot,
-    )
-    donor = get_donor_store().lookup(group_key)
-    role = "recipient" if donor is not None and donor.complete else "donor"
-    log_stats(
-        CacheBlendStats(
-            role=role,
-            request_id=rid,
-            pos_mode=cfg.pos_mode,
-            select_mode=cfg.select_mode,
-            fallback_reason="context_ready",
-        ).finalize()
-    )
-    return RequestContext(
-        group_key=group_key,
-        role=role,
-        image_token_id=int(image_token_id),
-        image_token_values=_image_pad_values_from_req(req),
-        request_id=rid,
-        global_step=global_step,
-        agent_uid=agent_uid,
-        agent_turn=agent_turn,
-        target_image_slot=image_slot,
-        grid_sig=grid_sig,
-        request_index=int(req_index),
-    )
+        return []
+
+    image_token_values = _image_pad_values_from_req(req)
+    contexts: List[RequestContext] = []
+    for image_slot in slots:
+        _, grid_sig = select_grid_sig_for_req(
+            req, image_slot, image_token_id=image_token_id
+        )
+        if not grid_sig:
+            continue
+        group_key = build_group_key(
+            agent_uid,
+            agent_turn,
+            grid_sig,
+            global_step=global_step,
+            image_slot=image_slot,
+        )
+        donor = get_donor_store().lookup(group_key)
+        role = "recipient" if donor is not None and donor.complete else "donor"
+        log_stats(
+            CacheBlendStats(
+                role=role,
+                request_id=rid,
+                pos_mode=cfg.pos_mode,
+                select_mode=cfg.select_mode,
+                fallback_reason="context_ready",
+            ).finalize()
+        )
+        contexts.append(
+            RequestContext(
+                group_key=group_key,
+                role=role,
+                image_token_id=int(image_token_id),
+                image_token_values=image_token_values,
+                request_id=rid,
+                global_step=global_step,
+                agent_uid=agent_uid,
+                agent_turn=agent_turn,
+                target_image_slot=image_slot,
+                grid_sig=grid_sig,
+                request_index=int(req_index),
+            )
+        )
+    return contexts
 
 
 def _parse_turn_from_rid(rid: str) -> Optional[int]:
@@ -1616,15 +2098,12 @@ def build_request_context_from_forward_batch(
     contexts = tuple(
         ctx
         for i, req in enumerate(reqs)
-        for ctx in [
-            _build_request_context_for_req(
-                forward_batch,
-                req,
-                i,
-                image_token_id=int(image_token_id),
-            )
-        ]
-        if ctx is not None
+        for ctx in _build_request_contexts_for_req(
+            forward_batch,
+            req,
+            i,
+            image_token_id=int(image_token_id),
+        )
     )
     if not contexts:
         return None

@@ -182,6 +182,75 @@ def test_select_grid_sig_aligns_current_image_spans_to_grid_suffix():
     print("ok test_select_grid_sig_aligns_current_image_spans_to_grid_suffix")
 
 
+def test_resolve_target_slots_multi_slot():
+    """Method A: 'all'/list selectors expand to per-slot indices (original+refocus)."""
+
+    class Item:
+        def __init__(self, pad_value, grid):
+            self.pad_value = pad_value
+            self.image_grid_thw = torch.tensor([grid])
+
+        def is_image(self):
+            return True
+
+    class MM:
+        def __init__(self):
+            self.mm_items = [
+                Item(201, (1, 20, 20)),
+                Item(202, (1, 21, 21)),
+            ]
+
+    class Req:
+        multimodal_inputs = MM()
+        # Two image spans present in the current turn (slot0 original, slot1 refocus).
+        fill_ids = [7, 201, 201, 8, 202, 202, 202, 9]
+
+    tok = 151655
+    # Legacy default -> single last slot (back-compat).
+    legacy = cb._resolve_target_slots(Req(), _cfg(target_image_slots="-1"), tok)
+    assert legacy == [1], legacy
+
+    # "all" -> every span.
+    all_slots = cb._resolve_target_slots(Req(), _cfg(target_image_slots="all"), tok)
+    assert all_slots == [0, 1], all_slots
+
+    # Explicit list, de-duplicated and order-preserving; -1 normalizes to last span.
+    explicit = cb._resolve_target_slots(Req(), _cfg(target_image_slots="0,-1"), tok)
+    assert explicit == [0, 1], explicit
+    print("ok test_resolve_target_slots_multi_slot")
+
+
+def test_get_recipient_blend_plan_for_is_slot_aware():
+    """Multi-slot: per (request_id, group_key) lookup returns the right slot plan."""
+
+    def _plan(group_key, reused):
+        return cb.RecipientKVBlendPlan(
+            request_id="r0",
+            group_key=group_key,
+            img_locs=torch.tensor([0, 1], dtype=torch.long),
+            positions=None,
+            recompute_mask=torch.tensor([False, False]),
+            grid_sig=(1, 2, 2),
+            n_image_tokens=2,
+            reused_tokens=reused,
+            recomputed_tokens=0,
+            pos_mode="same",
+            select_mode="kvdev",
+        )
+
+    gk0 = ("uid", 1, (1, 20, 20), 0, 0)
+    gk1 = ("uid", 1, (1, 21, 21), 0, 1)
+    cb.set_recipient_blend_plans((_plan(gk0, 5), _plan(gk1, 7)))
+    try:
+        assert cb.get_recipient_blend_plan_for("r0", gk1).reused_tokens == 7
+        assert cb.get_recipient_blend_plan_for("r0", gk0).reused_tokens == 5
+        # Unknown group_key falls back to first plan for the request.
+        assert cb.get_recipient_blend_plan_for("r0", ("x",)).reused_tokens == 5
+    finally:
+        cb.clear_recipient_blend_plans()
+    print("ok test_get_recipient_blend_plan_for_is_slot_aware")
+
+
 def test_image_token_locs_from_request_uses_request_index():
     class Pool:
         req_to_token = torch.tensor(
@@ -395,6 +464,146 @@ def test_apply_recipient_kv_blend_updates_pool_and_direct_tensors():
     print("ok test_apply_recipient_kv_blend_updates_pool_and_direct_tensors")
 
 
+def _apply_fixture(fast_apply):
+    """Build donor/plan/pool fixture for apply parity tests. Returns (Batch, plan)."""
+    cb._CONFIG = _cfg(fast_path=True, fast_apply=fast_apply)
+    cb._DONOR_STORE = cb.DonorKVStore(max_groups=4)
+    cb.clear_recipient_blend_plans()
+
+    class Pool:
+        def __init__(self):
+            self.k = torch.zeros(16, 1, 2)
+            self.v = torch.zeros(16, 1, 2)
+
+        def get_key_buffer(self, layer_id):
+            return self.k
+
+        def get_value_buffer(self, layer_id):
+            return self.v
+
+    class Batch:
+        token_to_kv_pool = Pool()
+
+    donor_k = torch.tensor([[[10.0, 11.0]], [[20.0, 21.0]], [[30.0, 31.0]]])
+    donor_v = donor_k + 100
+    entry = cb.get_donor_store().get_or_create_donor(
+        ("g",), n_image_tokens=3, grid_sig=(1, 1, 3), positions=None
+    )
+    entry.record_layer(0, donor_k, donor_v)
+    cb.get_donor_store().mark_complete(("g",))
+
+    plan = cb.RecipientKVBlendPlan(
+        request_id="r1",
+        group_key=("g",),
+        img_locs=torch.tensor([3, 5, 8], dtype=torch.long),
+        positions=None,
+        recompute_mask=torch.tensor([False, True, False]),
+        grid_sig=(1, 1, 3),
+        n_image_tokens=3,
+        reused_tokens=2,
+        recomputed_tokens=1,
+        pos_mode="same",
+        select_mode="topr",
+    )
+    cb.set_recipient_blend_plans((plan,))
+    return Batch, plan, donor_k, donor_v
+
+
+def test_fast_apply_matches_slow_path():
+    """Method B: fast_apply must be bit-for-bit identical to the slow apply path."""
+
+    def run(fast_apply):
+        Batch, plan, donor_k, donor_v = _apply_fixture(fast_apply)
+        cache_locs = torch.tensor([2, 3, 5, 8, 9], dtype=torch.long)
+        k = torch.ones(5, 1, 2)
+        v = torch.ones(5, 1, 2) * 2
+        Batch.token_to_kv_pool.k[cache_locs] = k
+        Batch.token_to_kv_pool.v[cache_locs] = v
+        # Call the same layer twice to exercise the per-forward cache reuse.
+        for _ in range(2):
+            cb.apply_recipient_kv_blend_for_layer(
+                forward_batch=Batch(), layer_id=0, cache_locs=cache_locs, k=k, v=v
+            )
+        cb.clear_recipient_blend_plans()
+        return (
+            Batch.token_to_kv_pool.k.clone(),
+            Batch.token_to_kv_pool.v.clone(),
+            k.clone(),
+            v.clone(),
+        )
+
+    slow = run(False)
+    fast = run(True)
+    for a, b in zip(slow, fast):
+        assert torch.equal(a, b), "fast_apply diverged from slow path"
+    print("ok test_fast_apply_matches_slow_path")
+
+
+def test_fast_apply_skips_direct_write_for_pool_reading_backend():
+    """Method B: reads_kv_from_pool skips the dead direct-tensor write (FA3).
+
+    The pool must still receive donor K/V (that is what FA3 reads); the direct k/v
+    tensors must be left untouched, and the pool result must match the full path.
+    """
+
+    def run(reads_kv_from_pool):
+        Batch, plan, donor_k, donor_v = _apply_fixture(fast_apply=True)
+        cache_locs = torch.tensor([2, 3, 5, 8, 9], dtype=torch.long)
+        k = torch.ones(5, 1, 2)
+        v = torch.ones(5, 1, 2) * 2
+        Batch.token_to_kv_pool.k[cache_locs] = k
+        Batch.token_to_kv_pool.v[cache_locs] = v
+        cb.apply_recipient_kv_blend_for_layer(
+            forward_batch=Batch(),
+            layer_id=0,
+            cache_locs=cache_locs,
+            k=k,
+            v=v,
+            reads_kv_from_pool=reads_kv_from_pool,
+        )
+        cb.clear_recipient_blend_plans()
+        return Batch.token_to_kv_pool.k.clone(), k.clone()
+
+    pool_full, k_full = run(False)
+    pool_skip, k_skip = run(True)
+    # Pool write identical regardless of the direct-write skip (FA3 reads the pool).
+    assert torch.equal(pool_full, pool_skip), "pool diverged when skipping direct write"
+    # With skip, the direct k tensor keeps its original recipient values (untouched).
+    assert torch.equal(k_skip, torch.ones(5, 1, 2)), "direct tensor should be untouched"
+    # Without skip, the direct k tensor was overwritten with donor K at reused slots.
+    assert not torch.equal(k_full, torch.ones(5, 1, 2)), "direct write expected off-skip"
+    print("ok test_fast_apply_skips_direct_write_for_pool_reading_backend")
+
+
+def test_fast_apply_reuse_indices_cache_invalidates_on_mask_change():
+    """Cache keyed by mask sum: finalizing recompute mask must recompute indices."""
+    cb._CONFIG = _cfg(fast_path=True, fast_apply=True)
+    cb.clear_recipient_blend_plans()
+    plan = cb.RecipientKVBlendPlan(
+        request_id="rb",
+        group_key=("g",),
+        img_locs=torch.tensor([11, 13, 17, 19], dtype=torch.long),
+        positions=None,
+        recompute_mask=torch.tensor([True, True, True, True]),  # bootstrap: all recompute
+        grid_sig=(1, 1, 4),
+        n_image_tokens=4,
+        reused_tokens=0,
+        recomputed_tokens=4,
+        pos_mode="same",
+        select_mode="kvdev",
+    )
+    cb.set_recipient_blend_plans((plan,))
+    cache_locs = torch.tensor([7, 11, 12, 13, 17, 18, 19], dtype=torch.long)
+    idx0 = cb.recipient_reuse_token_indices(cache_locs)
+    assert idx0.tolist() == [], idx0.tolist()
+    # Bootstrap finalizes: only index 1 recomputes now -> reuse the other three.
+    plan.recompute_mask = torch.tensor([False, True, False, False])
+    idx1 = cb.recipient_reuse_token_indices(cache_locs)
+    assert idx1.tolist() == [1, 4, 6], idx1.tolist()
+    cb.clear_recipient_blend_plans()
+    print("ok test_fast_apply_reuse_indices_cache_invalidates_on_mask_change")
+
+
 def test_recipient_reuse_token_indices():
     cb.clear_recipient_blend_plans()
     plan = cb.RecipientKVBlendPlan(
@@ -461,6 +670,90 @@ def test_recipient_active_query_ranges():
     print("ok test_recipient_active_query_ranges")
 
 
+def test_compact_active_indices_match_ranges_when_finalized():
+    # Method C: compact prefill must drop exactly the reused image tokens, i.e. the
+    # active indices must equal recipient_active_query_ranges().query_indices.
+    cb._CONFIG = _cfg(fast_path=True, compact_prefill=True)
+    cb.clear_recipient_blend_plans()
+    plan = cb.RecipientKVBlendPlan(
+        request_id="rc",
+        group_key=("g",),
+        img_locs=torch.tensor([101, 102, 202], dtype=torch.long),
+        positions=None,
+        recompute_mask=torch.tensor([False, False, False]),  # all reused (finalized)
+        grid_sig=(1, 1, 3),
+        n_image_tokens=3,
+        reused_tokens=3,
+        recomputed_tokens=0,
+        pos_mode="same",
+        select_mode="topr",
+        pending_deviation=False,
+    )
+    cb.set_recipient_blend_plans((plan,))
+
+    class Batch:
+        out_cache_loc = torch.tensor(
+            [100, 101, 102, 103, 104, 200, 201, 202, 203], dtype=torch.long
+        )
+        extend_seq_lens = torch.tensor([5, 4], dtype=torch.int32)
+        extend_seq_lens_cpu = [5, 4]
+        seq_lens = torch.tensor([15, 24], dtype=torch.int32)
+        req_pool_indices = torch.tensor([7, 8], dtype=torch.long)
+
+    assert cb.recipient_plans_finalized() is True
+    ranges = cb.recipient_active_query_ranges(Batch())
+    active = cb.recipient_compact_active_indices(Batch())
+    assert active is not None
+    assert active.tolist() == ranges.query_indices.tolist() == [0, 3, 4, 5, 6, 8]
+
+    # Disabled flag => no compaction even though reuse exists.
+    cb._CONFIG = _cfg(fast_path=True, compact_prefill=False)
+    assert cb.recipient_compact_active_indices(Batch()) is None
+
+    cb.clear_recipient_blend_plans()
+    cb._CONFIG = _cfg(fast_path=True)
+    print("ok test_compact_active_indices_match_ranges_when_finalized")
+
+
+def test_compact_active_indices_deferred_until_finalized():
+    # kvdev/sim defer the mask to a bootstrap layer; compact prefill must return None
+    # while pending (mask is all-recompute anyway) and never drop tokens too early.
+    cb._CONFIG = _cfg(fast_path=True, compact_prefill=True, select_mode="kvdev")
+    cb.clear_recipient_blend_plans()
+    pending_plan = cb.RecipientKVBlendPlan(
+        request_id="rd",
+        group_key=("g",),
+        img_locs=torch.tensor([101, 102, 202], dtype=torch.long),
+        positions=None,
+        recompute_mask=torch.ones(3, dtype=torch.bool),  # pending: mark all recompute
+        grid_sig=(1, 1, 3),
+        n_image_tokens=3,
+        reused_tokens=0,
+        recomputed_tokens=3,
+        pos_mode="same",
+        select_mode="kvdev",
+        bootstrap_layer_id=0,
+        pending_deviation=True,
+    )
+    cb.set_recipient_blend_plans((pending_plan,))
+
+    class Batch:
+        out_cache_loc = torch.tensor(
+            [100, 101, 102, 103, 104, 200, 201, 202, 203], dtype=torch.long
+        )
+        extend_seq_lens = torch.tensor([5, 4], dtype=torch.int32)
+        extend_seq_lens_cpu = [5, 4]
+        seq_lens = torch.tensor([15, 24], dtype=torch.int32)
+        req_pool_indices = torch.tensor([7, 8], dtype=torch.long)
+
+    assert cb.recipient_plans_finalized() is False
+    assert cb.recipient_compact_active_indices(Batch()) is None
+
+    cb.clear_recipient_blend_plans()
+    cb._CONFIG = _cfg(fast_path=True)
+    print("ok test_compact_active_indices_deferred_until_finalized")
+
+
 def test_recipient_attention_skip_stats():
     cb.clear_recipient_blend_plans()
     plan = cb.RecipientKVBlendPlan(
@@ -492,10 +785,18 @@ def test_recipient_attention_skip_stats():
         request_id="r4",
         attention_skipped_tokens=2,
         attention_active_ranges=2,
+        plan_wall_ms=1.0,
+        apply_wall_ms=2.5,
+        applied_layers=3,
+        gate_reason="",
     )
-    d = stats.to_dict()
+    d = stats.finalize().to_dict()
     assert d["cacheblend_attention_skipped_tokens"] == "2"
     assert d["cacheblend_attention_active_ranges"] == "2"
+    assert d["cacheblend_extend_wall_ms"] == "3.500"
+    assert d["cacheblend_plan_wall_ms"] == "1.000"
+    assert d["cacheblend_apply_wall_ms"] == "2.500"
+    assert d["cacheblend_applied_layers"] == "3"
     cb.clear_recipient_blend_plans()
     print("ok test_recipient_attention_skip_stats")
 
@@ -532,6 +833,35 @@ def test_finalize_recipient_plan_deviation_picks_high_deviation():
     assert not bool(plan.recompute_mask[5])
     assert plan.recomputed_tokens == 2 and plan.reused_tokens == n - 2
     print("ok test_finalize_recipient_plan_deviation_picks_high_deviation")
+
+
+def test_low_value_gate_disables_small_reuse_set():
+    cfg = _cfg(select_mode="kvdev", recompute_ratio=0.5, min_reused_tokens=5)
+    n, h, d = 8, 1, 2
+    donor_k = torch.zeros(n, h, d)
+    recipient_k = torch.arange(n * h * d, dtype=torch.float).reshape(n, h, d)
+    plan = cb.RecipientKVBlendPlan(
+        request_id="rg",
+        group_key=("g",),
+        img_locs=torch.arange(n, dtype=torch.long),
+        positions=None,
+        recompute_mask=torch.ones(n, dtype=torch.bool),
+        grid_sig=(1, 1, n),
+        n_image_tokens=n,
+        reused_tokens=0,
+        recomputed_tokens=n,
+        pos_mode="same",
+        select_mode="kvdev",
+        bootstrap_layer_id=0,
+        pending_deviation=True,
+    )
+    cb.finalize_recipient_plan_deviation(plan, recipient_k, donor_k, cfg)
+    assert plan.pending_deviation is False
+    assert bool(plan.recompute_mask.all())
+    assert plan.recomputed_tokens == n
+    assert plan.reused_tokens == 0
+    assert plan.gate_reason.startswith("low_value_gate:")
+    print("ok test_low_value_gate_disables_small_reuse_set")
 
 
 def test_finalize_recipient_plan_similarity_picks_low_cosine():

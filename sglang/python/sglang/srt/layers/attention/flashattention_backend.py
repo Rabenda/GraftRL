@@ -742,6 +742,21 @@ class FlashAttentionBackend(AttentionBackend):
                     if not layer.is_cross_attention
                     else forward_batch.encoder_out_cache_loc
                 )
+                # [VLM-CacheBlend Method C] compact prefill: k/v hold only the active
+                # (non-donor-reused) tokens, so the pool write must target the matching
+                # active slots. Reused slots are filled with donor K/V by apply below.
+                compact_active = getattr(
+                    forward_batch, "_cacheblend_compact_active", None
+                )
+                if (
+                    compact_active is not None
+                    and not layer.is_cross_attention
+                    and cache_loc is not None
+                    and cache_loc.shape[0] != k.shape[0]
+                ):
+                    cache_loc = cache_loc.index_select(
+                        0, compact_active.to(device=cache_loc.device, dtype=torch.long)
+                    )
                 if not self.use_mla:
                     forward_batch.token_to_kv_pool.set_kv_buffer(
                         layer, cache_loc, k, v, layer.k_scale, layer.v_scale
@@ -750,6 +765,11 @@ class FlashAttentionBackend(AttentionBackend):
                         from sglang.srt.mem_cache import vlm_cacheblend
 
                         if vlm_cacheblend.cacheblend_enabled():
+                            # FA3 prefill reads K/V from the token-to-KV pool
+                            # (get_kv_buffer, page-table indexed) and never re-reads the
+                            # direct k/v tensors, so the direct-tensor overwrite is a dead
+                            # write for this backend; reads_kv_from_pool lets fast_apply
+                            # skip it.
                             vlm_cacheblend.apply_recipient_kv_blend_for_layer(
                                 forward_batch=forward_batch,
                                 layer_id=layer.layer_id,
@@ -759,6 +779,7 @@ class FlashAttentionBackend(AttentionBackend):
                                 rotary_emb=getattr(
                                     layer, "_vlm_cacheblend_rotary_emb", None
                                 ),
+                                reads_kv_from_pool=True,
                             )
                 else:
                     forward_batch.token_to_kv_pool.set_mla_kv_buffer(
@@ -900,8 +921,16 @@ class FlashAttentionBackend(AttentionBackend):
                     torch.cumsum(active_cache_seqlens, dim=0, dtype=torch.int32),
                     (1, 0),
                 )
+                # [VLM-CacheBlend Method C] compact prefill: q_full already holds only the
+                # active queries in query_indices order, so we skip the gather on input and
+                # the scatter on output. Otherwise (per-op skip path) q_full is full length
+                # and we select/scatter the active queries as before.
+                compact = bool(
+                    getattr(forward_batch, "_cacheblend_compact", False)
+                ) and q_full.shape[0] == query_indices.shape[0]
+                q_active = q_full if compact else q_full.index_select(0, query_indices)
                 result_active = flash_attn_with_kvcache(
-                    q=q_full.index_select(0, query_indices),
+                    q=q_active,
                     k_cache=key_cache,
                     v_cache=value_cache,
                     page_table=page_table.index_select(0, range_batch_indices),
@@ -922,9 +951,12 @@ class FlashAttentionBackend(AttentionBackend):
                     **kwargs,
                 )
                 vlm_cacheblend.mark_recipient_attention_skip_used(active_ranges)
-                o = torch.zeros_like(q_full)
-                o.index_copy_(0, query_indices, result_active)
-                result = o
+                if compact:
+                    result = result_active
+                else:
+                    o = torch.zeros_like(q_full)
+                    o.index_copy_(0, query_indices, result_active)
+                    result = o
             else:
                 result = flash_attn_with_kvcache(
                     q=q_full,

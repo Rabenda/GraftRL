@@ -264,6 +264,12 @@ _CACHEBLEND_LOG_FIELDS = [
     "cacheblend_select_mode",
     "cacheblend_recompute_ratio",
     "cacheblend_extend_wall_ms",
+    "cacheblend_plan_wall_ms",
+    "cacheblend_bootstrap_wall_ms",
+    "cacheblend_apply_wall_ms",
+    "cacheblend_applied_layers",
+    "cacheblend_gate_reason",
+    "cacheblend_reuse_ratio",
     "cacheblend_attention_skipped_tokens",
     "cacheblend_attention_active_ranges",
 ]
