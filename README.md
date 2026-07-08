@@ -31,6 +31,9 @@ branches when turn0 responses diverge and refocus images are similar but not ide
 **中文总览（从建仓到现在做了什么、算法步骤、代码位置）：**  
 [`docs/GraftRL_项目全历程.md`](docs/GraftRL_项目全历程.md)
 
+**Geo3K 实验复现（给合作者）：**  
+[`docs/REPRODUCE_GEO3K.md`](docs/REPRODUCE_GEO3K.md) — 环境安装 + baseline/optimized 两条命令 + 结果判读
+
 版本标签说明：[`docs/RELEASES.md`](docs/RELEASES.md)
 
 ## Quick start (profiling)
@@ -44,7 +47,7 @@ refocus workload (**64×4**, standard PPO recompute — no training bypass):
 
 **Prerequisites**
 
-- 4 GPUs (80GB recommended), conda env with patched `verl` + `sglang` from this repo
+- 4 GPUs (80GB recommended) — see **[`docs/REPRODUCE_GEO3K.md`](docs/REPRODUCE_GEO3K.md)** for full env setup (`requirements-reproduce.txt` + editable `verl`/`sglang`)
 - Run from `graftrl/verl`
 
 ```bash
