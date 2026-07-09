@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import os
 import json
+import logging
 import threading
 import time
 from collections import OrderedDict
@@ -32,6 +33,8 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
 import torch
+
+logger = logging.getLogger(__name__)
 
 
 # --------------------------------------------------------------------------- #
@@ -135,6 +138,25 @@ class VLMCacheBlendConfig:
     # coordination/copy overhead.
     min_reused_tokens: int = 0
     min_reuse_ratio: float = 0.0
+    # Sparse decode (context-side): during autoregressive decode, skip attending to
+    # donor-reused image-token KV slots that were grafted at prefill. Query is still one
+    # token; only the context page table is shortened. Default off. Requires FA3 and
+    # page_size==1 for the first implementation.
+    sparse_decode: bool = False
+    # Strategy for which context tokens to drop. "reuse" drops image tokens marked
+    # reusable by the CacheBlend plan. Future: "topk" / "hybrid".
+    sparse_decode_mode: str = "reuse"
+    # Always keep the most recent N tokens in the context (local causal window).
+    sparse_decode_keep_recent: int = 64
+    # Always keep the first N context tokens. Useful as an attention-sink guard when
+    # prompts place instruction/system tokens before visual spans.
+    sparse_decode_keep_first: int = 0
+    # Skip sparse decode unless a decode forward can drop enough tokens to amortize the
+    # dynamic page-table build. Disabled by default for backward compatibility.
+    sparse_decode_min_dropped_tokens: int = 0
+    sparse_decode_min_drop_ratio: float = 0.0
+    # Cap how many sparse-decode plans are retained across requests (LRU).
+    sparse_decode_max_plans: int = 256
 
     @staticmethod
     def from_env() -> "VLMCacheBlendConfig":
@@ -175,6 +197,27 @@ class VLMCacheBlendConfig:
             donor_to_cpu=_env_flag("SGLANG_VLM_CACHEBLEND_DONOR_TO_CPU", "0"),
             min_reused_tokens=_env_int("SGLANG_VLM_CACHEBLEND_MIN_REUSED_TOKENS", 0),
             min_reuse_ratio=_env_float("SGLANG_VLM_CACHEBLEND_MIN_REUSE_RATIO", 0.0),
+            sparse_decode=_env_flag("SGLANG_VLM_CACHEBLEND_SPARSE_DECODE", "0"),
+            sparse_decode_mode=os.environ.get(
+                "SGLANG_VLM_CACHEBLEND_SPARSE_DECODE_MODE", "reuse"
+            )
+            .strip()
+            .lower(),
+            sparse_decode_keep_recent=_env_int(
+                "SGLANG_VLM_CACHEBLEND_SPARSE_DECODE_KEEP_RECENT", 64
+            ),
+            sparse_decode_keep_first=_env_int(
+                "SGLANG_VLM_CACHEBLEND_SPARSE_DECODE_KEEP_FIRST", 0
+            ),
+            sparse_decode_min_dropped_tokens=_env_int(
+                "SGLANG_VLM_CACHEBLEND_SPARSE_DECODE_MIN_DROPPED_TOKENS", 0
+            ),
+            sparse_decode_min_drop_ratio=_env_float(
+                "SGLANG_VLM_CACHEBLEND_SPARSE_DECODE_MIN_DROP_RATIO", 0.0
+            ),
+            sparse_decode_max_plans=_env_int(
+                "SGLANG_VLM_CACHEBLEND_SPARSE_DECODE_MAX_PLANS", 256
+            ),
         )
 
 
@@ -224,10 +267,13 @@ def target_turn_enabled(agent_turn: int, cfg: Optional[VLMCacheBlendConfig] = No
 def reload_config_from_env() -> VLMCacheBlendConfig:
     """Re-read env (useful for tests)."""
     global _CONFIG, _DUMP_ONCE_ENABLED, _DUMP_ONCE_DONE, _PREFILL_READY_ACTOR
+    global _SPARSE_DECODE_STORE
     _CONFIG = VLMCacheBlendConfig.from_env()
     _DUMP_ONCE_ENABLED = _env_flag("SGLANG_VLM_CACHEBLEND_DUMP_ONCE", "0")
     _DUMP_ONCE_DONE = False
     _PREFILL_READY_ACTOR = None
+    with _SPARSE_DECODE_STORE_LOCK:
+        _SPARSE_DECODE_STORE = None
     return _CONFIG
 
 
@@ -312,6 +358,43 @@ class RecipientActiveQueryRanges:
     range_end_lens: torch.Tensor
     range_batch_indices: torch.Tensor
     range_req_indices: torch.Tensor
+
+
+@dataclass
+class SparseDecodePlan:
+    """Per-request plan for context-side sparse attention during decode.
+
+    Built at the end of a successful recipient prefill from the finalized CacheBlend
+    reuse mask. Decode steps look this up by ``req_pool_idx`` and build a shortened
+    page table that drops donor-reused image-token KV slots while keeping text tokens
+    and a recent local window.
+    """
+
+    request_id: str
+    req_pool_idx: int
+    # Absolute KV-pool locations of image tokens that may be dropped from decode context.
+    drop_locs: torch.Tensor
+    n_image_tokens: int
+    n_drop_tokens: int
+    mode: str = "reuse"
+    keep_recent: int = 64
+    keep_first: int = 0
+    drop_locs_cache: Dict[str, torch.Tensor] = field(
+        default_factory=dict, repr=False, compare=False
+    )
+
+
+@dataclass(frozen=True)
+class SparseDecodeBatch:
+    """Batch-level sparse page tables for one decode forward."""
+
+    page_table: torch.Tensor
+    cache_seqlens: torch.Tensor
+    cu_seqlens_k: torch.Tensor
+    max_seqlen_k: int
+    kept_tokens: int
+    dropped_tokens: int
+    used_requests: int
 
 
 class DonorKVStore:
@@ -963,6 +1046,9 @@ class CacheBlendStats:
     reuse_ratio_effective: float = 0.0
     attention_skipped_tokens: int = 0
     attention_active_ranges: int = 0
+    sparse_decode_used: bool = False
+    sparse_decode_kept_tokens: int = 0
+    sparse_decode_dropped_tokens: int = 0
 
     def finalize(self) -> "CacheBlendStats":
         if self.n_image_tokens > 0:
@@ -1009,6 +1095,11 @@ class CacheBlendStats:
             "cacheblend_reuse_ratio": f"{self.reuse_ratio_effective:.4f}",
             "cacheblend_attention_skipped_tokens": str(self.attention_skipped_tokens),
             "cacheblend_attention_active_ranges": str(self.attention_active_ranges),
+            "cacheblend_sparse_decode_used": "1" if self.sparse_decode_used else "0",
+            "cacheblend_sparse_decode_kept_tokens": str(self.sparse_decode_kept_tokens),
+            "cacheblend_sparse_decode_dropped_tokens": str(
+                self.sparse_decode_dropped_tokens
+            ),
         }
 
 
@@ -1237,6 +1328,331 @@ def clear_recipient_blend_plans() -> None:
     _RECIPIENT_ATTENTION_SKIP.value = {}
     _RECIPIENT_ACTIVE_QUERY_RANGES.value = None
     _RECIPIENT_REUSE_IDX.value = None
+
+
+# --------------------------------------------------------------------------- #
+# Sparse decode plan store (persists across prefill → decode)
+# --------------------------------------------------------------------------- #
+
+
+class SparseDecodePlanStore:
+    """Thread-safe LRU of per-request sparse-decode plans keyed by req_pool_idx."""
+
+    def __init__(self, max_plans: int = 256):
+        self._lock = threading.Lock()
+        self._store: "OrderedDict[int, SparseDecodePlan]" = OrderedDict()
+        self._max_plans = max(1, int(max_plans))
+
+    def put(self, plan: SparseDecodePlan) -> None:
+        key = int(plan.req_pool_idx)
+        with self._lock:
+            self._store[key] = plan
+            self._store.move_to_end(key)
+            while len(self._store) > self._max_plans:
+                self._store.popitem(last=False)
+
+    def get(self, req_pool_idx: int) -> Optional[SparseDecodePlan]:
+        key = int(req_pool_idx)
+        with self._lock:
+            plan = self._store.get(key)
+            if plan is not None:
+                self._store.move_to_end(key)
+            return plan
+
+    def drop(self, req_pool_idx: int) -> None:
+        with self._lock:
+            self._store.pop(int(req_pool_idx), None)
+
+    def clear(self) -> None:
+        with self._lock:
+            self._store.clear()
+
+    def __len__(self) -> int:
+        with self._lock:
+            return len(self._store)
+
+
+_SPARSE_DECODE_STORE: Optional[SparseDecodePlanStore] = None
+_SPARSE_DECODE_STORE_LOCK = threading.Lock()
+_SPARSE_DECODE_LAST_BATCH = threading.local()
+
+
+def get_sparse_decode_store() -> SparseDecodePlanStore:
+    global _SPARSE_DECODE_STORE
+    if _SPARSE_DECODE_STORE is None:
+        with _SPARSE_DECODE_STORE_LOCK:
+            if _SPARSE_DECODE_STORE is None:
+                _SPARSE_DECODE_STORE = SparseDecodePlanStore(
+                    max_plans=get_config().sparse_decode_max_plans
+                )
+    return _SPARSE_DECODE_STORE
+
+
+def sparse_decode_enabled() -> bool:
+    cfg = get_config()
+    return bool(cacheblend_enabled() and cfg.sparse_decode)
+
+
+def register_sparse_decode_plan_from_blend(
+    plan: "RecipientKVBlendPlan",
+    *,
+    req_pool_idx: int,
+) -> Optional[SparseDecodePlan]:
+    """Persist a sparse-decode plan from a finalized recipient blend plan.
+
+    Only image tokens marked reusable (``~recompute_mask``) become drop candidates.
+    Returns None when sparse decode is disabled, the plan is pending, or there is
+    nothing to drop. If a plan already exists for the same ``req_pool_idx`` (e.g.
+    multi-slot graft), drop locations are unioned.
+    """
+    if not sparse_decode_enabled():
+        return None
+    if bool(getattr(plan, "pending_deviation", False)):
+        return None
+    if int(req_pool_idx) < 0:
+        return None
+    cfg = get_config()
+    mode = str(cfg.sparse_decode_mode or "reuse").strip().lower()
+    if mode not in ("reuse",):
+        mode = "reuse"
+    recompute_mask = plan.recompute_mask
+    if recompute_mask is None or plan.img_locs is None:
+        return None
+    reuse_mask = ~recompute_mask.to(dtype=torch.bool)
+    if not bool(reuse_mask.any()):
+        return None
+    drop_locs = (
+        plan.img_locs.to(dtype=torch.long)[reuse_mask].detach().cpu().contiguous()
+    )
+    store = get_sparse_decode_store()
+    existing = store.get(int(req_pool_idx))
+    if existing is not None and existing.drop_locs.numel() > 0:
+        merged = torch.unique(
+            torch.cat([existing.drop_locs.to(dtype=torch.long), drop_locs]),
+            sorted=True,
+        )
+        drop_locs = merged.contiguous()
+        n_image = int(existing.n_image_tokens) + int(plan.n_image_tokens)
+    else:
+        n_image = int(plan.n_image_tokens)
+    sparse_plan = SparseDecodePlan(
+        request_id=str(plan.request_id),
+        req_pool_idx=int(req_pool_idx),
+        drop_locs=drop_locs,
+        n_image_tokens=n_image,
+        n_drop_tokens=int(drop_locs.numel()),
+        mode=mode,
+        keep_recent=max(0, int(cfg.sparse_decode_keep_recent)),
+        keep_first=max(0, int(cfg.sparse_decode_keep_first)),
+    )
+    store.put(sparse_plan)
+    return sparse_plan
+
+
+def clear_sparse_decode_plan(req_pool_idx: int) -> None:
+    get_sparse_decode_store().drop(int(req_pool_idx))
+
+
+def pop_last_sparse_decode_batch() -> Optional[SparseDecodeBatch]:
+    batch = getattr(_SPARSE_DECODE_LAST_BATCH, "value", None)
+    _SPARSE_DECODE_LAST_BATCH.value = None
+    return batch
+
+
+def set_last_sparse_decode_batch(batch: Optional[SparseDecodeBatch]) -> None:
+    _SPARSE_DECODE_LAST_BATCH.value = batch
+
+
+def _sparse_decode_drop_locs_for_device(
+    plan: SparseDecodePlan,
+    *,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    """Return cached drop locations on the decode page-table device."""
+    key = f"{device}:{dtype}"
+    cached = plan.drop_locs_cache.get(key)
+    if cached is not None:
+        return cached
+    locs = plan.drop_locs.to(device=device, dtype=dtype, non_blocking=True).contiguous()
+    plan.drop_locs_cache[key] = locs
+    return locs
+
+
+def build_sparse_decode_batch(
+    forward_batch: Any,
+    *,
+    page_table: torch.Tensor,
+    cache_seqlens: torch.Tensor,
+    page_size: int = 1,
+) -> Optional[SparseDecodeBatch]:
+    """Build a shortened decode page table that drops reusable image context tokens.
+
+    Constraints:
+      - ``page_size`` must be 1 for token-level skipping. Larger pages fall back to dense
+        because the FA page table can only drop whole pages safely.
+      - Only normal decode (no speculative / cascade / local-attn) should call this.
+      - Dropped tokens are donor-reused image KV slots registered at prefill time.
+      - The most recent ``keep_recent`` tokens are always retained.
+    """
+    set_last_sparse_decode_batch(None)
+    if not sparse_decode_enabled():
+        return None
+    if int(page_size) != 1:
+        return None
+    req_pool_indices = getattr(forward_batch, "req_pool_indices", None)
+    if req_pool_indices is None or page_table is None or cache_seqlens is None:
+        return None
+    if page_table.ndim != 2 or cache_seqlens.ndim != 1:
+        return None
+    batch_size = int(page_table.shape[0])
+    if batch_size == 0 or int(cache_seqlens.numel()) != batch_size:
+        return None
+    flat_req = req_pool_indices.reshape(-1)
+    if int(flat_req.numel()) < batch_size:
+        return None
+
+    store = get_sparse_decode_store()
+    cfg = get_config()
+    device = page_table.device
+    dtype = page_table.dtype
+    max_len = int(page_table.shape[1])
+    sparse_rows: List[torch.Tensor] = []
+    sparse_lens: List[int] = []
+    kept_total = 0
+    dropped_total = 0
+    total_tokens = 0
+    used_requests = 0
+
+    for b in range(batch_size):
+        seq_len = int(cache_seqlens[b].item())
+        seq_len = max(0, min(seq_len, max_len))
+        total_tokens += seq_len
+        row = page_table[b, :seq_len]
+        if seq_len <= 0:
+            sparse_rows.append(row)
+            sparse_lens.append(0)
+            continue
+        req_pool_idx = int(flat_req[b].item())
+        plan = store.get(req_pool_idx)
+        if plan is None or int(plan.n_drop_tokens) <= 0:
+            sparse_rows.append(row)
+            sparse_lens.append(seq_len)
+            kept_total += seq_len
+            continue
+
+        keep_recent = max(0, int(plan.keep_recent))
+        keep_first = max(0, int(getattr(plan, "keep_first", 0)))
+        keep_from = max(0, seq_len - keep_recent) if keep_recent > 0 else seq_len
+
+        drop_locs = _sparse_decode_drop_locs_for_device(
+            plan, device=device, dtype=row.dtype
+        )
+        drop_mask = torch.isin(row, drop_locs)
+        if keep_recent > 0 or keep_first > 0:
+            pos = torch.arange(seq_len, device=device)
+            if keep_recent > 0:
+                drop_mask &= pos < keep_from
+            if keep_first > 0:
+                drop_mask &= pos >= keep_first
+
+        dropped = int(drop_mask.sum().item())
+        if dropped <= 0:
+            sparse_rows.append(row)
+            sparse_lens.append(seq_len)
+            kept_total += seq_len
+            continue
+
+        keep_mask = ~drop_mask
+        if dropped >= seq_len:
+            keep_mask[-1] = True
+            dropped = max(0, seq_len - 1)
+        kept_row = row[keep_mask]
+        sparse_rows.append(kept_row)
+        sparse_lens.append(int(kept_row.numel()))
+        kept_total += int(kept_row.numel())
+        dropped_total += int(dropped)
+        if dropped > 0:
+            used_requests += 1
+
+    if used_requests == 0 or dropped_total == 0:
+        return None
+    min_dropped = max(0, int(getattr(cfg, "sparse_decode_min_dropped_tokens", 0) or 0))
+    min_ratio = max(0.0, float(getattr(cfg, "sparse_decode_min_drop_ratio", 0.0) or 0.0))
+    drop_ratio = (dropped_total / total_tokens) if total_tokens > 0 else 0.0
+    if min_dropped > 0 and dropped_total < min_dropped:
+        return None
+    if min_ratio > 0.0 and drop_ratio < min_ratio:
+        return None
+
+    max_sparse = max(sparse_lens) if sparse_lens else 0
+    out = page_table.new_zeros((batch_size, max_sparse), dtype=dtype)
+    for b, row in enumerate(sparse_rows):
+        n = int(row.numel())
+        if n > 0:
+            out[b, :n] = row.to(device=device, dtype=dtype)
+    lens = torch.tensor(sparse_lens, dtype=torch.int32, device=device)
+    cu = torch.nn.functional.pad(
+        torch.cumsum(lens, dim=0, dtype=torch.int32), (1, 0)
+    )
+    batch = SparseDecodeBatch(
+        page_table=out,
+        cache_seqlens=lens,
+        cu_seqlens_k=cu,
+        max_seqlen_k=int(max_sparse),
+        kept_tokens=int(kept_total),
+        dropped_tokens=int(dropped_total),
+        used_requests=int(used_requests),
+    )
+    set_last_sparse_decode_batch(batch)
+    return batch
+
+
+def maybe_register_sparse_decode_plans(
+    forward_batch: Any,
+    plans: Tuple["RecipientKVBlendPlan", ...],
+) -> int:
+    """Register sparse-decode plans for finalized recipient blend plans.
+
+    Maps each plan to its ``req_pool_idx`` via ``forward_batch.req_pool_indices``.
+    Returns the number of plans registered.
+    """
+    if not sparse_decode_enabled() or not plans:
+        return 0
+    req_pool_indices = getattr(forward_batch, "req_pool_indices", None)
+    if req_pool_indices is None:
+        return 0
+    flat = req_pool_indices.reshape(-1)
+    registered = 0
+    ctx = get_request_context()
+    contexts: List[RequestContext] = []
+    if isinstance(ctx, BatchRequestContext):
+        contexts = list(ctx.contexts)
+    elif isinstance(ctx, RequestContext):
+        contexts = [ctx]
+
+    rid_to_req_index: Dict[str, int] = {}
+    for c in contexts:
+        rid_to_req_index[str(c.request_id)] = int(getattr(c, "request_index", 0))
+
+    for plan in plans:
+        if bool(getattr(plan, "pending_deviation", False)):
+            continue
+        req_index = rid_to_req_index.get(str(plan.request_id))
+        if req_index is None:
+            if int(flat.numel()) == 1:
+                req_index = 0
+            else:
+                continue
+        if req_index < 0 or req_index >= int(flat.numel()):
+            continue
+        req_pool_idx = int(flat[req_index].item())
+        if (
+            register_sparse_decode_plan_from_blend(plan, req_pool_idx=req_pool_idx)
+            is not None
+        ):
+            registered += 1
+    return registered
 
 
 def _reuse_idx_cache_signature(

@@ -501,6 +501,15 @@ kvdev/cos 跑：barrier + prefix warmup **均开启**。
 | ④ Compact | `CACHEBLEND_COMPACT_PREFILL=0` | Geo3K decode 太短，cp1 证负；**decode-heavy workload 再开** |
 | ⑤ Warm barrier | `WARMUP_BARRIER=1`, `PREFIX_WARMUP=1`, `TARGET_TURNS=1` | turn0 前缀 + turn1 graft |
 | ⑥ Bounded wait | `WAIT_POLICY=bounded`, **`MAX_WAIT_S=10`**（慢簇） | 见下节 |
+| ⑦ Sparse decode | `SGLANG_VLM_CACHEBLEND_SPARSE_DECODE=0` | **context 侧**稀疏：decode 时跳过 attend reused image KV；GPU mask/gather 构造短 page table；默认关，长 decode 数据集再开 |
+
+**Prefill vs Decode 优化对照**：
+
+| 功能 | 阶段 | 稀疏对象 | 默认 |
+|------|------|----------|------|
+| Compute skip (M2) | prefill/extend | reused **image query** 的 QKV/MLP/attn | 开 |
+| Compact prefill (cp1) | prefill/extend | 物理缩短 active sequence | 关 |
+| **Sparse decode** | **decode** | 缩短 **context page table**（少看 reused image KV）；`KEEP_RECENT/KEEP_FIRST/MIN_DROP` 可控 | 关 |
 
 ### 11.3 Bounded wait 关键结论（2367 同环境 AB）
 
@@ -668,7 +677,7 @@ python3 examples/profile/shared/analysis/analyze_profiling_logs.py \
 
 1. **diversified × 64×4 × aw4** semantic AB — 验证 cos 在相似图上的价值。  
 2. 补对照 **`CACHEBLEND=0` + `WARMUP_BARRIER=1`**，拆清 barrier 净收益。  
-3. decode-heavy workload 上开 **cp1/fa1**，验证 context attention 稀疏 decode 收益。  
+3. decode-heavy workload 上开 **sparse decode**（必要时配 `KEEP_FIRST` / `MIN_DROPPED_TOKENS`），验证 context attention 稀疏 decode 收益。
 4. `TOTAL_STEPS=2` 整步 profiling，拿稳态 gen vs training 占比。  
 
 ---

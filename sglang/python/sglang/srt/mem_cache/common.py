@@ -465,6 +465,15 @@ def alloc_for_decode(batch: ScheduleBatch, token_per_req: int) -> torch.Tensor:
 
 
 def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = True):
+    # Drop sparse-decode plan before the req_pool_idx is recycled.
+    if req.req_pool_idx is not None:
+        try:
+            from sglang.srt.mem_cache import vlm_cacheblend
+
+            vlm_cacheblend.clear_sparse_decode_plan(int(req.req_pool_idx))
+        except Exception:
+            pass
+
     tree_cache.cache_finished_req(req, is_insert=is_insert)
 
     # MambaRadixCache may alloc mamba state before alloc KV cache

@@ -1302,6 +1302,43 @@ class FlashAttentionBackend(AttentionBackend):
                     -1, layer.tp_q_head_num, layer.head_dim
                 )
 
+                # [VLM-CacheBlend sparse decode] optionally shorten the context page
+                # table by dropping donor-reused image KV slots registered at prefill.
+                # Only for normal decode (no cascade / local / cross / SWA-pool remap).
+                if (
+                    not use_cascade_attn
+                    and not use_local_attn
+                    and not layer.is_cross_attention
+                    and not (is_swa_layer and self.use_sliding_window_kv_pool)
+                    and forward_batch.spec_info is None
+                ):
+                    from sglang.srt.mem_cache import vlm_cacheblend
+
+                    if vlm_cacheblend.sparse_decode_enabled():
+                        # Cache once per forward: FA3 runs this path every layer.
+                        if not hasattr(
+                            forward_batch, "_cacheblend_sparse_decode_batch"
+                        ):
+                            sparse_batch = vlm_cacheblend.build_sparse_decode_batch(
+                                forward_batch,
+                                page_table=page_table,
+                                cache_seqlens=cache_seqlens,
+                                page_size=int(self.page_size or 1),
+                            )
+                            setattr(
+                                forward_batch,
+                                "_cacheblend_sparse_decode_batch",
+                                sparse_batch,
+                            )
+                        else:
+                            sparse_batch = getattr(
+                                forward_batch, "_cacheblend_sparse_decode_batch"
+                            )
+                        if sparse_batch is not None:
+                            page_table = sparse_batch.page_table
+                            cache_seqlens = sparse_batch.cache_seqlens
+                            cu_seqlens_k = sparse_batch.cu_seqlens_k
+
                 # Default: single-token self-attention
                 result = flash_attn_with_kvcache(
                     q=q_reshaped,

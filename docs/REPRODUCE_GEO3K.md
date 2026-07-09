@@ -185,7 +185,24 @@ SGLANG_VLM_CACHEBLEND_WARMUP_BARRIER_MAX_WAIT_S=10 \
 | Warm barrier | turn0 prefix + turn1 cacheblend |
 | Bounded wait | `MAX_WAIT_S=10` |
 | fast_apply / compact_prefill | **关**（fa0/cp0；Geo3K decode 短，cp1 曾证负） |
+| sparse_decode | **关**（默认；decode-heavy 数据集再开） |
 | Training | 标准 PPO recompute，**无 bypass** |
+
+### 8.1 可选：context attention 稀疏 decode
+
+Prefill 成功 graft 后，decode 步可跳过 attend 到 donor-reused image KV（缩短 page table）。**默认关**；Geo3K 短 decode 收益小，适合长输出数据集。
+
+```bash
+export SGLANG_VLM_CACHEBLEND_SPARSE_DECODE=1
+export SGLANG_VLM_CACHEBLEND_SPARSE_DECODE_MODE=reuse          # 目前仅 reuse
+export SGLANG_VLM_CACHEBLEND_SPARSE_DECODE_KEEP_RECENT=64      # 始终保留最近 N 个 token
+export SGLANG_VLM_CACHEBLEND_SPARSE_DECODE_KEEP_FIRST=0        # 可设 4/8，保留 attention sink
+export SGLANG_VLM_CACHEBLEND_SPARSE_DECODE_MIN_DROPPED_TOKENS=0
+export SGLANG_VLM_CACHEBLEND_SPARSE_DECODE_MIN_DROP_RATIO=0
+# 与 optimized 臂一起跑；需 FA3 normal decode + page_size==1
+```
+
+实现路径在 GPU 上用 mask/gather 构造短 page table，避免每个 decode step 把上下文搬回 CPU 做集合判断。日志字段：`cacheblend_sparse_decode_{used,kept_tokens,dropped_tokens}`。
 
 ---
 
@@ -205,4 +222,4 @@ A: [`docs/GraftRL_项目全历程.md`](GraftRL_项目全历程.md)
 
 ---
 
-*文档版本：2026-07-07，与 main 上 demo 脚本一致。*
+*文档版本：2026-07-09，含 sparse decode（默认关）。*

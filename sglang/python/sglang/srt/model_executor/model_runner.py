@@ -272,6 +272,9 @@ _CACHEBLEND_LOG_FIELDS = [
     "cacheblend_reuse_ratio",
     "cacheblend_attention_skipped_tokens",
     "cacheblend_attention_active_ranges",
+    "cacheblend_sparse_decode_used",
+    "cacheblend_sparse_decode_kept_tokens",
+    "cacheblend_sparse_decode_dropped_tokens",
 ]
 
 
@@ -445,6 +448,11 @@ def _pop_vlm_cacheblend_log_fields() -> Optional[dict]:
         stats = vlm_cacheblend.pop_last_stats()
         if stats is None:
             stats = vlm_cacheblend.CacheBlendStats()
+        sparse = vlm_cacheblend.pop_last_sparse_decode_batch()
+        if sparse is not None:
+            stats.sparse_decode_used = True
+            stats.sparse_decode_kept_tokens = int(sparse.kept_tokens)
+            stats.sparse_decode_dropped_tokens = int(sparse.dropped_tokens)
         return stats.to_dict() if stats is not None else None
     except Exception:
         return None

@@ -1028,6 +1028,223 @@ def test_apply_kvdev_bootstrap_finalizes_then_reuses_next_layer():
     print("ok test_apply_kvdev_bootstrap_finalizes_then_reuses_next_layer")
 
 
+def test_sparse_decode_plan_register_and_build_batch():
+    """Sparse decode: register reuse drop locs, then shorten decode page table."""
+    os.environ["SGLANG_VLM_CACHEBLEND"] = "1"
+    os.environ["SGLANG_VLM_CACHEBLEND_SPARSE_DECODE"] = "1"
+    os.environ["SGLANG_VLM_CACHEBLEND_SPARSE_DECODE_KEEP_RECENT"] = "2"
+    os.environ["SGLANG_VLM_CACHEBLEND_SPARSE_DECODE_KEEP_FIRST"] = "0"
+    os.environ["SGLANG_VLM_CACHEBLEND_SPARSE_DECODE_MIN_DROPPED_TOKENS"] = "0"
+    os.environ["SGLANG_VLM_CACHEBLEND_SPARSE_DECODE_MIN_DROP_RATIO"] = "0"
+    cb.reload_config_from_env()
+    assert cb.sparse_decode_enabled()
+
+    # Sequence of 8 token locs; image tokens at positions 1,2,3 with pool locs 101,102,103.
+    # Recompute only token 2 => drop 101 and 103.
+    img_locs = torch.tensor([101, 102, 103], dtype=torch.long)
+    recompute_mask = torch.tensor([False, True, False])
+    plan = cb.RecipientKVBlendPlan(
+        request_id="reqA",
+        group_key=("g",),
+        img_locs=img_locs,
+        positions=None,
+        recompute_mask=recompute_mask,
+        grid_sig=(1, 1, 1),
+        n_image_tokens=3,
+        reused_tokens=2,
+        recomputed_tokens=1,
+        pos_mode="same",
+        select_mode="kvdev",
+        pending_deviation=False,
+    )
+    sparse = cb.register_sparse_decode_plan_from_blend(plan, req_pool_idx=7)
+    assert sparse is not None
+    assert sparse.n_drop_tokens == 2
+    assert set(sparse.drop_locs.tolist()) == {101, 103}
+
+    page_table = torch.tensor(
+        [[10, 101, 102, 103, 20, 21, 22, 23]], dtype=torch.int32
+    )
+    cache_seqlens = torch.tensor([8], dtype=torch.int32)
+
+    class Batch:
+        req_pool_indices = torch.tensor([7], dtype=torch.long)
+
+    batch = cb.build_sparse_decode_batch(
+        Batch(),
+        page_table=page_table,
+        cache_seqlens=cache_seqlens,
+        page_size=1,
+    )
+    assert batch is not None
+    # keep_recent=2 keeps last two (22,23). Drop 101,103 from earlier context.
+    # Kept: 10, 102, 20, 21, 22, 23  (dropped 101,103)
+    assert int(batch.cache_seqlens[0]) == 6
+    assert batch.dropped_tokens == 2
+    assert batch.kept_tokens == 6
+    kept = batch.page_table[0, :6].tolist()
+    assert 101 not in kept and 103 not in kept
+    assert kept[-2:] == [22, 23]
+
+    # page_size != 1 must fall back
+    assert (
+        cb.build_sparse_decode_batch(
+            Batch(),
+            page_table=page_table,
+            cache_seqlens=cache_seqlens,
+            page_size=16,
+        )
+        is None
+    )
+
+    cb.clear_sparse_decode_plan(7)
+    assert cb.get_sparse_decode_store().get(7) is None
+    os.environ["SGLANG_VLM_CACHEBLEND_SPARSE_DECODE"] = "0"
+    cb.reload_config_from_env()
+    print("ok test_sparse_decode_plan_register_and_build_batch")
+
+
+def test_sparse_decode_keep_recent_protects_tail():
+    os.environ["SGLANG_VLM_CACHEBLEND"] = "1"
+    os.environ["SGLANG_VLM_CACHEBLEND_SPARSE_DECODE"] = "1"
+    os.environ["SGLANG_VLM_CACHEBLEND_SPARSE_DECODE_KEEP_RECENT"] = "4"
+    os.environ["SGLANG_VLM_CACHEBLEND_SPARSE_DECODE_KEEP_FIRST"] = "0"
+    os.environ["SGLANG_VLM_CACHEBLEND_SPARSE_DECODE_MIN_DROPPED_TOKENS"] = "0"
+    os.environ["SGLANG_VLM_CACHEBLEND_SPARSE_DECODE_MIN_DROP_RATIO"] = "0"
+    cb.reload_config_from_env()
+
+    # All tokens are drop candidates, but keep_recent=4 must retain the tail.
+    img_locs = torch.arange(8, dtype=torch.long)
+    recompute_mask = torch.zeros(8, dtype=torch.bool)
+    plan = cb.RecipientKVBlendPlan(
+        request_id="reqB",
+        group_key=("g",),
+        img_locs=img_locs,
+        positions=None,
+        recompute_mask=recompute_mask,
+        grid_sig=(1, 1, 1),
+        n_image_tokens=8,
+        reused_tokens=8,
+        recomputed_tokens=0,
+        pos_mode="same",
+        select_mode="kvdev",
+    )
+    cb.register_sparse_decode_plan_from_blend(plan, req_pool_idx=3)
+    page_table = torch.arange(8, dtype=torch.int32).unsqueeze(0)
+    cache_seqlens = torch.tensor([8], dtype=torch.int32)
+
+    class Batch:
+        req_pool_indices = torch.tensor([3], dtype=torch.long)
+
+    batch = cb.build_sparse_decode_batch(
+        Batch(),
+        page_table=page_table,
+        cache_seqlens=cache_seqlens,
+        page_size=1,
+    )
+    assert batch is not None
+    assert int(batch.cache_seqlens[0]) == 4
+    assert batch.page_table[0, :4].tolist() == [4, 5, 6, 7]
+    assert batch.dropped_tokens == 4
+    cb.get_sparse_decode_store().clear()
+    os.environ["SGLANG_VLM_CACHEBLEND_SPARSE_DECODE"] = "0"
+    cb.reload_config_from_env()
+    print("ok test_sparse_decode_keep_recent_protects_tail")
+
+
+def test_sparse_decode_keep_first_and_min_drop_gate():
+    os.environ["SGLANG_VLM_CACHEBLEND"] = "1"
+    os.environ["SGLANG_VLM_CACHEBLEND_SPARSE_DECODE"] = "1"
+    os.environ["SGLANG_VLM_CACHEBLEND_SPARSE_DECODE_KEEP_RECENT"] = "0"
+    os.environ["SGLANG_VLM_CACHEBLEND_SPARSE_DECODE_KEEP_FIRST"] = "2"
+    os.environ["SGLANG_VLM_CACHEBLEND_SPARSE_DECODE_MIN_DROPPED_TOKENS"] = "0"
+    os.environ["SGLANG_VLM_CACHEBLEND_SPARSE_DECODE_MIN_DROP_RATIO"] = "0"
+    cb.reload_config_from_env()
+
+    plan = cb.RecipientKVBlendPlan(
+        request_id="reqD",
+        group_key=("g",),
+        img_locs=torch.arange(6, dtype=torch.long),
+        positions=None,
+        recompute_mask=torch.zeros(6, dtype=torch.bool),
+        grid_sig=(1, 1, 1),
+        n_image_tokens=6,
+        reused_tokens=6,
+        recomputed_tokens=0,
+        pos_mode="same",
+        select_mode="kvdev",
+    )
+    cb.register_sparse_decode_plan_from_blend(plan, req_pool_idx=4)
+    page_table = torch.arange(6, dtype=torch.int32).unsqueeze(0)
+    cache_seqlens = torch.tensor([6], dtype=torch.int32)
+
+    class Batch:
+        req_pool_indices = torch.tensor([4], dtype=torch.long)
+
+    batch = cb.build_sparse_decode_batch(
+        Batch(),
+        page_table=page_table,
+        cache_seqlens=cache_seqlens,
+        page_size=1,
+    )
+    assert batch is not None
+    assert batch.page_table[0, :2].tolist() == [0, 1]
+    assert int(batch.cache_seqlens[0]) == 2
+    assert batch.dropped_tokens == 4
+
+    os.environ["SGLANG_VLM_CACHEBLEND_SPARSE_DECODE_MIN_DROPPED_TOKENS"] = "5"
+    cb.reload_config_from_env()
+    cb.register_sparse_decode_plan_from_blend(plan, req_pool_idx=4)
+    assert (
+        cb.build_sparse_decode_batch(
+            Batch(),
+            page_table=page_table,
+            cache_seqlens=cache_seqlens,
+            page_size=1,
+        )
+        is None
+    )
+    cb.get_sparse_decode_store().clear()
+    os.environ["SGLANG_VLM_CACHEBLEND_SPARSE_DECODE"] = "0"
+    cb.reload_config_from_env()
+    print("ok test_sparse_decode_keep_first_and_min_drop_gate")
+
+
+def test_sparse_decode_disabled_is_noop():
+    os.environ["SGLANG_VLM_CACHEBLEND"] = "1"
+    os.environ["SGLANG_VLM_CACHEBLEND_SPARSE_DECODE"] = "0"
+    cb.reload_config_from_env()
+    assert not cb.sparse_decode_enabled()
+    plan = cb.RecipientKVBlendPlan(
+        request_id="reqC",
+        group_key=("g",),
+        img_locs=torch.tensor([1, 2]),
+        positions=None,
+        recompute_mask=torch.tensor([False, False]),
+        grid_sig=(1, 1, 1),
+        n_image_tokens=2,
+        reused_tokens=2,
+        recomputed_tokens=0,
+        pos_mode="same",
+        select_mode="kvdev",
+    )
+    assert cb.register_sparse_decode_plan_from_blend(plan, req_pool_idx=1) is None
+    print("ok test_sparse_decode_disabled_is_noop")
+
+
+def test_sparse_decode_stats_to_dict():
+    stats = cb.CacheBlendStats(
+        sparse_decode_used=True,
+        sparse_decode_kept_tokens=12,
+        sparse_decode_dropped_tokens=4,
+    )
+    d = stats.to_dict()
+    assert d["cacheblend_sparse_decode_used"] == "1"
+    assert d["cacheblend_sparse_decode_kept_tokens"] == "12"
+    assert d["cacheblend_sparse_decode_dropped_tokens"] == "4"
+    print("ok test_sparse_decode_stats_to_dict")
+
+
 def main():
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for fn in tests:

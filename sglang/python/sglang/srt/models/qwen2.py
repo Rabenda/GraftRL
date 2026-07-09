@@ -494,6 +494,11 @@ class Qwen2Model(nn.Module):
         # emit a structured fallback reason.
         self._maybe_cacheblend_after_full_prefill(input_ids, forward_batch)
         if _vlm_cacheblend.cacheblend_enabled():
+            # Persist sparse-decode plans before clearing the per-forward blend plans so
+            # decode steps can drop reused image context from the attention page table.
+            _vlm_cacheblend.maybe_register_sparse_decode_plans(
+                forward_batch, _vlm_cacheblend.get_recipient_blend_plans()
+            )
             _vlm_cacheblend.clear_recipient_blend_plans()
 
         if not self.pp_group.is_last_rank:
