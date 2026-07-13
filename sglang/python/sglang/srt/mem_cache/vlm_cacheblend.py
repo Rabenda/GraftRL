@@ -58,6 +58,14 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
+def _env_str_any(names: Tuple[str, ...], default: str) -> str:
+    for name in names:
+        value = os.environ.get(name)
+        if value is not None:
+            return value
+    return default
+
+
 @dataclass(frozen=True)
 class VLMCacheBlendConfig:
     """Snapshot of ``SGLANG_VLM_CACHEBLEND*`` env vars (read once at import)."""
@@ -163,7 +171,15 @@ class VLMCacheBlendConfig:
         return VLMCacheBlendConfig(
             enabled=_env_flag("SGLANG_VLM_CACHEBLEND", "0"),
             pos_mode=os.environ.get("SGLANG_VLM_CACHEBLEND_POS_MODE", "same").strip().lower(),
-            select_mode=os.environ.get("SGLANG_VLM_CACHEBLEND_SELECT", "topr").strip().lower(),
+            select_mode=_env_str_any(
+                (
+                    "SGLANG_VLM_CACHEBLEND_SELECT",
+                    "SGLANG_VLM_CACHEBLEND_SELECTOR",
+                ),
+                "topr",
+            )
+            .strip()
+            .lower(),
             recompute_ratio=_env_float("SGLANG_VLM_CACHEBLEND_RECOMPUTE_RATIO", 0.15),
             sim_threshold=_env_float("SGLANG_VLM_CACHEBLEND_SIM_THRESHOLD", 0.90),
             target_turn=_env_int("SGLANG_VLM_CACHEBLEND_TARGET_TURN", 1),
@@ -1479,6 +1495,7 @@ def _sparse_decode_drop_locs_for_device(
     return locs
 
 
+
 def build_sparse_decode_batch(
     forward_batch: Any,
     *,
@@ -1517,63 +1534,112 @@ def build_sparse_decode_batch(
     device = page_table.device
     dtype = page_table.dtype
     max_len = int(page_table.shape[1])
-    sparse_rows: List[torch.Tensor] = []
-    sparse_lens: List[int] = []
-    kept_total = 0
-    dropped_total = 0
-    total_tokens = 0
-    used_requests = 0
 
-    for b in range(batch_size):
-        seq_len = int(cache_seqlens[b].item())
-        seq_len = max(0, min(seq_len, max_len))
-        total_tokens += seq_len
-        row = page_table[b, :seq_len]
-        if seq_len <= 0:
-            sparse_rows.append(row)
-            sparse_lens.append(0)
+    lens_cpu = [
+        max(0, min(int(v), max_len))
+        for v in cache_seqlens.detach().to(device="cpu", dtype=torch.long).tolist()
+    ]
+    req_cpu = (
+        flat_req[:batch_size]
+        .detach()
+        .to(device="cpu", dtype=torch.long)
+        .tolist()
+    )
+    total_tokens = sum(lens_cpu)
+    if total_tokens <= 0:
+        return None
+
+    # Collect drop candidates on CPU (no per-row device sync). Only rows with a
+    # registered plan and pending drops matter; everything else passes through. Encoding
+    # a compact candidate row id into the key lets one batched isin replace per-row isin
+    # while preserving per-request isolation. ``row_stride`` is sized from ``batch_size``
+    # (>= n_candidate) so it is a safe upper stride for realistic KV-loc magnitudes.
+    row_stride = torch.iinfo(torch.int64).max // max(batch_size + 1, 1)
+    cand_orig: List[int] = []
+    cand_drop_pieces: List[torch.Tensor] = []
+    keep_recent_cpu = [0] * batch_size
+    keep_first_cpu = [0] * batch_size
+    drop_upper_bound = 0
+    for b, req_pool_idx in enumerate(req_cpu):
+        if lens_cpu[b] <= 0:
             continue
-        req_pool_idx = int(flat_req[b].item())
-        plan = store.get(req_pool_idx)
+        plan = store.get(int(req_pool_idx))
         if plan is None or int(plan.n_drop_tokens) <= 0:
-            sparse_rows.append(row)
-            sparse_lens.append(seq_len)
-            kept_total += seq_len
             continue
-
-        keep_recent = max(0, int(plan.keep_recent))
-        keep_first = max(0, int(getattr(plan, "keep_first", 0)))
-        keep_from = max(0, seq_len - keep_recent) if keep_recent > 0 else seq_len
-
+        keep_recent_cpu[b] = max(0, int(plan.keep_recent))
+        keep_first_cpu[b] = max(0, int(getattr(plan, "keep_first", 0)))
         drop_locs = _sparse_decode_drop_locs_for_device(
-            plan, device=device, dtype=row.dtype
+            plan, device=device, dtype=torch.long
         )
-        drop_mask = torch.isin(row, drop_locs)
-        if keep_recent > 0 or keep_first > 0:
-            pos = torch.arange(seq_len, device=device)
-            if keep_recent > 0:
-                drop_mask &= pos < keep_from
-            if keep_first > 0:
-                drop_mask &= pos >= keep_first
-
-        dropped = int(drop_mask.sum().item())
-        if dropped <= 0:
-            sparse_rows.append(row)
-            sparse_lens.append(seq_len)
-            kept_total += seq_len
+        if int(drop_locs.numel()) <= 0:
             continue
+        j = len(cand_orig)
+        cand_orig.append(b)
+        cand_drop_pieces.append(drop_locs + (j * row_stride))
+        drop_upper_bound += int(drop_locs.numel())
 
-        keep_mask = ~drop_mask
-        if dropped >= seq_len:
-            keep_mask[-1] = True
-            dropped = max(0, seq_len - 1)
-        kept_row = row[keep_mask]
-        sparse_rows.append(kept_row)
-        sparse_lens.append(int(kept_row.numel()))
-        kept_total += int(kept_row.numel())
-        dropped_total += int(dropped)
-        if dropped > 0:
-            used_requests += 1
+    if not cand_drop_pieces:
+        return None
+
+    # [gate: early bail] Each page-table row holds unique KV slots, so a request can
+    # match at most ``n_drop_tokens`` of its drop_locs, and keep_recent/keep_first only
+    # remove drops. Hence ``drop_upper_bound`` (sum of candidate drop_locs) upper-bounds
+    # the true dropped_total. If even the bound cannot satisfy the min-drop gate, bail
+    # before allocating any (batch, max_len) tensor. When gates are 0 (default), this is
+    # inert and behavior is unchanged.
+    min_dropped = max(0, int(getattr(cfg, "sparse_decode_min_dropped_tokens", 0) or 0))
+    min_ratio = max(0.0, float(getattr(cfg, "sparse_decode_min_drop_ratio", 0.0) or 0.0))
+    if min_dropped > 0 and drop_upper_bound < min_dropped:
+        return None
+    if (
+        min_ratio > 0.0
+        and total_tokens > 0
+        and (drop_upper_bound / total_tokens) < min_ratio
+    ):
+        return None
+
+    lens = torch.tensor(lens_cpu, dtype=torch.int32, device=device)
+    pos = torch.arange(max_len, dtype=torch.int32, device=device).unsqueeze(0)
+    valid_mask = pos < lens.unsqueeze(1)
+
+    # Restrict the int64 key encoding + isin to candidate rows, then scatter the drop
+    # mask back to the full batch. Non-candidate rows keep drop_mask == False.
+    cand_idx = torch.tensor(cand_orig, dtype=torch.long, device=device)
+    n_cand = int(cand_idx.numel())
+    cand_offsets = (
+        torch.arange(n_cand, dtype=torch.long, device=device).unsqueeze(1) * row_stride
+    )
+    cand_page_keys = (
+        page_table.index_select(0, cand_idx).to(dtype=torch.long) + cand_offsets
+    )
+    drop_keys = torch.cat(cand_drop_pieces).contiguous()
+    cand_drop_mask = torch.isin(cand_page_keys, drop_keys)
+
+    drop_mask = page_table.new_zeros((batch_size, max_len), dtype=torch.bool)
+    drop_mask[cand_idx] = cand_drop_mask
+    drop_mask &= valid_mask
+
+    keep_recent = torch.tensor(keep_recent_cpu, dtype=torch.int32, device=device)
+    keep_first = torch.tensor(keep_first_cpu, dtype=torch.int32, device=device)
+    keep_from = torch.clamp(lens - keep_recent, min=0)
+    recent_protected = (keep_recent.unsqueeze(1) > 0) & (
+        pos >= keep_from.unsqueeze(1)
+    )
+    first_protected = (keep_first.unsqueeze(1) > 0) & (
+        pos < keep_first.unsqueeze(1)
+    )
+    drop_mask &= ~recent_protected
+    drop_mask &= ~first_protected
+
+    drop_counts = drop_mask.sum(dim=1, dtype=torch.int32)
+    all_dropped = (drop_counts >= lens) & (lens > 0)
+    if bool(all_dropped.any()):
+        rows = torch.nonzero(all_dropped, as_tuple=False).flatten()
+        drop_mask[rows, lens[rows].to(dtype=torch.long) - 1] = False
+        drop_counts = drop_mask.sum(dim=1, dtype=torch.int32)
+
+    used_requests = int((drop_counts > 0).sum().item())
+    dropped_total = int(drop_counts.sum().item())
 
     if used_requests == 0 or dropped_total == 0:
         return None
@@ -1585,16 +1651,19 @@ def build_sparse_decode_batch(
     if min_ratio > 0.0 and drop_ratio < min_ratio:
         return None
 
-    max_sparse = max(sparse_lens) if sparse_lens else 0
+    keep_mask = valid_mask & ~drop_mask
+    sparse_lens = keep_mask.sum(dim=1, dtype=torch.int32)
+    max_sparse = int(sparse_lens.max().item()) if int(sparse_lens.numel()) > 0 else 0
     out = page_table.new_zeros((batch_size, max_sparse), dtype=dtype)
-    for b, row in enumerate(sparse_rows):
-        n = int(row.numel())
-        if n > 0:
-            out[b, :n] = row.to(device=device, dtype=dtype)
-    lens = torch.tensor(sparse_lens, dtype=torch.int32, device=device)
+    if max_sparse > 0:
+        ranks = torch.cumsum(keep_mask.to(dtype=torch.int32), dim=1) - 1
+        rows, cols = torch.nonzero(keep_mask, as_tuple=True)
+        out[rows, ranks[rows, cols].to(dtype=torch.long)] = page_table[rows, cols]
+    lens = sparse_lens
     cu = torch.nn.functional.pad(
         torch.cumsum(lens, dim=0, dtype=torch.int32), (1, 0)
     )
+    kept_total = int(sparse_lens.sum().item())
     batch = SparseDecodeBatch(
         page_table=out,
         cache_seqlens=lens,

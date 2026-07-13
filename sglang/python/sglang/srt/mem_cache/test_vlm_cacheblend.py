@@ -35,6 +35,29 @@ def _cfg(**kw):
     return cb.VLMCacheBlendConfig(**base)
 
 
+def test_cacheblend_select_env_alias_and_precedence():
+    old_select = os.environ.get("SGLANG_VLM_CACHEBLEND_SELECT")
+    old_selector = os.environ.get("SGLANG_VLM_CACHEBLEND_SELECTOR")
+    try:
+        os.environ.pop("SGLANG_VLM_CACHEBLEND_SELECT", None)
+        os.environ["SGLANG_VLM_CACHEBLEND_SELECTOR"] = "kvdev"
+        assert cb.VLMCacheBlendConfig.from_env().select_mode == "kvdev"
+
+        os.environ["SGLANG_VLM_CACHEBLEND_SELECT"] = "sim"
+        assert cb.VLMCacheBlendConfig.from_env().select_mode == "sim"
+    finally:
+        if old_select is None:
+            os.environ.pop("SGLANG_VLM_CACHEBLEND_SELECT", None)
+        else:
+            os.environ["SGLANG_VLM_CACHEBLEND_SELECT"] = old_select
+        if old_selector is None:
+            os.environ.pop("SGLANG_VLM_CACHEBLEND_SELECTOR", None)
+        else:
+            os.environ["SGLANG_VLM_CACHEBLEND_SELECTOR"] = old_selector
+        cb.reload_config_from_env()
+    print("ok test_cacheblend_select_env_alias_and_precedence")
+
+
 def test_blend_kv():
     n, h, d = 6, 2, 4
     donor_k = torch.zeros(n, h, d)
@@ -1210,6 +1233,81 @@ def test_sparse_decode_keep_first_and_min_drop_gate():
     print("ok test_sparse_decode_keep_first_and_min_drop_gate")
 
 
+def test_sparse_decode_batched_rows_keep_request_isolation():
+    os.environ["SGLANG_VLM_CACHEBLEND"] = "1"
+    os.environ["SGLANG_VLM_CACHEBLEND_SPARSE_DECODE"] = "1"
+    os.environ["SGLANG_VLM_CACHEBLEND_SPARSE_DECODE_MIN_DROPPED_TOKENS"] = "0"
+    os.environ["SGLANG_VLM_CACHEBLEND_SPARSE_DECODE_MIN_DROP_RATIO"] = "0"
+    cb.reload_config_from_env()
+    cb.get_sparse_decode_store().clear()
+
+    os.environ["SGLANG_VLM_CACHEBLEND_SPARSE_DECODE_KEEP_RECENT"] = "0"
+    os.environ["SGLANG_VLM_CACHEBLEND_SPARSE_DECODE_KEEP_FIRST"] = "0"
+    cb.reload_config_from_env()
+    plan_a = cb.RecipientKVBlendPlan(
+        request_id="req_iso_a",
+        group_key=("g",),
+        img_locs=torch.tensor([101, 102, 103], dtype=torch.long),
+        positions=None,
+        recompute_mask=torch.tensor([False, True, False]),
+        grid_sig=(1, 1, 1),
+        n_image_tokens=3,
+        reused_tokens=2,
+        recomputed_tokens=1,
+        pos_mode="same",
+        select_mode="kvdev",
+    )
+    cb.register_sparse_decode_plan_from_blend(plan_a, req_pool_idx=10)
+
+    plan_b = cb.RecipientKVBlendPlan(
+        request_id="req_iso_b",
+        group_key=("g",),
+        img_locs=torch.tensor([201, 202, 204], dtype=torch.long),
+        positions=None,
+        recompute_mask=torch.tensor([True, False, False]),
+        grid_sig=(1, 1, 1),
+        n_image_tokens=3,
+        reused_tokens=2,
+        recomputed_tokens=1,
+        pos_mode="same",
+        select_mode="kvdev",
+    )
+    cb.register_sparse_decode_plan_from_blend(plan_b, req_pool_idx=20)
+
+    page_table = torch.tensor(
+        [
+            [1, 101, 102, 103, 9],
+            [201, 202, 203, 204, 205],
+            [101, 301, 302, 303, 0],
+        ],
+        dtype=torch.int32,
+    )
+    cache_seqlens = torch.tensor([5, 5, 4], dtype=torch.int32)
+
+    class Batch:
+        req_pool_indices = torch.tensor([10, 20, 30], dtype=torch.long)
+
+    batch = cb.build_sparse_decode_batch(
+        Batch(),
+        page_table=page_table,
+        cache_seqlens=cache_seqlens,
+        page_size=1,
+    )
+    assert batch is not None
+    assert batch.dropped_tokens == 4
+    assert batch.used_requests == 2
+    assert batch.cache_seqlens.tolist() == [3, 3, 4]
+    assert batch.page_table[0, :3].tolist() == [1, 102, 9]
+    assert batch.page_table[1, :3].tolist() == [201, 203, 205]
+    # Row 2 has no sparse plan. Its 101 must not be dropped just because row 0 drops 101.
+    assert batch.page_table[2, :4].tolist() == [101, 301, 302, 303]
+
+    cb.get_sparse_decode_store().clear()
+    os.environ["SGLANG_VLM_CACHEBLEND_SPARSE_DECODE"] = "0"
+    cb.reload_config_from_env()
+    print("ok test_sparse_decode_batched_rows_keep_request_isolation")
+
+
 def test_sparse_decode_disabled_is_noop():
     os.environ["SGLANG_VLM_CACHEBLEND"] = "1"
     os.environ["SGLANG_VLM_CACHEBLEND_SPARSE_DECODE"] = "0"
@@ -1243,6 +1341,130 @@ def test_sparse_decode_stats_to_dict():
     assert d["cacheblend_sparse_decode_kept_tokens"] == "12"
     assert d["cacheblend_sparse_decode_dropped_tokens"] == "4"
     print("ok test_sparse_decode_stats_to_dict")
+
+
+def test_sparse_decode_min_drop_gate_bails_on_upper_bound():
+    """[P0.5-a] The min-drop gate bails using an upper bound before heavy tensor work,
+    and the decision matches the exact computation (bail iff exact would also bail)."""
+    os.environ["SGLANG_VLM_CACHEBLEND"] = "1"
+    os.environ["SGLANG_VLM_CACHEBLEND_SPARSE_DECODE"] = "1"
+    os.environ["SGLANG_VLM_CACHEBLEND_SPARSE_DECODE_KEEP_RECENT"] = "0"
+    os.environ["SGLANG_VLM_CACHEBLEND_SPARSE_DECODE_KEEP_FIRST"] = "0"
+    os.environ["SGLANG_VLM_CACHEBLEND_SPARSE_DECODE_MIN_DROPPED_TOKENS"] = "0"
+    os.environ["SGLANG_VLM_CACHEBLEND_SPARSE_DECODE_MIN_DROP_RATIO"] = "0"
+    cb.reload_config_from_env()
+
+    page_table = torch.tensor(
+        [[10, 101, 102, 103, 20, 21, 22, 23]], dtype=torch.int32
+    )
+    cache_seqlens = torch.tensor([8], dtype=torch.int32)
+
+    class Batch:
+        req_pool_indices = torch.tensor([50], dtype=torch.long)
+
+    def build_with_gate(min_ratio, min_dropped):
+        # reload_config_from_env resets the sparse-decode store, so register the plan
+        # after configuring gates. drop {101,103} => n_drop=2, seqlen 8 => bound 0.25.
+        os.environ["SGLANG_VLM_CACHEBLEND_SPARSE_DECODE_MIN_DROP_RATIO"] = str(min_ratio)
+        os.environ["SGLANG_VLM_CACHEBLEND_SPARSE_DECODE_MIN_DROPPED_TOKENS"] = str(
+            min_dropped
+        )
+        cb.reload_config_from_env()
+        cb.get_sparse_decode_store().clear()
+        plan = cb.RecipientKVBlendPlan(
+            request_id="reqUB",
+            group_key=("g",),
+            img_locs=torch.tensor([101, 102, 103], dtype=torch.long),
+            positions=None,
+            recompute_mask=torch.tensor([False, True, False]),
+            grid_sig=(1, 1, 1),
+            n_image_tokens=3,
+            reused_tokens=2,
+            recomputed_tokens=1,
+            pos_mode="same",
+            select_mode="kvdev",
+        )
+        cb.register_sparse_decode_plan_from_blend(plan, req_pool_idx=50)
+        return cb.build_sparse_decode_batch(
+            Batch(), page_table=page_table, cache_seqlens=cache_seqlens, page_size=1
+        )
+
+    # ratio gate above the 0.25 upper bound -> bail (None).
+    assert build_with_gate(0.5, 0) is None
+    # ratio gate below the upper bound and below the exact 0.25 ratio -> keep.
+    b = build_with_gate(0.2, 0)
+    assert b is not None and b.dropped_tokens == 2
+    # dropped-count gate above the upper bound of 2 -> bail (None).
+    assert build_with_gate(0, 3) is None
+    # dropped-count gate at the exact bound -> keep.
+    b = build_with_gate(0, 2)
+    assert b is not None and b.dropped_tokens == 2
+
+    cb.get_sparse_decode_store().clear()
+    os.environ["SGLANG_VLM_CACHEBLEND_SPARSE_DECODE_MIN_DROPPED_TOKENS"] = "0"
+    os.environ["SGLANG_VLM_CACHEBLEND_SPARSE_DECODE"] = "0"
+    cb.reload_config_from_env()
+    print("ok test_sparse_decode_min_drop_gate_bails_on_upper_bound")
+
+
+def test_sparse_decode_candidate_restriction_mixed_batch():
+    """[P0.5-b] Candidate-restricted isin scatters back correctly across a zero-length
+    row, a non-candidate row, and a keep_first-protected candidate row."""
+    os.environ["SGLANG_VLM_CACHEBLEND"] = "1"
+    os.environ["SGLANG_VLM_CACHEBLEND_SPARSE_DECODE"] = "1"
+    os.environ["SGLANG_VLM_CACHEBLEND_SPARSE_DECODE_KEEP_RECENT"] = "0"
+    os.environ["SGLANG_VLM_CACHEBLEND_SPARSE_DECODE_KEEP_FIRST"] = "1"
+    os.environ["SGLANG_VLM_CACHEBLEND_SPARSE_DECODE_MIN_DROPPED_TOKENS"] = "0"
+    os.environ["SGLANG_VLM_CACHEBLEND_SPARSE_DECODE_MIN_DROP_RATIO"] = "0"
+    cb.reload_config_from_env()
+    cb.get_sparse_decode_store().clear()
+
+    # Candidate row: all three image tokens reusable, keep_first=1 protects col 0 (101).
+    plan = cb.RecipientKVBlendPlan(
+        request_id="reqMix",
+        group_key=("g",),
+        img_locs=torch.tensor([101, 102, 103], dtype=torch.long),
+        positions=None,
+        recompute_mask=torch.tensor([False, False, False]),
+        grid_sig=(1, 1, 1),
+        n_image_tokens=3,
+        reused_tokens=3,
+        recomputed_tokens=0,
+        pos_mode="same",
+        select_mode="kvdev",
+    )
+    cb.register_sparse_decode_plan_from_blend(plan, req_pool_idx=60)
+
+    page_table = torch.tensor(
+        [
+            [101, 102, 103, 55, 66],  # req60 candidate: keep 101 (first), drop 102,103
+            [201, 202, 0, 0, 0],      # req99 no plan: pass through whole
+            [9, 9, 9, 9, 9],          # zero-length row: kept empty
+        ],
+        dtype=torch.int32,
+    )
+    cache_seqlens = torch.tensor([5, 2, 0], dtype=torch.int32)
+
+    class Batch:
+        req_pool_indices = torch.tensor([60, 99, 70], dtype=torch.long)
+
+    batch = cb.build_sparse_decode_batch(
+        Batch(), page_table=page_table, cache_seqlens=cache_seqlens, page_size=1
+    )
+    assert batch is not None
+    assert batch.used_requests == 1
+    assert batch.dropped_tokens == 2
+    assert batch.cache_seqlens.tolist() == [3, 2, 0]
+    assert batch.page_table[0, :3].tolist() == [101, 55, 66]
+    assert batch.page_table[1, :2].tolist() == [201, 202]
+
+    cb.get_sparse_decode_store().clear()
+    os.environ["SGLANG_VLM_CACHEBLEND_SPARSE_DECODE_KEEP_FIRST"] = "0"
+    os.environ["SGLANG_VLM_CACHEBLEND_SPARSE_DECODE"] = "0"
+    cb.reload_config_from_env()
+    print("ok test_sparse_decode_candidate_restriction_mixed_batch")
+
+
 
 
 def main():
