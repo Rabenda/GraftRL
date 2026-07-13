@@ -1465,6 +1465,246 @@ def test_sparse_decode_candidate_restriction_mixed_batch():
     print("ok test_sparse_decode_candidate_restriction_mixed_batch")
 
 
+def _run_incremental_decode_sequence(
+    *, full_row, steps, keep_recent, keep_first, incremental, req_pool_idx=7
+):
+    """Register one reuse plan (drop image slots 101 & 103) then build a sparse
+    decode batch at each seqlen in ``steps``, simulating autoregressive decode over a
+    fixed page-table row. Returns a comparable summary per step (or None when the
+    build bails). Used to assert the incremental path matches the full recompute."""
+    os.environ["SGLANG_VLM_CACHEBLEND"] = "1"
+    os.environ["SGLANG_VLM_CACHEBLEND_SPARSE_DECODE"] = "1"
+    os.environ["SGLANG_VLM_CACHEBLEND_SPARSE_DECODE_KEEP_RECENT"] = str(keep_recent)
+    os.environ["SGLANG_VLM_CACHEBLEND_SPARSE_DECODE_KEEP_FIRST"] = str(keep_first)
+    os.environ["SGLANG_VLM_CACHEBLEND_SPARSE_DECODE_MIN_DROPPED_TOKENS"] = "0"
+    os.environ["SGLANG_VLM_CACHEBLEND_SPARSE_DECODE_MIN_DROP_RATIO"] = "0"
+    os.environ["SGLANG_VLM_CACHEBLEND_SPARSE_DECODE_INCREMENTAL"] = (
+        "1" if incremental else "0"
+    )
+    cb.reload_config_from_env()
+    cb.get_sparse_decode_store().clear()
+
+    img_locs = torch.tensor([101, 102, 103], dtype=torch.long)
+    recompute_mask = torch.tensor([False, True, False])  # reuse (=> drop) 101 & 103
+    plan = cb.RecipientKVBlendPlan(
+        request_id="reqInc",
+        group_key=("g",),
+        img_locs=img_locs,
+        positions=None,
+        recompute_mask=recompute_mask,
+        grid_sig=(1, 1, 1),
+        n_image_tokens=3,
+        reused_tokens=2,
+        recomputed_tokens=1,
+        pos_mode="same",
+        select_mode="kvdev",
+        pending_deviation=False,
+    )
+    cb.register_sparse_decode_plan_from_blend(plan, req_pool_idx=req_pool_idx)
+
+    outs = []
+    for seq_len in steps:
+        page_table = torch.tensor([full_row], dtype=torch.int32)
+        cache_seqlens = torch.tensor([seq_len], dtype=torch.int32)
+
+        class Batch:
+            req_pool_indices = torch.tensor([req_pool_idx], dtype=torch.long)
+
+        batch = cb.build_sparse_decode_batch(
+            Batch(),
+            page_table=page_table,
+            cache_seqlens=cache_seqlens,
+            page_size=1,
+        )
+        if batch is None:
+            outs.append(None)
+        else:
+            outs.append(
+                (
+                    batch.cache_seqlens.tolist(),
+                    batch.page_table.tolist(),
+                    int(batch.dropped_tokens),
+                    int(batch.kept_tokens),
+                    int(batch.used_requests),
+                )
+            )
+    return outs
+
+
+def test_sparse_decode_incremental_matches_full_recompute():
+    """The incremental drop-column cache must produce a bit-identical batch to the
+    full-context recompute at every decode step, including when keep_recent initially
+    overlaps the drop columns and then slides past them."""
+    row = [10, 101, 102, 103, 20, 21, 30, 31, 32, 33]
+
+    # Case A: steady state, recent window never reaches the drop columns.
+    a_inc = _run_incremental_decode_sequence(
+        full_row=row, steps=[6, 7, 8, 9, 10], keep_recent=2, keep_first=1,
+        incremental=True,
+    )
+    a_ref = _run_incremental_decode_sequence(
+        full_row=row, steps=[6, 7, 8, 9, 10], keep_recent=2, keep_first=1,
+        incremental=False,
+    )
+    assert a_inc == a_ref, f"case A mismatch:\n{a_inc}\n{a_ref}"
+
+    # Case B: large recent window protects the drops early (build bails -> None), then
+    # the window slides forward and the drops re-appear.
+    b_inc = _run_incremental_decode_sequence(
+        full_row=row, steps=[4, 5, 6, 7, 8, 9, 10], keep_recent=6, keep_first=0,
+        incremental=True,
+    )
+    b_ref = _run_incremental_decode_sequence(
+        full_row=row, steps=[4, 5, 6, 7, 8, 9, 10], keep_recent=6, keep_first=0,
+        incremental=False,
+    )
+    assert b_inc == b_ref, f"case B mismatch:\n{b_inc}\n{b_ref}"
+    # Sanity: case B actually exercises both a bail and a real drop.
+    assert None in b_inc and any(o is not None for o in b_inc)
+
+    cb.get_sparse_decode_store().clear()
+    os.environ["SGLANG_VLM_CACHEBLEND_SPARSE_DECODE"] = "0"
+    os.environ["SGLANG_VLM_CACHEBLEND_SPARSE_DECODE_INCREMENTAL"] = "1"
+    cb.reload_config_from_env()
+    print("ok test_sparse_decode_incremental_matches_full_recompute")
+
+
+def test_sparse_decode_incremental_resets_on_seqlen_regression():
+    """If the same plan object is reused but the sequence length regresses (e.g. an
+    unexpected pool-index reuse), the incremental cache must reset and recompute
+    membership against the new page-table row rather than reuse stale columns."""
+    os.environ["SGLANG_VLM_CACHEBLEND"] = "1"
+    os.environ["SGLANG_VLM_CACHEBLEND_SPARSE_DECODE"] = "1"
+    os.environ["SGLANG_VLM_CACHEBLEND_SPARSE_DECODE_KEEP_RECENT"] = "0"
+    os.environ["SGLANG_VLM_CACHEBLEND_SPARSE_DECODE_KEEP_FIRST"] = "0"
+    os.environ["SGLANG_VLM_CACHEBLEND_SPARSE_DECODE_MIN_DROPPED_TOKENS"] = "0"
+    os.environ["SGLANG_VLM_CACHEBLEND_SPARSE_DECODE_MIN_DROP_RATIO"] = "0"
+    os.environ["SGLANG_VLM_CACHEBLEND_SPARSE_DECODE_INCREMENTAL"] = "1"
+    cb.reload_config_from_env()
+    cb.get_sparse_decode_store().clear()
+
+    img_locs = torch.tensor([101, 102, 103], dtype=torch.long)
+    recompute_mask = torch.tensor([False, True, False])  # drop 101 & 103
+    plan = cb.RecipientKVBlendPlan(
+        request_id="reqReset",
+        group_key=("g",),
+        img_locs=img_locs,
+        positions=None,
+        recompute_mask=recompute_mask,
+        grid_sig=(1, 1, 1),
+        n_image_tokens=3,
+        reused_tokens=2,
+        recomputed_tokens=1,
+        pos_mode="same",
+        select_mode="kvdev",
+        pending_deviation=False,
+    )
+    cb.register_sparse_decode_plan_from_blend(plan, req_pool_idx=5)
+
+    class BatchA:
+        req_pool_indices = torch.tensor([5], dtype=torch.long)
+
+    # Grow to len 8 with 101 & 103 at cols 1 & 3 -> cache columns {1, 3}, seen=8.
+    grow = cb.build_sparse_decode_batch(
+        BatchA(),
+        page_table=torch.tensor([[10, 101, 102, 103, 20, 21, 22, 23]], dtype=torch.int32),
+        cache_seqlens=torch.tensor([8], dtype=torch.int32),
+        page_size=1,
+    )
+    assert grow is not None and grow.dropped_tokens == 2
+
+    # Regress to len 4 with a DIFFERENT row: 101 now sits at col 2, 103 absent. The
+    # cache must reset (seen 8 > 4) and recompute -> drop only col 2.
+    regress_row = torch.tensor([[10, 55, 101, 66, 77, 88, 99, 44]], dtype=torch.int32)
+    regress = cb.build_sparse_decode_batch(
+        BatchA(),
+        page_table=regress_row,
+        cache_seqlens=torch.tensor([4], dtype=torch.int32),
+        page_size=1,
+    )
+    assert regress is not None
+    assert regress.dropped_tokens == 1, regress.dropped_tokens
+    kept = regress.page_table[0, : int(regress.cache_seqlens[0])].tolist()
+    assert 101 not in kept and kept == [10, 55, 66], kept
+
+    cb.get_sparse_decode_store().clear()
+    os.environ["SGLANG_VLM_CACHEBLEND_SPARSE_DECODE"] = "0"
+    cb.reload_config_from_env()
+    print("ok test_sparse_decode_incremental_resets_on_seqlen_regression")
+
+
+def test_sparse_decode_incremental_same_seqlen_rewrite_resets():
+    """If the page-table row is rewritten under an unchanged seqlen (slot relocation
+    from preemption / replay / KV compaction / pool reuse), the anchor-value check must
+    invalidate the cache so the drop mask matches a fresh full recompute instead of
+    dropping stale columns."""
+    os.environ["SGLANG_VLM_CACHEBLEND"] = "1"
+    os.environ["SGLANG_VLM_CACHEBLEND_SPARSE_DECODE"] = "1"
+    os.environ["SGLANG_VLM_CACHEBLEND_SPARSE_DECODE_KEEP_RECENT"] = "0"
+    os.environ["SGLANG_VLM_CACHEBLEND_SPARSE_DECODE_KEEP_FIRST"] = "0"
+    os.environ["SGLANG_VLM_CACHEBLEND_SPARSE_DECODE_MIN_DROPPED_TOKENS"] = "0"
+    os.environ["SGLANG_VLM_CACHEBLEND_SPARSE_DECODE_MIN_DROP_RATIO"] = "0"
+    os.environ["SGLANG_VLM_CACHEBLEND_SPARSE_DECODE_INCREMENTAL"] = "1"
+    cb.reload_config_from_env()
+    cb.get_sparse_decode_store().clear()
+
+    img_locs = torch.tensor([101, 102, 103], dtype=torch.long)
+    recompute_mask = torch.tensor([False, True, False])  # drop 101 & 103
+    plan = cb.RecipientKVBlendPlan(
+        request_id="reqRewrite",
+        group_key=("g",),
+        img_locs=img_locs,
+        positions=None,
+        recompute_mask=recompute_mask,
+        grid_sig=(1, 1, 1),
+        n_image_tokens=3,
+        reused_tokens=2,
+        recomputed_tokens=1,
+        pos_mode="same",
+        select_mode="kvdev",
+        pending_deviation=False,
+    )
+    cb.register_sparse_decode_plan_from_blend(plan, req_pool_idx=9)
+
+    class Batch:
+        req_pool_indices = torch.tensor([9], dtype=torch.long)
+
+    # First build: 101 & 103 present at cols 1 & 3 -> cache {1, 3} with anchor vals.
+    first = cb.build_sparse_decode_batch(
+        Batch(),
+        page_table=torch.tensor([[10, 101, 20, 103, 30]], dtype=torch.int32),
+        cache_seqlens=torch.tensor([5], dtype=torch.int32),
+        page_size=1,
+    )
+    assert first is not None and first.dropped_tokens == 2
+
+    # Same seqlen, rewritten row: cols 1 & 3 no longer hold drop slots. The anchor check
+    # must reset the cache; nothing is droppable now -> build bails (None), exactly like
+    # a full recompute would.
+    rewritten = cb.build_sparse_decode_batch(
+        Batch(),
+        page_table=torch.tensor([[10, 55, 20, 66, 30]], dtype=torch.int32),
+        cache_seqlens=torch.tensor([5], dtype=torch.int32),
+        page_size=1,
+    )
+    assert rewritten is None, "stale cache dropped rewritten columns"
+
+    # After the reset, normal append-only growth still detects a drop slot at a newly
+    # appended position (col 5 holds 103).
+    grow = cb.build_sparse_decode_batch(
+        Batch(),
+        page_table=torch.tensor([[10, 55, 20, 66, 30, 103]], dtype=torch.int32),
+        cache_seqlens=torch.tensor([6], dtype=torch.int32),
+        page_size=1,
+    )
+    assert grow is not None and grow.dropped_tokens == 1
+    kept = grow.page_table[0, : int(grow.cache_seqlens[0])].tolist()
+    assert kept == [10, 55, 20, 66, 30], kept
+
+    cb.get_sparse_decode_store().clear()
+    os.environ["SGLANG_VLM_CACHEBLEND_SPARSE_DECODE"] = "0"
+    cb.reload_config_from_env()
+    print("ok test_sparse_decode_incremental_same_seqlen_rewrite_resets")
 
 
 def main():

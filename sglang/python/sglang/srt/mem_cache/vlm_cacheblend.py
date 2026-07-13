@@ -165,6 +165,13 @@ class VLMCacheBlendConfig:
     sparse_decode_min_drop_ratio: float = 0.0
     # Cap how many sparse-decode plans are retained across requests (LRU).
     sparse_decode_max_plans: int = 256
+    # P1: incrementally extend each request's drop-column set by only the newly
+    # appended decode positions instead of re-running the full-context ``isin`` every
+    # decode forward. A context KV slot at a given position is fixed once written
+    # (decode only appends), so membership for positions ``< seqlen_seen`` is stable and
+    # need not be recomputed. Numerically identical (bit-for-bit) to the full recompute.
+    # Off by default; enable with ``SGLANG_VLM_CACHEBLEND_SPARSE_DECODE_INCREMENTAL=1``.
+    sparse_decode_incremental: bool = False
 
     @staticmethod
     def from_env() -> "VLMCacheBlendConfig":
@@ -233,6 +240,9 @@ class VLMCacheBlendConfig:
             ),
             sparse_decode_max_plans=_env_int(
                 "SGLANG_VLM_CACHEBLEND_SPARSE_DECODE_MAX_PLANS", 256
+            ),
+            sparse_decode_incremental=_env_flag(
+                "SGLANG_VLM_CACHEBLEND_SPARSE_DECODE_INCREMENTAL", "0"
             ),
         )
 
@@ -397,6 +407,22 @@ class SparseDecodePlan:
     keep_first: int = 0
     drop_locs_cache: Dict[str, torch.Tensor] = field(
         default_factory=dict, repr=False, compare=False
+    )
+    # P1 incremental membership cache (mutable, per page-table device). ``inc_drop_cols``
+    # holds the sorted context column positions whose KV slot is a drop target, grown as
+    # decode extends the sequence up to ``inc_seqlen_seen``. ``inc_drop_vals`` holds the KV
+    # slot value observed at each cached column; it is re-checked against the live page
+    # table every forward so a same-seqlen rewrite / slot relocation (preemption, replay,
+    # KV compaction, pool reuse) invalidates the cache instead of dropping stale columns.
+    # Reset on device change, sequence-length regression, or an anchor-value mismatch. See
+    # ``_sparse_decode_incremental_drop_mask``.
+    inc_device_key: Optional[str] = field(default=None, repr=False, compare=False)
+    inc_seqlen_seen: int = field(default=0, repr=False, compare=False)
+    inc_drop_cols: Optional[torch.Tensor] = field(
+        default=None, repr=False, compare=False
+    )
+    inc_drop_vals: Optional[torch.Tensor] = field(
+        default=None, repr=False, compare=False
     )
 
 
@@ -1495,6 +1521,140 @@ def _sparse_decode_drop_locs_for_device(
     return locs
 
 
+def _sparse_decode_incremental_drop_mask(
+    *,
+    cand_orig: List[int],
+    cand_plans: List["SparseDecodePlan"],
+    page_table: torch.Tensor,
+    lens_cpu: List[int],
+    batch_size: int,
+    max_len: int,
+    device: torch.device,
+) -> torch.Tensor:
+    """Build the ``[batch, max_len]`` raw drop mask (before valid/keep gating) by
+    extending each request's cached drop-column set with only the newly appended
+    decode positions.
+
+    Under append-only decode a request's context KV slot at a given position is fixed
+    once written, so membership of position ``p`` in the drop set is stable for
+    ``p < seqlen_seen`` and only ``[seqlen_seen, len)`` needs a fresh test each forward.
+    That invariant is *not* assumed blindly: the cache also stores the KV slot value
+    seen at each cached drop column (``inc_drop_vals``) and re-verifies it against the
+    live page table every forward. If any anchor value changed (same-seqlen rewrite,
+    slot relocation from preemption / replay / KV compaction / pool reuse) the cache is
+    reset and the request is rescanned from scratch, so the resulting mask is always
+    identical, position for position, to recomputing the full-context membership. Only
+    redundant work on unchanged, already-scanned positions is removed.
+    """
+    n_cand = len(cand_orig)
+    row_stride = torch.iinfo(torch.int64).max // max(n_cand + 1, 1)
+    device_key = str(device)
+
+    def _reset(plan: "SparseDecodePlan") -> None:
+        plan.inc_drop_cols = torch.empty(0, dtype=torch.long, device=device)
+        plan.inc_drop_vals = torch.empty(0, dtype=torch.long, device=device)
+        plan.inc_seqlen_seen = 0
+        plan.inc_device_key = device_key
+
+    # Structural reset: device change or sequence-length regression.
+    for b, plan in zip(cand_orig, cand_plans):
+        if (
+            plan.inc_drop_cols is None
+            or plan.inc_drop_vals is None
+            or plan.inc_device_key != device_key
+            or int(plan.inc_seqlen_seen) > lens_cpu[b]
+        ):
+            _reset(plan)
+
+    # Anchor verification: re-check the cached drop columns still hold their cached KV
+    # slot value. A mismatch means the page table was rewritten under a stable seqlen,
+    # so the cache is stale and must be rebuilt. Batched into one gather + one sync.
+    ver_rows: List[torch.Tensor] = []
+    ver_cols: List[torch.Tensor] = []
+    ver_vals: List[torch.Tensor] = []
+    ver_owner: List[torch.Tensor] = []
+    for j, (b, plan) in enumerate(zip(cand_orig, cand_plans)):
+        cols = plan.inc_drop_cols
+        if cols is not None and int(cols.numel()) > 0:
+            ver_rows.append(torch.full_like(cols, int(b)))
+            ver_cols.append(cols)
+            ver_vals.append(plan.inc_drop_vals)
+            ver_owner.append(torch.full_like(cols, int(j)))
+    if ver_cols:
+        vr = torch.cat(ver_rows)
+        vc = torch.cat(ver_cols)
+        vv = torch.cat(ver_vals)
+        vo = torch.cat(ver_owner)
+        bad = page_table[vr, vc].to(dtype=torch.long) != vv
+        if bool(bad.any()):
+            for j in torch.unique(vo[bad]).tolist():
+                _reset(cand_plans[int(j)])
+
+    # Gather the newly appended (row, col) positions that still need a membership test,
+    # encoding each candidate's rows with a disjoint stride so a single batched
+    # ``isin`` preserves per-request isolation.
+    delta_rows: List[int] = []
+    delta_cols: List[int] = []
+    delta_local: List[int] = []
+    drop_key_pieces: List[torch.Tensor] = []
+    for j, (b, plan) in enumerate(zip(cand_orig, cand_plans)):
+        seq_len = lens_cpu[b]
+        seen = int(plan.inc_seqlen_seen)
+        if seq_len > seen:
+            drop_locs = _sparse_decode_drop_locs_for_device(
+                plan, device=device, dtype=torch.long
+            )
+            if int(drop_locs.numel()) > 0:
+                drop_key_pieces.append(drop_locs + (j * row_stride))
+                span = seq_len - seen
+                delta_rows.extend([b] * span)
+                delta_cols.extend(range(seen, seq_len))
+                delta_local.extend([j] * span)
+
+    if delta_rows:
+        drows = torch.tensor(delta_rows, dtype=torch.long, device=device)
+        dcols = torch.tensor(delta_cols, dtype=torch.long, device=device)
+        dloc = torch.tensor(delta_local, dtype=torch.long, device=device)
+        delta_vals = page_table[drows, dcols].to(dtype=torch.long)
+        delta_keys = delta_vals + dloc * row_stride
+        drop_keys = torch.cat(drop_key_pieces).contiguous()
+        hit = torch.isin(delta_keys, drop_keys)
+        if bool(hit.any()):
+            hit_local = dloc[hit].tolist()
+            hit_cols = dcols[hit].tolist()
+            hit_vals = delta_vals[hit].tolist()
+            per_cand_new: Dict[int, List[Tuple[int, int]]] = {}
+            for loc, col, val in zip(hit_local, hit_cols, hit_vals):
+                per_cand_new.setdefault(int(loc), []).append((int(col), int(val)))
+            for j, pairs in per_cand_new.items():
+                pairs.sort()
+                plan = cand_plans[j]
+                add_cols = torch.tensor(
+                    [c for c, _ in pairs], dtype=torch.long, device=device
+                )
+                add_vals = torch.tensor(
+                    [v for _, v in pairs], dtype=torch.long, device=device
+                )
+                plan.inc_drop_cols = torch.cat([plan.inc_drop_cols, add_cols])
+                plan.inc_drop_vals = torch.cat([plan.inc_drop_vals, add_vals])
+
+    # Commit the scanned length for every candidate (idempotent when unchanged).
+    for b, plan in zip(cand_orig, cand_plans):
+        plan.inc_seqlen_seen = lens_cpu[b]
+
+    # Assemble the raw drop mask from cached drop columns.
+    drop_mask = page_table.new_zeros((batch_size, max_len), dtype=torch.bool)
+    flat_rows: List[torch.Tensor] = []
+    flat_cols: List[torch.Tensor] = []
+    for b, plan in zip(cand_orig, cand_plans):
+        cols = plan.inc_drop_cols
+        if cols is not None and int(cols.numel()) > 0:
+            flat_rows.append(torch.full_like(cols, int(b)))
+            flat_cols.append(cols)
+    if flat_cols:
+        drop_mask[torch.cat(flat_rows), torch.cat(flat_cols)] = True
+    return drop_mask
+
 
 def build_sparse_decode_batch(
     forward_batch: Any,
@@ -1556,6 +1716,7 @@ def build_sparse_decode_batch(
     # (>= n_candidate) so it is a safe upper stride for realistic KV-loc magnitudes.
     row_stride = torch.iinfo(torch.int64).max // max(batch_size + 1, 1)
     cand_orig: List[int] = []
+    cand_plans: List[SparseDecodePlan] = []
     cand_drop_pieces: List[torch.Tensor] = []
     keep_recent_cpu = [0] * batch_size
     keep_first_cpu = [0] * batch_size
@@ -1575,6 +1736,7 @@ def build_sparse_decode_batch(
             continue
         j = len(cand_orig)
         cand_orig.append(b)
+        cand_plans.append(plan)
         cand_drop_pieces.append(drop_locs + (j * row_stride))
         drop_upper_bound += int(drop_locs.numel())
 
@@ -1602,21 +1764,36 @@ def build_sparse_decode_batch(
     pos = torch.arange(max_len, dtype=torch.int32, device=device).unsqueeze(0)
     valid_mask = pos < lens.unsqueeze(1)
 
-    # Restrict the int64 key encoding + isin to candidate rows, then scatter the drop
-    # mask back to the full batch. Non-candidate rows keep drop_mask == False.
-    cand_idx = torch.tensor(cand_orig, dtype=torch.long, device=device)
-    n_cand = int(cand_idx.numel())
-    cand_offsets = (
-        torch.arange(n_cand, dtype=torch.long, device=device).unsqueeze(1) * row_stride
-    )
-    cand_page_keys = (
-        page_table.index_select(0, cand_idx).to(dtype=torch.long) + cand_offsets
-    )
-    drop_keys = torch.cat(cand_drop_pieces).contiguous()
-    cand_drop_mask = torch.isin(cand_page_keys, drop_keys)
+    if cfg.sparse_decode_incremental:
+        # P1: extend each request's cached drop columns by only the newly appended
+        # decode positions instead of re-scanning the whole context every forward.
+        drop_mask = _sparse_decode_incremental_drop_mask(
+            cand_orig=cand_orig,
+            cand_plans=cand_plans,
+            page_table=page_table,
+            lens_cpu=lens_cpu,
+            batch_size=batch_size,
+            max_len=max_len,
+            device=device,
+        )
+    else:
+        # Full recompute: restrict the int64 key encoding + isin to candidate rows,
+        # then scatter the drop mask back to the full batch. Non-candidate rows keep
+        # drop_mask == False.
+        cand_idx = torch.tensor(cand_orig, dtype=torch.long, device=device)
+        n_cand = int(cand_idx.numel())
+        cand_offsets = (
+            torch.arange(n_cand, dtype=torch.long, device=device).unsqueeze(1)
+            * row_stride
+        )
+        cand_page_keys = (
+            page_table.index_select(0, cand_idx).to(dtype=torch.long) + cand_offsets
+        )
+        drop_keys = torch.cat(cand_drop_pieces).contiguous()
+        cand_drop_mask = torch.isin(cand_page_keys, drop_keys)
 
-    drop_mask = page_table.new_zeros((batch_size, max_len), dtype=torch.bool)
-    drop_mask[cand_idx] = cand_drop_mask
+        drop_mask = page_table.new_zeros((batch_size, max_len), dtype=torch.bool)
+        drop_mask[cand_idx] = cand_drop_mask
     drop_mask &= valid_mask
 
     keep_recent = torch.tensor(keep_recent_cpu, dtype=torch.int32, device=device)
