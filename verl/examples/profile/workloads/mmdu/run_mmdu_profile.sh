@@ -135,11 +135,12 @@ bash examples/grpo_trainer/run_qwen2_5_vl_7b_fsdp.sh \
   trainer.experiment_name="${SUFFIX}" \
   trainer.rollout_data_dir="${PROFILE_ROLLOUT_DATA_DIR}" \
   data.train_batch_size="${TRAIN_BATCH_SIZE}" \
+  data.seed="${DATA_SEED:-42}" \
   actor_rollout_ref.actor.ppo_mini_batch_size="${TRAIN_BATCH_SIZE}" \
   actor_rollout_ref.rollout.n="${ROLLOUT_N}" \
   actor_rollout_ref.rollout.tensor_model_parallel_size=1 \
   actor_rollout_ref.rollout.gpu_memory_utilization="${GPU_MEMORY_UTILIZATION}" \
-  actor_rollout_ref.rollout.enforce_eager=True \
+  actor_rollout_ref.rollout.enforce_eager="${ENFORCE_EAGER:-True}" \
   actor_rollout_ref.actor.fsdp_config.param_offload=True \
   actor_rollout_ref.actor.fsdp_config.optimizer_offload=True \
   actor_rollout_ref.actor.ppo_max_token_len_per_gpu="${LOGPROB_MAX_TOKEN_LEN_PER_GPU}" \
@@ -149,6 +150,7 @@ bash examples/grpo_trainer/run_qwen2_5_vl_7b_fsdp.sh \
   data.max_response_length="${MAX_RESPONSE_LENGTH}" \
   data.filter_overlong_prompts="${FILTER_OVERLONG_PROMPTS:-False}" \
   actor_rollout_ref.rollout.response_length="${MAX_RESPONSE_LENGTH}" \
+  actor_rollout_ref.rollout.temperature="${SAMPLING_TEMPERATURE:-1.0}" \
   actor_rollout_ref.model.use_fused_kernels="${USE_FUSED_KERNELS}" \
   "${agent_args[@]}" \
   "$@"

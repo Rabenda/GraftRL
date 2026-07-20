@@ -243,6 +243,11 @@ VLM_CACHEBLEND_ENABLED = os.environ.get("SGLANG_VLM_CACHEBLEND", "0").lower() in
     "yes",
     "on",
 )
+SPARSE_DECODE_ENABLED = os.environ.get(
+    "SGLANG_ROLLOUT_SPARSE_DECODE",
+    os.environ.get("SGLANG_VLM_CACHEBLEND_SPARSE_DECODE", "0"),
+).lower() in ("1", "true", "yes", "on")
+ROLLOUT_REUSE_RUNTIME_ENABLED = VLM_CACHEBLEND_ENABLED or SPARSE_DECODE_ENABLED
 LOG_INFERENCE_STEP_CSV_BASE = "model_forward_log"
 _inference_log_lock = threading.Lock()
 _CACHEBLEND_LOG_FIELDS = [
@@ -271,6 +276,19 @@ _CACHEBLEND_LOG_FIELDS = [
     "cacheblend_sparse_decode_dropped_tokens",
     "cacheblend_sparse_decode_direct_source",
     "cacheblend_sparse_decode_incremental_append",
+    "cacheblend_sparse_decode_mode",
+    "cacheblend_sparse_decode_candidate_tokens",
+    "cacheblend_sparse_decode_selected_tokens",
+    "reuse_action_schema",
+    "reuse_action",
+    "reuse_operator_id",
+    "reuse_representation_stage",
+    "reuse_reason",
+    "reuse_eligible_units",
+    "reuse_applied_units",
+    "reuse_approximate",
+    "reuse_error_bound",
+    "reuse_policy",
 ]
 
 
@@ -313,7 +331,7 @@ def _append_inference_step_log(
     }
     if cacheblend_fields:
         row.update(cacheblend_fields)
-    if VLM_CACHEBLEND_ENABLED:
+    if ROLLOUT_REUSE_RUNTIME_ENABLED:
         for field in _CACHEBLEND_LOG_FIELDS:
             row.setdefault(field, "")
     with _inference_log_lock:
@@ -439,7 +457,7 @@ def _clear_vlm_cacheblend_context() -> None:
         pass
 
 
-def _pop_vlm_cacheblend_log_fields() -> Optional[dict]:
+def _pop_vlm_cacheblend_log_fields(forward_mode: str) -> Optional[dict]:
     try:
         from sglang.srt.mem_cache import vlm_cacheblend
 
@@ -447,6 +465,9 @@ def _pop_vlm_cacheblend_log_fields() -> Optional[dict]:
         if stats is None:
             stats = vlm_cacheblend.CacheBlendStats()
         sparse = vlm_cacheblend.pop_last_sparse_decode_batch()
+        sparse_fallback_reason = (
+            vlm_cacheblend.pop_last_sparse_decode_fallback_reason()
+        )
         if sparse is not None:
             stats.sparse_decode_used = True
             stats.sparse_decode_kept_tokens = int(sparse.kept_tokens)
@@ -454,6 +475,44 @@ def _pop_vlm_cacheblend_log_fields() -> Optional[dict]:
             stats.sparse_decode_direct_source = bool(sparse.direct_source)
             stats.sparse_decode_incremental_append = bool(
                 sparse.incremental_append
+            )
+            stats.sparse_decode_mode = str(sparse.mode)
+            stats.execution_action = str(sparse.decision_action or "skip")
+            stats.execution_reason = str(sparse.decision_reason)
+            stats.execution_policy = str(sparse.policy)
+            stats.execution_operator_id = "sparse_decode.context_attention"
+            stats.execution_representation_stage = "decode_kv_blocks"
+            stats.execution_approximate = True
+            stats.execution_error_bound = sparse.approximate_error_bound
+            stats.sparse_decode_candidate_tokens = int(sparse.candidate_tokens)
+            stats.sparse_decode_selected_tokens = int(sparse.selected_tokens)
+        elif SPARSE_DECODE_ENABLED and str(forward_mode).upper() == "DECODE":
+            # A decode forward without an active compact plan is the correctness
+            # fallback of the sparse operator, not a CacheBlend-prefill decision.
+            # Keep this visible so unified traces account for both SKIP and LOCAL.
+            cfg = vlm_cacheblend.get_config()
+            stats.sparse_decode_mode = str(cfg.sparse_decode_mode)
+            stats.execution_action = "local"
+            stats.execution_reason = (
+                sparse_fallback_reason or "no_active_sparse_plan"
+            )
+            stats.execution_policy = str(cfg.sparse_decode_mode)
+            stats.execution_operator_id = "sparse_decode.context_attention"
+            stats.execution_representation_stage = "decode_kv_blocks"
+        elif not VLM_CACHEBLEND_ENABLED:
+            # The runtime log is enabled by sparse planning, but EXTEND itself may
+            # execute without any reuse action. Attribute that work to the actual
+            # local model stage rather than the legacy CacheBlend stats envelope.
+            is_decode = str(forward_mode).upper() == "DECODE"
+            stats.execution_action = "local"
+            stats.execution_reason = "dense_local"
+            stats.execution_operator_id = (
+                "model_forward.decode_attention"
+                if is_decode
+                else "model_forward.prefill"
+            )
+            stats.execution_representation_stage = (
+                "decode_kv_blocks" if is_decode else "llm_prefill_kv"
             )
         return stats.to_dict() if stats is not None else None
     except Exception:
@@ -617,7 +676,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # block-size buckets before the HTTP server becomes ready; compiling lazily in
         # the first rollout fragments continuous batches and charges seconds of JIT
         # work to the first measured training step.
-        if self.device == "cuda" and VLM_CACHEBLEND_ENABLED:
+        if self.device == "cuda" and ROLLOUT_REUSE_RUNTIME_ENABLED:
             from sglang.srt.mem_cache import vlm_cacheblend
 
             if vlm_cacheblend.sparse_decode_enabled():
@@ -625,7 +684,13 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     warmup_sparse_decode_kernels,
                 )
 
-                warmup_sparse_decode_kernels(torch.device("cuda"))
+                warmup_sparse_decode_kernels(
+                    torch.device("cuda"),
+                    max_context_len=self.model_config.context_len,
+                    min_context_len=(
+                        vlm_cacheblend.get_config().sparse_decode_min_context_tokens
+                    ),
+                )
 
         # Temporary cached values
         self.support_pp = (
@@ -2528,7 +2593,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 _clear_vlm_cacheblend_context()
         output.expert_distribution_metrics = recorder_outputs.get("metrics")
         cacheblend_fields = (
-            _pop_vlm_cacheblend_log_fields() if VLM_CACHEBLEND_ENABLED else None
+            _pop_vlm_cacheblend_log_fields(forward_batch.forward_mode.name)
+            if ROLLOUT_REUSE_RUNTIME_ENABLED
+            else None
         )
 
         # Copy cached routing experts' buffers back to CPU cache

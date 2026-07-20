@@ -7,6 +7,33 @@ import triton
 import triton.language as tl
 
 
+MAX_FUSED_SPARSE_CONTEXT_WIDTH = 65536
+
+
+def sparse_decode_warmup_widths(
+    max_context_len: int, min_context_len: int = 256
+) -> tuple[int, ...]:
+    """Return reachable fused-compaction widths without exceeding kernel support.
+
+    A model may advertise a 128K context while a workload admits much shorter
+    requests.  That must not make sparse-decode server initialization fail: contexts
+    wider than the fused kernel limit simply use the existing dense fallback.
+    """
+
+    max_context_len = max(1, int(max_context_len))
+    min_context_len = max(1, min(int(min_context_len), max_context_len))
+    max_width = min(
+        MAX_FUSED_SPARSE_CONTEXT_WIDTH,
+        triton.next_power_of_2(max_context_len),
+    )
+    source_width = triton.next_power_of_2(min_context_len)
+    widths: list[int] = []
+    while source_width <= max_width:
+        widths.append(min(source_width, max_context_len))
+        source_width *= 2
+    return tuple(widths)
+
+
 @triton.jit(
     do_not_specialize=[
         "source_row_stride",
@@ -116,15 +143,16 @@ def _compact_sparse_page_table_kernel(
     )
     keep = source_valid & ~active_drop
     # Match the reference path's fail-safe: never expose an empty context.
-    keep = keep | ((tl.sum(keep.to(tl.int32), axis=0) == 0) & (cols == seq_len - 1))
+    kept_count = tl.sum(keep.to(tl.int32), axis=0)
+    empty_context = kept_count == 0
+    keep = keep | (empty_context & (cols == seq_len - 1))
+    kept_count += empty_context.to(tl.int32)
     compact_cols = tl.cumsum(keep.to(tl.int32), axis=0) - 1
-    tl.store(sparse_lens_ptr + row, tl.sum(keep.to(tl.int32), axis=0))
+    tl.store(sparse_lens_ptr + row, kept_count)
 
-    tl.store(
-        output_ptr + row * output_row_stride + cols,
-        0,
-        mask=cols < output_cols,
-    )
+    # FA3 consumes only [:cache_seqlens[row]]. The rectangular tail is unreachable,
+    # so clearing output_cols entries before overwriting the compact prefix only adds
+    # a full-context global-memory write to every compaction.
     values = tl.load(
         source_ptr + row * source_row_stride + cols,
         mask=source_valid,
@@ -189,15 +217,14 @@ def _compact_sparse_req_to_token_kernel(
         & (cols < tl.maximum(seq_len - keep_recent, 0))
     )
     keep = source_valid & ~active_drop
-    keep = keep | ((tl.sum(keep.to(tl.int32), axis=0) == 0) & (cols == seq_len - 1))
+    kept_count = tl.sum(keep.to(tl.int32), axis=0)
+    empty_context = kept_count == 0
+    keep = keep | (empty_context & (cols == seq_len - 1))
+    kept_count += empty_context.to(tl.int32)
     compact_cols = tl.cumsum(keep.to(tl.int32), axis=0) - 1
-    tl.store(sparse_lens_ptr + row, tl.sum(keep.to(tl.int32), axis=0))
+    tl.store(sparse_lens_ptr + row, kept_count)
 
-    tl.store(
-        output_ptr + row * output_row_stride + cols,
-        0,
-        mask=cols < output_cols,
-    )
+    # Stale tail entries are masked by sparse_lens and never read by attention.
     values = tl.load(
         source_ptr + request_row * source_row_stride + cols,
         mask=source_valid,
@@ -315,7 +342,7 @@ def compact_page_table(
         return page_table.new_zeros((int(rows), max(output_cols, 0)))
 
     block_size = triton.next_power_of_2(int(source_cols))
-    if block_size > 65536:
+    if block_size > MAX_FUSED_SPARSE_CONTEXT_WIDTH:
         raise ValueError(f"sparse page table is too wide for fused compaction: {source_cols}")
     output = page_table.new_empty((int(rows), output_cols))
     _compact_page_table_kernel[(int(rows),)](
@@ -367,7 +394,7 @@ def compact_sparse_page_table(
         )
 
     block_size = triton.next_power_of_2(int(source_cols))
-    if block_size > 65536:
+    if block_size > MAX_FUSED_SPARSE_CONTEXT_WIDTH:
         raise ValueError(f"sparse page table is too wide for fused compaction: {source_cols}")
     if output is None:
         output = page_table.new_empty((int(rows), output_cols))
@@ -453,7 +480,7 @@ def compact_sparse_req_to_token(
     if rows == 0 or source_cols <= 0 or output_cols <= 0:
         return output[:rows, : max(output_cols, 0)], sparse_lens[:rows]
     block_size = triton.next_power_of_2(source_cols)
-    if block_size > 65536:
+    if block_size > MAX_FUSED_SPARSE_CONTEXT_WIDTH:
         raise ValueError(
             f"sparse page table is too wide for fused compaction: {source_cols}"
         )
@@ -566,19 +593,34 @@ def append_sparse_req_to_token(
     return output[:rows], sparse_lens[:rows]
 
 
-def warmup_sparse_decode_kernels(device: torch.device | str) -> None:
-    """Compile all practical block-size buckets before the server accepts work."""
+def warmup_sparse_decode_kernels(
+    device: torch.device | str,
+    *,
+    max_context_len: int = 8192,
+    min_context_len: int = 256,
+) -> None:
+    """Compile every reachable context-width bucket before accepting work.
+
+    Triton specializes compaction on the next-power-of-two source width. The old
+    fixed list stopped at 8K even when the server admitted 16K+ contexts, so the first
+    long request still paid cold compilation inside rollout latency.
+    """
 
     device = torch.device(device)
-    for source_cols in (256, 512, 1024, 2048, 4096, 8192):
+    if device.type != "cuda" or not torch.cuda.is_available():
+        return
+    for actual_source_cols in sparse_decode_warmup_widths(
+        max_context_len, min_context_len
+    ):
+        source_cols = triton.next_power_of_2(actual_source_cols)
         page_table = torch.zeros(
-            (1, source_cols), dtype=torch.int32, device=device
+            (1, actual_source_cols), dtype=torch.int32, device=device
         )
         drop_mask = torch.zeros(
-            (1, source_cols), dtype=torch.bool, device=device
+            (1, actual_source_cols), dtype=torch.bool, device=device
         )
         seq_lens = torch.full(
-            (1,), source_cols, dtype=torch.int32, device=device
+            (1,), actual_source_cols, dtype=torch.int32, device=device
         )
         keep_recent = torch.full((1,), 64, dtype=torch.int32, device=device)
         keep_first = torch.zeros((1,), dtype=torch.int32, device=device)
@@ -588,10 +630,10 @@ def warmup_sparse_decode_kernels(device: torch.device | str) -> None:
             seq_lens,
             keep_recent,
             keep_first,
-            source_cols,
+            actual_source_cols,
         )
         req_to_token = torch.zeros(
-            (2, source_cols + 1), dtype=torch.int32, device=device
+            (2, actual_source_cols + 1), dtype=torch.int32, device=device
         )
         req_pool_indices = torch.ones((1,), dtype=torch.int64, device=device)
         direct_output = page_table.new_empty((1, source_cols))
@@ -603,8 +645,8 @@ def warmup_sparse_decode_kernels(device: torch.device | str) -> None:
             seq_lens,
             keep_recent,
             keep_first,
-            source_cols,
-            source_cols,
+            actual_source_cols,
+            actual_source_cols,
             output=direct_output,
             sparse_lens=direct_sparse_lens,
         )

@@ -43,6 +43,51 @@ SGLANG_VLM_CACHEBLEND_TARGET_TURNS=all \
 bash examples/profile/workloads/mmdu/run_mmdu_profile.sh
 ```
 
+## Final query-aware sparse decode gate
+
+Sparse decode is evaluated on MMDU because its long, multi-turn generations expose
+enough decode attention work. The current policy is independent of CacheBlend: it
+scores historical context blocks once during prefill, then reuses a stable compact
+page table throughout decode.
+
+The launcher performs exactly one dense run followed by one sparse run—no smoke,
+ABBA, or hidden repeats. Both arms use the same data seed and a stable sampling seed
+per step/sample/GRPO-branch/turn, temperature 1, real `64×4`, two-step rollout-only
+runs with CUDA Graph enabled. Only the sparse enable bit differs.
+The current launcher targets mass-budget V2: at most 70% of blocks may be dropped,
+and only while their cumulative query-score proxy mass stays at or below 5%.
+
+```bash
+cd verl
+CUDA_VISIBLE_DEVICES=1,2 \
+bash examples/profile/workloads/mmdu/run_mmdu_query_sparse_final.sh
+```
+
+The command exits successfully only when rollout is at least 5% faster, mean reward
+drops by no more than 0.01, no response aborts, mean response length changes by no
+more than 5%, and forward logs confirm that context tokens were actually dropped.
+
+The V1 reference run on 2026-07-20 passed: two-step rollout changed
+`315.004s -> 295.028s` (**6.34% faster**), reward `0.441203 -> 0.437968`, response
+length `475.904 -> 460.902` (-3.15%), and aborts remained zero. Sparse execution
+dropped 387,485,698 of 1,734,247,300 cumulative decode context-token visits
+(22.34%). Because this is an approximate policy and a single fixed-seed pair, it
+remains explicit opt-in rather than a global default.
+
+The first V2 formal pair did not pass the wall-time gate: `287.068s -> 295.671s`
+(3.00% slower). Mean response length was 3.85% longer, reward improved by 0.000665,
+and normalized response-token throughput improved by 0.83%. Sparse execution dropped
+30.4% of cumulative context visits and used incremental append on 5,846/7,411 sparse
+forwards, so the failure is insufficient end-to-end margin rather than a dense bypass.
+
+V2.1 development then continued without another GPU run. It prewarms direct compact
+Triton width variants during server initialization and no longer copies a full live
+request routing row to CPU when registering a semantic position plan. Stable paired
+sampling reduces scheduler-induced output-length noise but is not counted as a decode
+speedup. Thus 6.34% still belongs only to V1; V2's measured wall result is negative,
+and V2.1 remains unmeasured. The gate requires non-negative generated-token throughput
+so shorter outputs alone cannot pass.
+
 Legacy single-turn (one-shot full prompt):
 
 ```bash

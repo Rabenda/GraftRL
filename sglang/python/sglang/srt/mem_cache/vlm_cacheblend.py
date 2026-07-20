@@ -46,6 +46,10 @@ def _env_flag(name: str, default: str = "0") -> bool:
     return os.environ.get(name, default).strip().lower() in ("1", "true", "yes", "on")
 
 
+def _env_flag_any(names: Tuple[str, ...], default: str = "0") -> bool:
+    return _env_str_any(names, default).strip().lower() in ("1", "true", "yes", "on")
+
+
 def _env_float(name: str, default: float) -> float:
     try:
         return float(os.environ.get(name, str(default)))
@@ -60,12 +64,42 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
+def _env_int_any(names: Tuple[str, ...], default: int) -> int:
+    try:
+        return int(_env_str_any(names, str(default)))
+    except (TypeError, ValueError):
+        return default
+
+
+def _env_float_any(names: Tuple[str, ...], default: float) -> float:
+    try:
+        return float(_env_str_any(names, str(default)))
+    except (TypeError, ValueError):
+        return default
+
+
 def _env_str_any(names: Tuple[str, ...], default: str) -> str:
     for name in names:
         value = os.environ.get(name)
         if value is not None:
             return value
     return default
+
+
+def _sparse_decode_mode_from_env() -> str:
+    explicit = _env_str_any(
+        (
+            "SGLANG_ROLLOUT_SPARSE_DECODE_MODE",
+            "SGLANG_VLM_CACHEBLEND_SPARSE_DECODE_MODE",
+        ),
+        "",
+    ).strip()
+    if explicit:
+        return explicit.lower()
+    # Both the independent and legacy enable aliases use the query-aware policy.
+    # The semantically unsupported reuse-mask heuristic remains available only to
+    # reproduce historical runs via an explicit MODE=reuse setting.
+    return "query_blocks"
 
 
 @dataclass(frozen=True)
@@ -159,19 +193,35 @@ class VLMCacheBlendConfig:
     # cosine below this threshold.  A negative threshold disables the gate.
     donor_reject_min_similarity: float = 0.50
     donor_reject_max_bad_ratio: float = 0.25
-    # Sparse decode (context-side): during autoregressive decode, skip attending to
-    # donor-reused image-token KV slots that were grafted at prefill. Query is still one
-    # token; only the context page table is shortened. Default off. Requires FA3 and
-    # page_size==1 for the first implementation.
+    # Sparse decode (context-side).  The current default strategy is query_blocks:
+    # score old context blocks with prompt-tail queries at a probe layer, persist the
+    # selected blocks once, and use that stable plan throughout decode.  This is
+    # independent of CacheBlend equivalence.  The old "reuse" rule is retained only as
+    # an explicitly selected legacy experiment because reusable K/V is not evidence
+    # that future decode queries may ignore those tokens.
     sparse_decode: bool = False
-    # Strategy for which context tokens to drop. "reuse" drops image tokens marked
-    # reusable by the CacheBlend plan. Future: "topk" / "hybrid".
-    sparse_decode_mode: str = "reuse"
+    sparse_decode_mode: str = "query_blocks"
+    # Query-aware block selector. It runs once in prefill, outside the per-token decode
+    # hot path, and therefore preserves the fixed-shape CUDA Graph decode path.
+    sparse_decode_block_size: int = 64
+    # V2 does not retain a fixed top-k fraction. It may drop up to this structural
+    # cap, but only while the cumulative proxy attention mass of removed blocks stays
+    # within ``sparse_decode_max_dropped_score_mass``. Uniform/ambiguous scores thus
+    # fail closed instead of blindly dropping a quota.
+    sparse_decode_max_drop_ratio: float = 0.70
+    sparse_decode_max_dropped_score_mass: float = 0.05
+    # A late-middle Qwen2.5-VL layer is more semantically informative than an early
+    # projection while leaving the full prefill dense. Unsupported shorter models
+    # simply never register a plan and remain dense.
+    sparse_decode_probe_layer: int = 20
+    sparse_decode_score_representatives: int = 4
+    sparse_decode_query_representatives: int = 8
+    sparse_decode_min_context_tokens: int = 4096
     # Always keep the most recent N tokens in the context (local causal window).
-    sparse_decode_keep_recent: int = 64
+    sparse_decode_keep_recent: int = 512
     # Always keep the first N context tokens. Useful as an attention-sink guard when
     # prompts place instruction/system tokens before visual spans.
-    sparse_decode_keep_first: int = 0
+    sparse_decode_keep_first: int = 128
     # Skip sparse decode unless a decode forward can drop enough tokens to amortize the
     # dynamic page-table build. Geo3K 64x4 CUDA-Graph profiles put the crossover between
     # a batch=3 tail (~2.2k dropped entries, slightly slower than dense) and batch=9
@@ -245,23 +295,87 @@ class VLMCacheBlendConfig:
             donor_reject_max_bad_ratio=_env_float(
                 "SGLANG_VLM_CACHEBLEND_DONOR_REJECT_MAX_BAD_RATIO", 0.25
             ),
-            sparse_decode=_env_flag("SGLANG_VLM_CACHEBLEND_SPARSE_DECODE", "0"),
-            sparse_decode_mode=os.environ.get(
-                "SGLANG_VLM_CACHEBLEND_SPARSE_DECODE_MODE", "reuse"
-            )
-            .strip()
-            .lower(),
-            sparse_decode_keep_recent=_env_int(
-                "SGLANG_VLM_CACHEBLEND_SPARSE_DECODE_KEEP_RECENT", 64
+            sparse_decode=_env_flag_any(
+                ("SGLANG_ROLLOUT_SPARSE_DECODE", "SGLANG_VLM_CACHEBLEND_SPARSE_DECODE"),
+                "0",
             ),
-            sparse_decode_keep_first=_env_int(
-                "SGLANG_VLM_CACHEBLEND_SPARSE_DECODE_KEEP_FIRST", 0
+            sparse_decode_mode=_sparse_decode_mode_from_env(),
+            sparse_decode_block_size=_env_int_any(
+                (
+                    "SGLANG_ROLLOUT_SPARSE_DECODE_BLOCK_SIZE",
+                    "SGLANG_VLM_CACHEBLEND_SPARSE_DECODE_BLOCK_SIZE",
+                ),
+                64,
             ),
-            sparse_decode_min_dropped_tokens=_env_int(
-                "SGLANG_VLM_CACHEBLEND_SPARSE_DECODE_MIN_DROPPED_TOKENS", 4096
+            sparse_decode_max_drop_ratio=_env_float_any(
+                (
+                    "SGLANG_ROLLOUT_SPARSE_DECODE_MAX_DROP_RATIO",
+                    "SGLANG_VLM_CACHEBLEND_SPARSE_DECODE_MAX_DROP_RATIO",
+                ),
+                0.70,
             ),
-            sparse_decode_min_drop_ratio=_env_float(
-                "SGLANG_VLM_CACHEBLEND_SPARSE_DECODE_MIN_DROP_RATIO", 0.10
+            sparse_decode_max_dropped_score_mass=_env_float_any(
+                (
+                    "SGLANG_ROLLOUT_SPARSE_DECODE_MAX_DROPPED_SCORE_MASS",
+                    "SGLANG_VLM_CACHEBLEND_SPARSE_DECODE_MAX_DROPPED_SCORE_MASS",
+                ),
+                0.05,
+            ),
+            sparse_decode_probe_layer=_env_int_any(
+                (
+                    "SGLANG_ROLLOUT_SPARSE_DECODE_PROBE_LAYER",
+                    "SGLANG_VLM_CACHEBLEND_SPARSE_DECODE_PROBE_LAYER",
+                ),
+                20,
+            ),
+            sparse_decode_score_representatives=_env_int_any(
+                (
+                    "SGLANG_ROLLOUT_SPARSE_DECODE_SCORE_REPRESENTATIVES",
+                    "SGLANG_VLM_CACHEBLEND_SPARSE_DECODE_SCORE_REPRESENTATIVES",
+                ),
+                4,
+            ),
+            sparse_decode_query_representatives=_env_int_any(
+                (
+                    "SGLANG_ROLLOUT_SPARSE_DECODE_QUERY_REPRESENTATIVES",
+                    "SGLANG_VLM_CACHEBLEND_SPARSE_DECODE_QUERY_REPRESENTATIVES",
+                ),
+                8,
+            ),
+            sparse_decode_min_context_tokens=_env_int_any(
+                (
+                    "SGLANG_ROLLOUT_SPARSE_DECODE_MIN_CONTEXT_TOKENS",
+                    "SGLANG_VLM_CACHEBLEND_SPARSE_DECODE_MIN_CONTEXT_TOKENS",
+                ),
+                4096,
+            ),
+            sparse_decode_keep_recent=_env_int_any(
+                (
+                    "SGLANG_ROLLOUT_SPARSE_DECODE_KEEP_RECENT",
+                    "SGLANG_VLM_CACHEBLEND_SPARSE_DECODE_KEEP_RECENT",
+                ),
+                512,
+            ),
+            sparse_decode_keep_first=_env_int_any(
+                (
+                    "SGLANG_ROLLOUT_SPARSE_DECODE_KEEP_FIRST",
+                    "SGLANG_VLM_CACHEBLEND_SPARSE_DECODE_KEEP_FIRST",
+                ),
+                128,
+            ),
+            sparse_decode_min_dropped_tokens=_env_int_any(
+                (
+                    "SGLANG_ROLLOUT_SPARSE_DECODE_MIN_DROPPED_TOKENS",
+                    "SGLANG_VLM_CACHEBLEND_SPARSE_DECODE_MIN_DROPPED_TOKENS",
+                ),
+                4096,
+            ),
+            sparse_decode_min_drop_ratio=_env_float_any(
+                (
+                    "SGLANG_ROLLOUT_SPARSE_DECODE_MIN_DROP_RATIO",
+                    "SGLANG_VLM_CACHEBLEND_SPARSE_DECODE_MIN_DROP_RATIO",
+                ),
+                0.10,
             ),
             sparse_decode_max_plans=_env_int(
                 "SGLANG_VLM_CACHEBLEND_SPARSE_DECODE_MAX_PLANS", 256
@@ -439,13 +553,28 @@ class SparseDecodePlan:
 
     request_id: str
     req_pool_idx: int
-    # Absolute KV-pool locations of image tokens that may be dropped from decode context.
+    # Absolute KV-pool locations of image tokens that may be dropped from decode
+    # context. Query-aware position plans deliberately leave this empty: their
+    # semantic sequence columns are sufficient, and copying a complete live request
+    # table to the host merely to populate compatibility diagnostics adds a prefill
+    # synchronization per request.
     drop_locs: torch.Tensor
     n_image_tokens: int
     n_drop_tokens: int
     mode: str = "reuse"
     keep_recent: int = 64
     keep_first: int = 0
+    # Unified runtime attribution. Sparse attention is a SKIP action rather than an
+    # EXACT/PARTIAL artifact reuse action, even when a legacy plan originated from a
+    # CacheBlend reuse mask.
+    decision_action: str = "skip"
+    decision_reason: str = ""
+    policy: str = ""
+    candidate_tokens: int = 0
+    selected_tokens: int = 0
+    # Query-score mass removed by the selector. This is an empirical proxy bound,
+    # not a proof about full-layer attention, and is emitted only for approximate SKIP.
+    approximate_error_bound: Optional[float] = None
     # Stable request-sequence columns for the same tokens. Production registration
     # resolves these once at prefill, so decode never has to search the live page table
     # for physical KV locations on every generated token.
@@ -490,6 +619,13 @@ class SparseDecodeBatch:
     used_requests: int
     direct_source: bool = False
     incremental_append: bool = False
+    mode: str = ""
+    decision_action: str = "skip"
+    decision_reason: str = ""
+    policy: str = ""
+    candidate_tokens: int = 0
+    selected_tokens: int = 0
+    approximate_error_bound: Optional[float] = None
 
 
 class DonorKVStore:
@@ -1385,6 +1521,17 @@ class CacheBlendStats:
     sparse_decode_dropped_tokens: int = 0
     sparse_decode_direct_source: bool = False
     sparse_decode_incremental_append: bool = False
+    sparse_decode_mode: str = ""
+    sparse_decode_candidate_tokens: int = 0
+    sparse_decode_selected_tokens: int = 0
+    # Unified EXACT/PARTIAL/SKIP/LOCAL runtime attribution.
+    execution_action: str = ""
+    execution_reason: str = ""
+    execution_policy: str = ""
+    execution_operator_id: str = ""
+    execution_representation_stage: str = ""
+    execution_approximate: bool = False
+    execution_error_bound: Optional[float] = None
 
     def finalize(self) -> "CacheBlendStats":
         if self.n_image_tokens > 0:
@@ -1402,6 +1549,52 @@ class CacheBlendStats:
         return self
 
     def to_dict(self) -> Dict[str, str]:
+        from sglang.srt.mem_cache.rollout_reuse_backend import (
+            BackendExecutionDecision,
+        )
+
+        action = self.execution_action
+        reason = self.execution_reason
+        policy = self.execution_policy
+        operator_id = self.execution_operator_id or "vlm_cacheblend.prefill"
+        representation_stage = (
+            self.execution_representation_stage or "llm_prefill_kv"
+        )
+        eligible_units = self.n_image_tokens
+        applied_units = self.reused_tokens
+        approximate = self.execution_approximate
+        error_bound = self.execution_error_bound
+        if self.sparse_decode_used:
+            action = action or "skip"
+            reason = reason or "sparse_context_attention"
+            policy = policy or self.sparse_decode_mode
+            operator_id = "sparse_decode.context_attention"
+            representation_stage = "decode_kv_blocks"
+            eligible_units = self.sparse_decode_kept_tokens + self.sparse_decode_dropped_tokens
+            applied_units = self.sparse_decode_dropped_tokens
+            approximate = True
+        elif not action:
+            if self.used and self.role == "recipient":
+                action = "partial"
+                reason = self.gate_reason or "recipient_kv_graft"
+                policy = self.select_mode
+                approximate = True
+            else:
+                action = "local"
+                reason = self.fallback_reason or self.role or "dense_local"
+                policy = self.select_mode
+                applied_units = 0
+        decision = BackendExecutionDecision(
+            action=action,
+            operator_id=operator_id,
+            representation_stage=representation_stage,
+            reason=reason,
+            eligible_units=max(0, int(eligible_units)),
+            applied_units=max(0, int(applied_units)),
+            approximate=approximate,
+            error_bound=error_bound,
+            policy=policy,
+        )
         return {
             "cacheblend_role": self.role,
             "cacheblend_used": "1" if self.used else "0",
@@ -1442,6 +1635,14 @@ class CacheBlendStats:
             "cacheblend_sparse_decode_incremental_append": (
                 "1" if self.sparse_decode_incremental_append else "0"
             ),
+            "cacheblend_sparse_decode_mode": self.sparse_decode_mode,
+            "cacheblend_sparse_decode_candidate_tokens": str(
+                self.sparse_decode_candidate_tokens
+            ),
+            "cacheblend_sparse_decode_selected_tokens": str(
+                self.sparse_decode_selected_tokens
+            ),
+            **decision.event_fields(),
         }
 
 
@@ -1702,16 +1903,20 @@ class SparseDecodePlanStore:
         self._lock = threading.Lock()
         self._store: "OrderedDict[int, SparseDecodePlan]" = OrderedDict()
         self._max_plans = max(1, int(max_plans))
-        self._revision = 0
 
     def put(self, plan: SparseDecodePlan) -> None:
         key = int(plan.req_pool_idx)
+        _invalidate_sparse_decode_batch_caches(self, key)
+        evicted_keys: List[int] = []
         with self._lock:
             self._store[key] = plan
             self._store.move_to_end(key)
             while len(self._store) > self._max_plans:
-                self._store.popitem(last=False)
-            self._revision += 1
+                evicted_key, _ = self._store.popitem(last=False)
+                evicted_keys.append(int(evicted_key))
+        _invalidate_sparse_decode_batch_caches(self, key)
+        for evicted_key in evicted_keys:
+            _invalidate_sparse_decode_batch_caches(self, evicted_key)
 
     def get(self, req_pool_idx: int) -> Optional[SparseDecodePlan]:
         key = int(req_pool_idx)
@@ -1734,39 +1939,18 @@ class SparseDecodePlanStore:
                 plans.append(plan)
         return plans
 
-    @property
-    def revision(self) -> int:
-        """Semantic store version used by the decode batch-plan cache."""
-
-        with self._lock:
-            return self._revision
-
-    def get_many_with_revision(
-        self, req_pool_indices: List[int]
-    ) -> Tuple[int, List[Optional[SparseDecodePlan]]]:
-        """Atomically snapshot the store version and requested plans."""
-
-        plans: List[Optional[SparseDecodePlan]] = []
-        with self._lock:
-            revision = self._revision
-            for req_pool_idx in req_pool_indices:
-                key = int(req_pool_idx)
-                plan = self._store.get(key)
-                if plan is not None:
-                    self._store.move_to_end(key)
-                plans.append(plan)
-        return revision, plans
-
     def drop(self, req_pool_idx: int) -> None:
+        key = int(req_pool_idx)
+        _invalidate_sparse_decode_batch_caches(self, key)
         with self._lock:
-            if self._store.pop(int(req_pool_idx), None) is not None:
-                self._revision += 1
+            self._store.pop(key, None)
+        _invalidate_sparse_decode_batch_caches(self, key)
 
     def clear(self) -> None:
+        _invalidate_sparse_decode_batch_caches(self, None)
         with self._lock:
-            if self._store:
-                self._store.clear()
-                self._revision += 1
+            self._store.clear()
+        _invalidate_sparse_decode_batch_caches(self, None)
 
     def __len__(self) -> int:
         with self._lock:
@@ -1776,6 +1960,7 @@ class SparseDecodePlanStore:
 _SPARSE_DECODE_STORE: Optional[SparseDecodePlanStore] = None
 _SPARSE_DECODE_STORE_LOCK = threading.Lock()
 _SPARSE_DECODE_LAST_BATCH = threading.local()
+_SPARSE_DECODE_LAST_FALLBACK = threading.local()
 
 
 @dataclass
@@ -1815,12 +2000,39 @@ _SPARSE_DECODE_MASK_CACHE: "OrderedDict[Tuple, _SparseDecodeMaskWorkspace]" = (
     OrderedDict()
 )
 _SPARSE_DECODE_MASK_CACHE_LOCK = threading.Lock()
-_SPARSE_DECODE_MASK_CACHE_MAX = 8
+# Continuous batching rotates through several CUDA-Graph batch sizes and request
+# compositions. Eight entries caused a still-live graph workspace to be evicted by
+# unrelated EXTEND arrivals, forcing a full context compact when that batch resumed.
+# At the 8k/128-row worst common bucket, 32 entries remain a small fraction of an 80GB
+# worker while covering the observed scheduler working set.
+_SPARSE_DECODE_MASK_CACHE_MAX = 32
 _SPARSE_DECODE_STATIC_BATCH_CACHE: "OrderedDict[Tuple, _SparseDecodeStaticBatch]" = (
     OrderedDict()
 )
 _SPARSE_DECODE_STATIC_BATCH_CACHE_LOCK = threading.Lock()
-_SPARSE_DECODE_STATIC_BATCH_CACHE_MAX = 16
+_SPARSE_DECODE_STATIC_BATCH_CACHE_MAX = 64
+
+
+def _invalidate_sparse_decode_batch_caches(
+    store: SparseDecodePlanStore, req_pool_idx: Optional[int]
+) -> None:
+    """Invalidate only batches affected by a plan mutation.
+
+    This is deliberately request-scoped. Clearing every batch on every EXTEND was the
+    source of repeated full compaction in a continuously scheduled rollout.
+    """
+
+    store_id = id(store)
+    with _SPARSE_DECODE_STATIC_BATCH_CACHE_LOCK:
+        stale = []
+        for lookup_key in _SPARSE_DECODE_STATIC_BATCH_CACHE:
+            if not lookup_key or lookup_key[0] != store_id:
+                continue
+            req_key = lookup_key[1]
+            if req_pool_idx is None or int(req_pool_idx) in req_key:
+                stale.append(lookup_key)
+        for lookup_key in stale:
+            _SPARSE_DECODE_STATIC_BATCH_CACHE.pop(lookup_key, None)
 
 
 def get_sparse_decode_store() -> SparseDecodePlanStore:
@@ -1842,27 +2054,24 @@ def _get_sparse_decode_static_batch(
 
     Normal decode runs tens or hundreds of forwards with the same request rows.  The
     old path reacquired the store lock, rebuilt candidate lists, and bisected every
-    plan on every token.  A store revision makes this cache safe across pool-slot
-    reuse, request completion, KV flushes, and newly registered recipient plans.
+    plan on every token. The cache key uses the identity of the plans belonging to
+    this batch. An unrelated request registering or releasing a plan must not evict a
+    stable running batch from the incremental-append path.
     """
 
     req_key = tuple(int(value) for value in req_cpu)
-    revision = store.revision
-    cache_key = (id(store), revision, req_key)
+    lookup_key = (id(store), req_key)
     with _SPARSE_DECODE_STATIC_BATCH_CACHE_LOCK:
-        cached = _SPARSE_DECODE_STATIC_BATCH_CACHE.get(cache_key)
+        cached = _SPARSE_DECODE_STATIC_BATCH_CACHE.get(lookup_key)
         if cached is not None:
-            _SPARSE_DECODE_STATIC_BATCH_CACHE.move_to_end(cache_key)
+            _SPARSE_DECODE_STATIC_BATCH_CACHE.move_to_end(lookup_key)
             return cached
 
-    # Snapshot under the store lock; a concurrent semantic change gets its own key.
-    revision, plans_for_batch = store.get_many_with_revision(req_cpu)
-    cache_key = (id(store), revision, req_key)
-    with _SPARSE_DECODE_STATIC_BATCH_CACHE_LOCK:
-        cached = _SPARSE_DECODE_STATIC_BATCH_CACHE.get(cache_key)
-        if cached is not None:
-            _SPARSE_DECODE_STATIC_BATCH_CACHE.move_to_end(cache_key)
-            return cached
+    # Snapshot all referenced plans only on a composition miss. Targeted invalidation
+    # removes this lookup entry before a participating plan is replaced or released.
+    plans_for_batch = store.get_many(req_cpu)
+    plan_key = tuple(id(plan) if plan is not None else 0 for plan in plans_for_batch)
+    cache_key = (id(store), req_key, plan_key)
 
     batch_size = len(req_cpu)
     cand_orig: List[int] = []
@@ -1916,8 +2125,8 @@ def _get_sparse_decode_static_batch(
         steady_used_requests=sum(count > 0 for count in steady_drop_counts),
     )
     with _SPARSE_DECODE_STATIC_BATCH_CACHE_LOCK:
-        _SPARSE_DECODE_STATIC_BATCH_CACHE[cache_key] = static
-        _SPARSE_DECODE_STATIC_BATCH_CACHE.move_to_end(cache_key)
+        _SPARSE_DECODE_STATIC_BATCH_CACHE[lookup_key] = static
+        _SPARSE_DECODE_STATIC_BATCH_CACHE.move_to_end(lookup_key)
         while (
             len(_SPARSE_DECODE_STATIC_BATCH_CACHE)
             > _SPARSE_DECODE_STATIC_BATCH_CACHE_MAX
@@ -1928,7 +2137,12 @@ def _get_sparse_decode_static_batch(
 
 def sparse_decode_enabled() -> bool:
     cfg = get_config()
-    return bool(cacheblend_enabled() and cfg.sparse_decode)
+    if not cfg.sparse_decode:
+        return False
+    mode = str(cfg.sparse_decode_mode or "query_blocks").strip().lower()
+    # The legacy reuse-mask policy needs CacheBlend plans. Query-aware plans are
+    # produced independently at the prefill boundary and work on any long context.
+    return bool(cacheblend_enabled()) if mode in ("reuse", "reuse_legacy") else True
 
 
 def clear_runtime_state() -> None:
@@ -1950,6 +2164,7 @@ def clear_runtime_state() -> None:
     set_request_context(None)
     set_source_input_ids(None)
     set_last_sparse_decode_batch(None)
+    _SPARSE_DECODE_LAST_FALLBACK.value = ""
 
 
 def register_sparse_decode_plan_from_blend(
@@ -1973,8 +2188,8 @@ def register_sparse_decode_plan_from_blend(
         return None
     cfg = get_config()
     mode = str(cfg.sparse_decode_mode or "reuse").strip().lower()
-    if mode not in ("reuse",):
-        mode = "reuse"
+    if mode not in ("reuse", "reuse_legacy"):
+        return None
     recompute_mask = plan.recompute_mask
     if recompute_mask is None or plan.img_locs is None:
         return None
@@ -2023,9 +2238,79 @@ def register_sparse_decode_plan_from_blend(
         mode=mode,
         keep_recent=max(0, int(cfg.sparse_decode_keep_recent)),
         keep_first=max(0, int(cfg.sparse_decode_keep_first)),
+        decision_action="skip",
+        decision_reason="legacy_cacheblend_reuse_mask",
+        policy="reuse-mask-legacy",
+        candidate_tokens=n_image,
+        selected_tokens=max(0, n_image - int(drop_locs.numel())),
     )
     store.put(sparse_plan)
     return sparse_plan
+
+
+def register_sparse_decode_position_plan(
+    *,
+    request_id: str,
+    req_pool_idx: int,
+    req_to_token_row: torch.Tensor,
+    drop_positions: torch.Tensor,
+    mode: str,
+    keep_recent: int,
+    keep_first: int,
+    candidate_tokens: int,
+    selected_tokens: int,
+    decision_reason: str,
+    policy: str,
+    error_bound: Optional[float] = None,
+    positions_are_unique_sorted: bool = False,
+) -> Optional[SparseDecodePlan]:
+    """Register a generic position plan independent of CacheBlend equivalence.
+
+    ``drop_positions`` is a policy decision in request-sequence coordinates. Decode
+    execution consumes those stable positions and therefore remains valid across pool
+    relocation. Do not materialize physical KV locations for this plan type: doing so
+    requires copying the entire ``req_to_token_row`` from GPU to CPU even though the
+    production position path never reads ``drop_locs``.
+    """
+
+    if not sparse_decode_enabled() or int(req_pool_idx) < 0:
+        return None
+    positions = drop_positions.detach().to(device="cpu", dtype=torch.long)
+    if positions_are_unique_sorted:
+        positions = positions.contiguous()
+    else:
+        positions = torch.unique(positions, sorted=True).contiguous()
+    if int(positions.numel()) == 0 or req_to_token_row.ndim != 1:
+        return None
+    if int(positions[-1].item()) >= int(req_to_token_row.numel()):
+        return None
+    cfg = get_config()
+    plan = SparseDecodePlan(
+        request_id=str(request_id),
+        req_pool_idx=int(req_pool_idx),
+        drop_locs=torch.empty(0, dtype=torch.long),
+        n_image_tokens=0,
+        n_drop_tokens=int(positions.numel()),
+        mode=str(mode),
+        keep_recent=max(0, int(keep_recent)),
+        keep_first=max(0, int(keep_first)),
+        decision_action="skip",
+        decision_reason=str(decision_reason),
+        policy=str(policy),
+        candidate_tokens=max(0, int(candidate_tokens)),
+        selected_tokens=max(0, int(selected_tokens)),
+        approximate_error_bound=(
+            None
+            if error_bound is None
+            else min(1.0, max(0.0, float(error_bound)))
+        ),
+        drop_positions=positions,
+        drop_positions_host=tuple(int(value) for value in positions.tolist()),
+    )
+    # Query-aware selection replaces, rather than unions with, an older policy plan.
+    # This prevents a stale reuse-mask plan from silently widening the drop set.
+    get_sparse_decode_store().put(plan)
+    return plan
 
 
 def clear_sparse_decode_plan(req_pool_idx: int) -> None:
@@ -2040,6 +2325,17 @@ def pop_last_sparse_decode_batch() -> Optional[SparseDecodeBatch]:
 
 def set_last_sparse_decode_batch(batch: Optional[SparseDecodeBatch]) -> None:
     _SPARSE_DECODE_LAST_BATCH.value = batch
+
+
+def pop_last_sparse_decode_fallback_reason() -> str:
+    reason = str(getattr(_SPARSE_DECODE_LAST_FALLBACK, "value", "") or "")
+    _SPARSE_DECODE_LAST_FALLBACK.value = ""
+    return reason
+
+
+def _sparse_decode_fallback(reason: str) -> None:
+    _SPARSE_DECODE_LAST_FALLBACK.value = str(reason)
+    return None
 
 
 def _sparse_decode_drop_locs_for_device(
@@ -2211,6 +2507,32 @@ def _sparse_decode_incremental_drop_mask(
     return drop_mask
 
 
+def _sparse_decode_batch_attribution(
+    plans: Tuple[SparseDecodePlan, ...] | List[SparseDecodePlan],
+) -> Tuple[str, str, str, str, Optional[float]]:
+    if not plans:
+        return "", "skip", "", "", None
+
+    def one_or_mixed(values: List[str]) -> str:
+        unique = {value for value in values if value}
+        if len(unique) == 1:
+            return next(iter(unique))
+        return "mixed" if unique else ""
+
+    error_bounds = [
+        float(plan.approximate_error_bound)
+        for plan in plans
+        if plan.approximate_error_bound is not None
+    ]
+    return (
+        one_or_mixed([str(plan.mode) for plan in plans]),
+        one_or_mixed([str(plan.decision_action) for plan in plans]) or "skip",
+        one_or_mixed([str(plan.decision_reason) for plan in plans]),
+        one_or_mixed([str(plan.policy) for plan in plans]),
+        max(error_bounds) if error_bounds else None,
+    )
+
+
 def build_sparse_decode_batch(
     forward_batch: Any,
     *,
@@ -2232,17 +2554,18 @@ def build_sparse_decode_batch(
     plans retain the previous compatibility path.
     """
     set_last_sparse_decode_batch(None)
+    _SPARSE_DECODE_LAST_FALLBACK.value = ""
     if not sparse_decode_enabled() or int(page_size) != 1:
-        return None
+        return _sparse_decode_fallback("disabled_or_unsupported_page_size")
     if req_pool_indices is None:
         req_pool_indices = getattr(forward_batch, "req_pool_indices", None)
     if req_pool_indices is None or page_table is None or cache_seqlens is None:
-        return None
+        return _sparse_decode_fallback("missing_decode_metadata")
     if page_table.ndim != 2 or cache_seqlens.ndim != 1:
-        return None
+        return _sparse_decode_fallback("invalid_decode_metadata_shape")
     batch_size = int(page_table.shape[0])
     if batch_size == 0 or int(cache_seqlens.numel()) != batch_size:
-        return None
+        return _sparse_decode_fallback("empty_or_mismatched_batch")
     if source_req_to_token is not None and (
         source_req_to_token.ndim != 2
         or source_req_to_token.device != page_table.device
@@ -2250,15 +2573,24 @@ def build_sparse_decode_batch(
         or int(source_req_to_token.shape[1]) < int(page_table.shape[1])
         or req_pool_indices.device != page_table.device
     ):
-        return None
+        return _sparse_decode_fallback("incompatible_direct_source")
 
     store = get_sparse_decode_store()
     if len(store) == 0:
-        return None
+        return _sparse_decode_fallback("empty_plan_store")
     cfg = get_config()
     device = page_table.device
     dtype = page_table.dtype
     max_len = int(page_table.shape[1])
+    # The fused Triton prefix-scan is intentionally capped. A model can advertise a
+    # wider context than this workload uses; if a real request crosses the cap, retain
+    # correctness by using the normal dense page table instead of raising in rollout.
+    from sglang.srt.mem_cache.sparse_decode_kernels import (
+        MAX_FUSED_SPARSE_CONTEXT_WIDTH,
+    )
+
+    if max_len > MAX_FUSED_SPARSE_CONTEXT_WIDTH:
+        return _sparse_decode_fallback("context_exceeds_fused_width")
     host_meta = _sparse_decode_host_metadata(
         forward_batch,
         cache_seqlens=cache_seqlens,
@@ -2269,11 +2601,11 @@ def build_sparse_decode_batch(
         req_pool_indices_cpu=req_pool_indices_cpu,
     )
     if host_meta is None:
-        return None
+        return _sparse_decode_fallback("missing_host_routing")
     lens_cpu, req_cpu = host_meta
     total_tokens = sum(lens_cpu)
     if total_tokens <= 0:
-        return None
+        return _sparse_decode_fallback("empty_context")
 
     static_batch = _get_sparse_decode_static_batch(store, req_cpu)
     cand_orig = static_batch.cand_orig
@@ -2284,7 +2616,7 @@ def build_sparse_decode_batch(
     all_have_positions = static_batch.all_have_positions
 
     if not cand_plans or any(lens_cpu[row] <= 0 for row in cand_orig):
-        return None
+        return _sparse_decode_fallback("no_active_sparse_plan")
 
     min_dropped = max(
         0, int(getattr(cfg, "sparse_decode_min_dropped_tokens", 0) or 0)
@@ -2293,9 +2625,9 @@ def build_sparse_decode_batch(
         0.0, float(getattr(cfg, "sparse_decode_min_drop_ratio", 0.0) or 0.0)
     )
     if min_dropped > 0 and drop_upper_bound < min_dropped:
-        return None
+        return _sparse_decode_fallback("drop_upper_bound_below_floor")
     if min_ratio > 0.0 and (drop_upper_bound / total_tokens) < min_ratio:
-        return None
+        return _sparse_decode_fallback("drop_upper_bound_ratio_below_floor")
 
     if all_have_positions and page_table.is_cuda:
         return _build_sparse_decode_position_cuda(
@@ -2431,12 +2763,12 @@ def build_sparse_decode_batch(
         ]
 
     if used_requests == 0 or dropped_total == 0:
-        return None
+        return _sparse_decode_fallback("no_currently_droppable_tokens")
     drop_ratio = dropped_total / total_tokens
     if min_dropped > 0 and dropped_total < min_dropped:
-        return None
+        return _sparse_decode_fallback("actual_drop_below_floor")
     if min_ratio > 0.0 and drop_ratio < min_ratio:
-        return None
+        return _sparse_decode_fallback("actual_drop_ratio_below_floor")
 
     keep_mask = valid_mask & ~drop_mask
     sparse_lens = torch.tensor(
@@ -2444,7 +2776,7 @@ def build_sparse_decode_batch(
     )
     max_sparse = max(sparse_lens_cpu, default=0)
     if max_sparse <= 0:
-        return None
+        return _sparse_decode_fallback("empty_sparse_context_guard")
 
     if page_table.is_cuda:
         from sglang.srt.mem_cache.sparse_decode_kernels import compact_page_table
@@ -2460,6 +2792,9 @@ def build_sparse_decode_batch(
     cu = torch.nn.functional.pad(
         torch.cumsum(sparse_lens, dim=0, dtype=torch.int32), (1, 0)
     )
+    batch_mode, batch_action, batch_reason, batch_policy, batch_error_bound = (
+        _sparse_decode_batch_attribution(cand_plans)
+    )
     batch = SparseDecodeBatch(
         page_table=out,
         cache_seqlens=sparse_lens,
@@ -2468,6 +2803,13 @@ def build_sparse_decode_batch(
         kept_tokens=int(total_tokens - dropped_total),
         dropped_tokens=int(dropped_total),
         used_requests=int(used_requests),
+        mode=batch_mode,
+        decision_action=batch_action,
+        decision_reason=batch_reason,
+        policy=batch_policy,
+        candidate_tokens=sum(int(plan.candidate_tokens) for plan in cand_plans),
+        selected_tokens=sum(int(plan.selected_tokens) for plan in cand_plans),
+        approximate_error_bound=batch_error_bound,
     )
     set_last_sparse_decode_batch(batch)
     return batch
@@ -2641,19 +2983,19 @@ def _build_sparse_decode_position_cuda(
         dropped_total = sum(drop_counts)
         used_requests = sum(count > 0 for count in drop_counts)
     if used_requests == 0 or dropped_total == 0:
-        return None
+        return _sparse_decode_fallback("no_currently_droppable_tokens")
     drop_ratio = dropped_total / total_tokens
     if min_dropped > 0 and dropped_total < min_dropped:
-        return None
+        return _sparse_decode_fallback("actual_drop_below_floor")
     if min_ratio > 0.0 and drop_ratio < min_ratio:
-        return None
+        return _sparse_decode_fallback("actual_drop_ratio_below_floor")
 
     sparse_lens_cpu = [
         lens_cpu[row] - drop_counts[row] for row in range(batch_size)
     ]
     max_sparse = max(sparse_lens_cpu, default=0)
     if max_sparse <= 0:
-        return None
+        return _sparse_decode_fallback("empty_sparse_context_guard")
     workspace = _sparse_decode_mask_workspace(
         page_table=page_table,
         req_cpu=req_cpu,
@@ -2741,6 +3083,9 @@ def _build_sparse_decode_position_cuda(
     workspace.last_seq_lens_cpu = tuple(int(value) for value in lens_cpu)
     workspace.last_drop_counts = drop_counts_key
     workspace.append_ready = bool(steady_drop_set)
+    batch_mode, batch_action, batch_reason, batch_policy, batch_error_bound = (
+        _sparse_decode_batch_attribution(cand_plans)
+    )
     batch = SparseDecodeBatch(
         page_table=out,
         cache_seqlens=sparse_lens,
@@ -2754,6 +3099,13 @@ def _build_sparse_decode_position_cuda(
         used_requests=int(used_requests),
         direct_source=bool(use_direct_source),
         incremental_append=bool(can_append),
+        mode=batch_mode,
+        decision_action=batch_action,
+        decision_reason=batch_reason,
+        policy=batch_policy,
+        candidate_tokens=sum(int(plan.candidate_tokens) for plan in cand_plans),
+        selected_tokens=sum(int(plan.selected_tokens) for plan in cand_plans),
+        approximate_error_bound=batch_error_bound,
     )
     set_last_sparse_decode_batch(batch)
     return batch

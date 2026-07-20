@@ -1468,6 +1468,7 @@ def test_sparse_decode_plan_register_and_build_batch():
     """Sparse decode: register reuse drop locs, then shorten decode page table."""
     os.environ["SGLANG_VLM_CACHEBLEND"] = "1"
     os.environ["SGLANG_VLM_CACHEBLEND_SPARSE_DECODE"] = "1"
+    os.environ["SGLANG_VLM_CACHEBLEND_SPARSE_DECODE_MODE"] = "reuse"
     os.environ["SGLANG_VLM_CACHEBLEND_SPARSE_DECODE_KEEP_RECENT"] = "2"
     os.environ["SGLANG_VLM_CACHEBLEND_SPARSE_DECODE_KEEP_FIRST"] = "0"
     os.environ["SGLANG_VLM_CACHEBLEND_SPARSE_DECODE_MIN_DROPPED_TOKENS"] = "0"
@@ -1548,6 +1549,7 @@ def test_sparse_decode_position_plan_avoids_physical_location_search():
     """
     os.environ["SGLANG_VLM_CACHEBLEND"] = "1"
     os.environ["SGLANG_VLM_CACHEBLEND_SPARSE_DECODE"] = "1"
+    os.environ["SGLANG_VLM_CACHEBLEND_SPARSE_DECODE_MODE"] = "reuse"
     os.environ["SGLANG_VLM_CACHEBLEND_SPARSE_DECODE_KEEP_RECENT"] = "2"
     os.environ["SGLANG_VLM_CACHEBLEND_SPARSE_DECODE_KEEP_FIRST"] = "0"
     os.environ["SGLANG_VLM_CACHEBLEND_SPARSE_DECODE_MIN_DROPPED_TOKENS"] = "0"
@@ -1618,7 +1620,9 @@ def test_sparse_decode_static_batch_cache_invalidates_on_plan_replacement():
     """A recycled req_pool_idx must never reuse the previous request's host plan."""
     os.environ["SGLANG_VLM_CACHEBLEND"] = "1"
     os.environ["SGLANG_VLM_CACHEBLEND_SPARSE_DECODE"] = "1"
+    os.environ["SGLANG_VLM_CACHEBLEND_SPARSE_DECODE_MODE"] = "reuse"
     os.environ["SGLANG_VLM_CACHEBLEND_SPARSE_DECODE_KEEP_RECENT"] = "0"
+    os.environ["SGLANG_VLM_CACHEBLEND_SPARSE_DECODE_MIN_DROPPED_TOKENS"] = "0"
     os.environ["SGLANG_VLM_CACHEBLEND_SPARSE_DECODE_MIN_DROP_RATIO"] = "0"
     cb.reload_config_from_env()
     store = cb.get_sparse_decode_store()
@@ -1664,9 +1668,65 @@ def test_sparse_decode_static_batch_cache_invalidates_on_plan_replacement():
     print("ok test_sparse_decode_static_batch_cache_invalidates_on_plan_replacement")
 
 
+def test_sparse_decode_static_batch_ignores_unrelated_store_churn():
+    """Another request's plan must not force a stable batch to compact again."""
+
+    store = cb.SparseDecodePlanStore(max_plans=8)
+
+    def plan(req_pool_idx, position):
+        values = torch.tensor([position], dtype=torch.long)
+        return cb.SparseDecodePlan(
+            request_id=f"req-{req_pool_idx}",
+            req_pool_idx=req_pool_idx,
+            drop_locs=values,
+            n_image_tokens=0,
+            n_drop_tokens=1,
+            drop_positions=values,
+            drop_positions_host=(position,),
+        )
+
+    store.put(plan(0, 1))
+    first = cb._get_sparse_decode_static_batch(store, [0])
+    store.put(plan(7, 2))
+    second = cb._get_sparse_decode_static_batch(store, [0])
+    assert second is first
+
+    store.put(plan(0, 2))
+    replaced = cb._get_sparse_decode_static_batch(store, [0])
+    assert replaced is not first
+    assert replaced.cand_plans[0].drop_positions_host == (2,)
+    print("ok test_sparse_decode_static_batch_ignores_unrelated_store_churn")
+
+
+def test_sparse_decode_plan_eviction_invalidates_affected_batch():
+    store = cb.SparseDecodePlanStore(max_plans=1)
+
+    def plan(req_pool_idx):
+        values = torch.tensor([1], dtype=torch.long)
+        return cb.SparseDecodePlan(
+            request_id=f"req-{req_pool_idx}",
+            req_pool_idx=req_pool_idx,
+            drop_locs=values,
+            n_image_tokens=0,
+            n_drop_tokens=1,
+            drop_positions=values,
+            drop_positions_host=(1,),
+        )
+
+    store.put(plan(0))
+    before = cb._get_sparse_decode_static_batch(store, [0])
+    assert len(before.cand_plans) == 1
+    store.put(plan(1))  # evicts req_pool_idx=0
+    after = cb._get_sparse_decode_static_batch(store, [0])
+    assert after is not before
+    assert len(after.cand_plans) == 0
+    print("ok test_sparse_decode_plan_eviction_invalidates_affected_batch")
+
+
 def test_sparse_decode_keep_recent_protects_tail():
     os.environ["SGLANG_VLM_CACHEBLEND"] = "1"
     os.environ["SGLANG_VLM_CACHEBLEND_SPARSE_DECODE"] = "1"
+    os.environ["SGLANG_VLM_CACHEBLEND_SPARSE_DECODE_MODE"] = "reuse"
     os.environ["SGLANG_VLM_CACHEBLEND_SPARSE_DECODE_KEEP_RECENT"] = "4"
     os.environ["SGLANG_VLM_CACHEBLEND_SPARSE_DECODE_KEEP_FIRST"] = "0"
     os.environ["SGLANG_VLM_CACHEBLEND_SPARSE_DECODE_MIN_DROPPED_TOKENS"] = "0"
@@ -1715,6 +1775,7 @@ def test_sparse_decode_keep_recent_protects_tail():
 def test_sparse_decode_keep_first_and_min_drop_gate():
     os.environ["SGLANG_VLM_CACHEBLEND"] = "1"
     os.environ["SGLANG_VLM_CACHEBLEND_SPARSE_DECODE"] = "1"
+    os.environ["SGLANG_VLM_CACHEBLEND_SPARSE_DECODE_MODE"] = "reuse"
     os.environ["SGLANG_VLM_CACHEBLEND_SPARSE_DECODE_KEEP_RECENT"] = "0"
     os.environ["SGLANG_VLM_CACHEBLEND_SPARSE_DECODE_KEEP_FIRST"] = "2"
     os.environ["SGLANG_VLM_CACHEBLEND_SPARSE_DECODE_MIN_DROPPED_TOKENS"] = "0"
@@ -1773,6 +1834,7 @@ def test_sparse_decode_keep_first_and_min_drop_gate():
 def test_sparse_decode_batched_rows_keep_request_isolation():
     os.environ["SGLANG_VLM_CACHEBLEND"] = "1"
     os.environ["SGLANG_VLM_CACHEBLEND_SPARSE_DECODE"] = "1"
+    os.environ["SGLANG_VLM_CACHEBLEND_SPARSE_DECODE_MODE"] = "reuse"
     os.environ["SGLANG_VLM_CACHEBLEND_SPARSE_DECODE_MIN_DROPPED_TOKENS"] = "0"
     os.environ["SGLANG_VLM_CACHEBLEND_SPARSE_DECODE_MIN_DROP_RATIO"] = "0"
     cb.reload_config_from_env()
@@ -1874,6 +1936,9 @@ def test_sparse_decode_stats_to_dict():
         sparse_decode_dropped_tokens=4,
         sparse_decode_direct_source=True,
         sparse_decode_incremental_append=True,
+        sparse_decode_candidate_tokens=16,
+        sparse_decode_selected_tokens=12,
+        execution_error_bound=0.04,
     )
     d = stats.to_dict()
     assert d["cacheblend_sparse_decode_used"] == "1"
@@ -1881,7 +1946,29 @@ def test_sparse_decode_stats_to_dict():
     assert d["cacheblend_sparse_decode_dropped_tokens"] == "4"
     assert d["cacheblend_sparse_decode_direct_source"] == "1"
     assert d["cacheblend_sparse_decode_incremental_append"] == "1"
+    assert d["cacheblend_sparse_decode_candidate_tokens"] == "16"
+    assert d["cacheblend_sparse_decode_selected_tokens"] == "12"
+    assert float(d["reuse_error_bound"]) == 0.04
     print("ok test_sparse_decode_stats_to_dict")
+
+
+def test_explicit_local_decision_is_not_misattributed_to_cacheblend():
+    stats = cb.CacheBlendStats(
+        sparse_decode_mode="query_blocks",
+        execution_action="local",
+        execution_reason="no_active_sparse_plan",
+        execution_policy="query_blocks",
+        execution_operator_id="sparse_decode.context_attention",
+        execution_representation_stage="decode_kv_blocks",
+    )
+    d = stats.to_dict()
+    assert d["reuse_action"] == "local"
+    assert d["reuse_operator_id"] == "sparse_decode.context_attention"
+    assert d["reuse_representation_stage"] == "decode_kv_blocks"
+    assert d["reuse_reason"] == "no_active_sparse_plan"
+    assert d["reuse_applied_units"] == "0"
+    assert d["reuse_approximate"] == "0"
+    print("ok test_explicit_local_decision_is_not_misattributed_to_cacheblend")
 
 
 def test_sparse_decode_min_drop_gate_bails_on_upper_bound():
@@ -1889,6 +1976,7 @@ def test_sparse_decode_min_drop_gate_bails_on_upper_bound():
     and the decision matches the exact computation (bail iff exact would also bail)."""
     os.environ["SGLANG_VLM_CACHEBLEND"] = "1"
     os.environ["SGLANG_VLM_CACHEBLEND_SPARSE_DECODE"] = "1"
+    os.environ["SGLANG_VLM_CACHEBLEND_SPARSE_DECODE_MODE"] = "reuse"
     os.environ["SGLANG_VLM_CACHEBLEND_SPARSE_DECODE_KEEP_RECENT"] = "0"
     os.environ["SGLANG_VLM_CACHEBLEND_SPARSE_DECODE_KEEP_FIRST"] = "0"
     os.environ["SGLANG_VLM_CACHEBLEND_SPARSE_DECODE_MIN_DROPPED_TOKENS"] = "0"
@@ -1932,9 +2020,14 @@ def test_sparse_decode_min_drop_gate_bails_on_upper_bound():
 
     # ratio gate above the 0.25 upper bound -> bail (None).
     assert build_with_gate(0.5, 0) is None
+    assert (
+        cb.pop_last_sparse_decode_fallback_reason()
+        == "drop_upper_bound_ratio_below_floor"
+    )
     # ratio gate below the upper bound and below the exact 0.25 ratio -> keep.
     b = build_with_gate(0.2, 0)
     assert b is not None and b.dropped_tokens == 2
+    assert cb.pop_last_sparse_decode_fallback_reason() == ""
     # dropped-count gate above the upper bound of 2 -> bail (None).
     assert build_with_gate(0, 3) is None
     # dropped-count gate at the exact bound -> keep.
@@ -1953,6 +2046,7 @@ def test_sparse_decode_candidate_restriction_mixed_batch():
     row, a non-candidate row, and a keep_first-protected candidate row."""
     os.environ["SGLANG_VLM_CACHEBLEND"] = "1"
     os.environ["SGLANG_VLM_CACHEBLEND_SPARSE_DECODE"] = "1"
+    os.environ["SGLANG_VLM_CACHEBLEND_SPARSE_DECODE_MODE"] = "reuse"
     os.environ["SGLANG_VLM_CACHEBLEND_SPARSE_DECODE_KEEP_RECENT"] = "0"
     os.environ["SGLANG_VLM_CACHEBLEND_SPARSE_DECODE_KEEP_FIRST"] = "1"
     os.environ["SGLANG_VLM_CACHEBLEND_SPARSE_DECODE_MIN_DROPPED_TOKENS"] = "0"
@@ -2015,6 +2109,7 @@ def _run_incremental_decode_sequence(
     build bails). Used to assert the incremental path matches the full recompute."""
     os.environ["SGLANG_VLM_CACHEBLEND"] = "1"
     os.environ["SGLANG_VLM_CACHEBLEND_SPARSE_DECODE"] = "1"
+    os.environ["SGLANG_VLM_CACHEBLEND_SPARSE_DECODE_MODE"] = "reuse"
     os.environ["SGLANG_VLM_CACHEBLEND_SPARSE_DECODE_KEEP_RECENT"] = str(keep_recent)
     os.environ["SGLANG_VLM_CACHEBLEND_SPARSE_DECODE_KEEP_FIRST"] = str(keep_first)
     os.environ["SGLANG_VLM_CACHEBLEND_SPARSE_DECODE_MIN_DROPPED_TOKENS"] = "0"
@@ -2116,6 +2211,7 @@ def test_sparse_decode_incremental_resets_on_seqlen_regression():
     membership against the new page-table row rather than reuse stale columns."""
     os.environ["SGLANG_VLM_CACHEBLEND"] = "1"
     os.environ["SGLANG_VLM_CACHEBLEND_SPARSE_DECODE"] = "1"
+    os.environ["SGLANG_VLM_CACHEBLEND_SPARSE_DECODE_MODE"] = "reuse"
     os.environ["SGLANG_VLM_CACHEBLEND_SPARSE_DECODE_KEEP_RECENT"] = "0"
     os.environ["SGLANG_VLM_CACHEBLEND_SPARSE_DECODE_KEEP_FIRST"] = "0"
     os.environ["SGLANG_VLM_CACHEBLEND_SPARSE_DECODE_MIN_DROPPED_TOKENS"] = "0"
@@ -2181,6 +2277,7 @@ def test_sparse_decode_incremental_same_seqlen_rewrite_resets():
     dropping stale columns."""
     os.environ["SGLANG_VLM_CACHEBLEND"] = "1"
     os.environ["SGLANG_VLM_CACHEBLEND_SPARSE_DECODE"] = "1"
+    os.environ["SGLANG_VLM_CACHEBLEND_SPARSE_DECODE_MODE"] = "reuse"
     os.environ["SGLANG_VLM_CACHEBLEND_SPARSE_DECODE_KEEP_RECENT"] = "0"
     os.environ["SGLANG_VLM_CACHEBLEND_SPARSE_DECODE_KEEP_FIRST"] = "0"
     os.environ["SGLANG_VLM_CACHEBLEND_SPARSE_DECODE_MIN_DROPPED_TOKENS"] = "0"

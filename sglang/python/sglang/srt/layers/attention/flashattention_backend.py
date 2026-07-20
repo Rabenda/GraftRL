@@ -933,8 +933,24 @@ class FlashAttentionBackend(AttentionBackend):
                 and not layer.is_cross_attention
                 and not is_swa_layer
             ):
+                # Query-aware sparse decode pays its selector cost once at the
+                # prefill boundary. The resulting fixed block plan is consumed by
+                # every decode layer through the normal FA3 page table; no per-token
+                # top-k or Python routing is added to the decode hot path.
                 from sglang.srt.mem_cache import vlm_cacheblend
 
+                if vlm_cacheblend.sparse_decode_enabled():
+                    from sglang.srt.mem_cache.query_aware_sparse_decode import (
+                        maybe_register_query_block_plans,
+                    )
+
+                    maybe_register_query_block_plans(
+                        forward_batch=forward_batch,
+                        q=q_full,
+                        key_cache=key_cache,
+                        layer_id=layer.layer_id,
+                        page_size=int(self.page_size or 1),
+                    )
                 cfg = vlm_cacheblend.get_config()
                 if vlm_cacheblend.cacheblend_enabled() and cfg.skip_reuse_attention:
                     active_ranges = vlm_cacheblend.recipient_active_query_ranges(

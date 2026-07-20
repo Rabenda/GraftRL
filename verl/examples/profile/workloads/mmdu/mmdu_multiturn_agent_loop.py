@@ -17,6 +17,7 @@ matches the last answer / dataset GT). Intermediate turns still call
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import os
 from typing import Any
@@ -29,6 +30,32 @@ from verl.workers.rollout.replica import TokenOutput
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
+
+
+def paired_sampling_seed(
+    base_seed: int,
+    *,
+    global_step: Any,
+    sample_index: Any,
+    rollout_index: Any,
+    turn_index: int,
+) -> int:
+    """Return a stable per-trajectory seed independent of worker scheduling."""
+
+    coordinates = ":".join(
+        str(value)
+        for value in (
+            int(base_seed),
+            global_step,
+            sample_index,
+            rollout_index,
+            int(turn_index),
+        )
+    )
+    digest = hashlib.blake2s(
+        coordinates.encode("utf-8"), digest_size=4, person=b"mmdu-ab"
+    ).digest()
+    return int.from_bytes(digest, "little") & 0x7FFFFFFF
 
 
 def message_has_image(message: dict) -> bool:
@@ -109,11 +136,27 @@ class MMDUMultiturnAgentLoop(AgentLoopBase):
         self.final_max_new_tokens = int(
             os.environ.get("MMDU_FINAL_MAX_NEW_TOKENS", final_max_new_tokens)
         )
+        paired_seed = os.environ.get("MMDU_PAIRED_SAMPLING_SEED")
+        self.paired_sampling_seed = (
+            None if paired_seed is None or paired_seed == "" else int(paired_seed)
+        )
 
-    def _sampling_params(self, sampling_params: dict[str, Any], max_new_tokens: int) -> dict[str, Any]:
+    def _sampling_params(
+        self,
+        sampling_params: dict[str, Any],
+        max_new_tokens: int,
+        *,
+        seed: int | None = None,
+    ) -> dict[str, Any]:
         params = dict(sampling_params)
         params.pop("max_tokens", None)
         params["max_new_tokens"] = max(1, int(max_new_tokens))
+        if seed is not None:
+            # SGLang's internal SamplingParams names the per-request deterministic
+            # stream ``sampling_seed``. ``seed`` is only the OpenAI-compatible API
+            # spelling and is not accepted by the direct TokenizerManager path used
+            # by verl's colocated rollout server.
+            params["sampling_seed"] = int(seed)
         return params
 
     async def _decode_assistant(self, token_ids: list[int]) -> str:
@@ -127,7 +170,9 @@ class MMDUMultiturnAgentLoop(AgentLoopBase):
         messages = list(kwargs["raw_prompt"])
         uid = str(kwargs.get("uid") or uuid4())
         request_id = uuid4().hex
-        rollout_idx = str(kwargs.get("index")) if kwargs.get("index") is not None else None
+        sample_idx = kwargs.get("index")
+        branch_idx = kwargs.get("rollout_idx")
+        rollout_idx = str(branch_idx) if branch_idx is not None else None
         global_step = kwargs.get("global_step")
         extra_info = kwargs.get("extra_info") or {}
 
@@ -212,7 +257,21 @@ class MMDUMultiturnAgentLoop(AgentLoopBase):
                 output: TokenOutput = await self.server_manager.generate(
                     request_id=request_id,
                     prompt_ids=full_ids,
-                    sampling_params=self._sampling_params(sampling_params, budget),
+                    sampling_params=self._sampling_params(
+                        sampling_params,
+                        budget,
+                        seed=(
+                            None
+                            if self.paired_sampling_seed is None
+                            else paired_sampling_seed(
+                                self.paired_sampling_seed,
+                                global_step=global_step,
+                                sample_index=sample_idx,
+                                rollout_index=branch_idx,
+                                turn_index=turn_rank,
+                            )
+                        ),
+                    ),
                     image_data=images,
                     video_data=videos,
                     audio_data=audios,
