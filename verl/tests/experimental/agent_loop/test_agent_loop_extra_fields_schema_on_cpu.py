@@ -95,6 +95,9 @@ class _FakeTokenizer:
     ) -> dict[str, torch.Tensor]:
         del padding, return_tensors
         input_ids = encoded_inputs["input_ids"]
+        if input_ids and isinstance(input_ids[0], list):
+            assert len(input_ids) == 1
+            input_ids = input_ids[0]
         if len(input_ids) > max_length:
             if self.padding_side == "left":
                 input_ids = input_ids[-max_length:]
@@ -262,6 +265,7 @@ async def test_agent_loop_postprocess_accepts_read_only_routed_experts_on_cpu():
         _compute_multi_modal_inputs = AgentLoopWorker._compute_multi_modal_inputs
         _compute_position_ids = AgentLoopWorker._compute_position_ids
         _get_mm_processor_kwargs = AgentLoopWorker._get_mm_processor_kwargs
+        _ensure_tensor_encoding = staticmethod(AgentLoopWorker._ensure_tensor_encoding)
         _compute_score = AgentLoopWorker._compute_score
         _compute_teacher_logprobs = AgentLoopWorker._compute_teacher_logprobs
         distillation_enabled = False

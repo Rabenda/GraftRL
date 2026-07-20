@@ -46,6 +46,7 @@ from tensordict import TensorDict
 from transformers import AutoProcessor, AutoTokenizer
 
 from verl.experimental.agent_loop.utils import resolve_config_path
+from verl.experimental.rollout_reuse import group_preserving_slices
 from verl.protocol import DataProto
 from verl.tools.tool_registry import load_all_tools
 from verl.trainer.distillation import is_distillation_enabled
@@ -74,6 +75,15 @@ logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 DEFAULT_ROUTING_CACHE_SIZE = 10000
+
+
+def _rollout_reuse_group_affinity_enabled() -> bool:
+    return os.environ.get("VERL_ROLLOUT_REUSE_GROUP_AFFINITY", "0").lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
 
 
 class AgentLoopMetrics(BaseModel):
@@ -476,6 +486,7 @@ class AgentLoopWorker:
             top_k=config.top_k,
             repetition_penalty=1.0,
             logprobs=config.calculate_log_probs,
+            ignore_eos=config.ignore_eos,
         )
 
         def apply_greedy_sampling_params(params: dict[str, Any]) -> None:
@@ -574,8 +585,19 @@ class AgentLoopWorker:
                 tools=ToolListWrap(self.tools),
             )
             kwargs.setdefault("global_step", trajectory["step"])
+            # ``index`` identifies the dataset sample and is shared by all GRPO
+            # branches. ``rollout_n`` is the actual branch coordinate.
+            kwargs.setdefault("rollout_idx", trajectory["rollout_n"])
             output: AgentLoopOutput = await agent_loop.run(sampling_params, **kwargs)
             return await self._agent_loop_postprocess(output, trajectory["validate"], **kwargs)
+
+    @staticmethod
+    def _ensure_tensor_encoding(encoding, *keys: str):
+        for key in keys:
+            value = encoding.get(key)
+            if value is not None and not isinstance(value, torch.Tensor):
+                encoding[key] = torch.tensor(value, dtype=torch.long)
+        return encoding
 
     async def _agent_loop_postprocess(self, output, validate, **kwargs) -> _InternalAgentLoopOutput:
         """Perform post-processing operations on the output of each individual agent loop."""
@@ -601,45 +623,59 @@ class AgentLoopWorker:
         # - position_ids: sequential positions for tokens, starting at 0
         #   e.g., [0,0,0,0,0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,0,0,0,0]
 
+        prompt_ids = output.prompt_ids[-self.rollout_config.prompt_length :]
+        response_ids = output.response_ids[: self.rollout_config.response_length]
+        response_mask_ids = output.response_mask[: len(response_ids)]
+        response_logprobs_ids = (
+            output.response_logprobs[: len(response_ids)] if output.response_logprobs is not None else None
+        )
+        output.prompt_ids = prompt_ids
+        output.response_ids = response_ids
+        output.response_mask = response_mask_ids
+        output.response_logprobs = response_logprobs_ids
+
         # TODO(wuxibin): remove padding and use tensordict.
         self.tokenizer.padding_side = "left"
         prompt_output = self.tokenizer.pad(
-            {"input_ids": output.prompt_ids},
+            {"input_ids": [prompt_ids]},
             padding="max_length",
             max_length=self.rollout_config.prompt_length,
             return_tensors="pt",
             return_attention_mask=True,
         )
+        prompt_output = self._ensure_tensor_encoding(prompt_output, "input_ids", "attention_mask")
         if prompt_output["input_ids"].dim() == 1:
             prompt_output["input_ids"] = prompt_output["input_ids"].unsqueeze(0)
             prompt_output["attention_mask"] = prompt_output["attention_mask"].unsqueeze(0)
 
         self.tokenizer.padding_side = "right"
         response_output = self.tokenizer.pad(
-            {"input_ids": output.response_ids},
+            {"input_ids": [response_ids]},
             padding="max_length",
             max_length=self.rollout_config.response_length,
             return_tensors="pt",
             return_attention_mask=True,
         )
+        response_output = self._ensure_tensor_encoding(response_output, "input_ids", "attention_mask")
         if response_output["input_ids"].dim() == 1:
             response_output["input_ids"] = response_output["input_ids"].unsqueeze(0)
             response_output["attention_mask"] = response_output["attention_mask"].unsqueeze(0)
 
         response_mask_output = self.tokenizer.pad(
-            {"input_ids": output.response_mask},
+            {"input_ids": [response_mask_ids]},
             padding="max_length",
             max_length=self.rollout_config.response_length,
             return_tensors="pt",
             return_attention_mask=False,
         )
+        response_mask_output = self._ensure_tensor_encoding(response_mask_output, "input_ids")
         if response_mask_output["input_ids"].dim() == 1:
             response_mask_output["input_ids"] = response_mask_output["input_ids"].unsqueeze(0)
 
         response_logprobs = None
-        if output.response_logprobs is not None:
-            pad_size = self.rollout_config.response_length - len(output.response_logprobs)
-            response_logprobs = torch.tensor(output.response_logprobs + [0.0] * pad_size).unsqueeze(0)
+        if response_logprobs_ids is not None:
+            pad_size = self.rollout_config.response_length - len(response_logprobs_ids)
+            response_logprobs = torch.tensor(response_logprobs_ids + [0.0] * pad_size).unsqueeze(0)
 
         response_mask = response_mask_output["input_ids"] * response_output["attention_mask"]
         attention_mask = torch.cat([prompt_output["attention_mask"], response_output["attention_mask"]], dim=1)
@@ -661,7 +697,7 @@ class AgentLoopWorker:
             routed_experts = torch.zeros(1, total_length, layer_num, topk_num, dtype=experts_tensor.dtype)
 
             # Calculate start position: left padding means original prompt starts at the end
-            start_pos = prompt_output["input_ids"].shape[1] - len(output.prompt_ids)
+            start_pos = prompt_output["input_ids"].shape[1] - len(prompt_ids)
             end_pos = min(start_pos + length, total_length)
 
             # Add boundary checks for robustness
@@ -686,8 +722,8 @@ class AgentLoopWorker:
         await self._compute_score([output], kwargs=kwargs)
         await self._compute_teacher_logprobs(
             output,
-            prompt_ids=output.prompt_ids,
-            response_ids=output.response_ids,
+            prompt_ids=prompt_ids,
+            response_ids=response_ids,
             validate=validate,
             sample_kwargs=kwargs,
         )
@@ -704,8 +740,8 @@ class AgentLoopWorker:
                 teacher_logprobs,
                 prompt_width=prompt_output["input_ids"].shape[1],
                 response_width=response_output["input_ids"].shape[1],
-                prompt_length=len(output.prompt_ids),
-                response_length=len(output.response_ids),
+                prompt_length=len(prompt_ids),
+                response_length=len(response_ids),
                 pad_token_id=self.tokenizer.pad_token_id,
             )
 
@@ -1124,7 +1160,16 @@ class AgentLoopManager:
         Returns:
             DataProto: Output batch.
         """
-        chunkes = prompts.chunk(len(self.agent_loop_workers))
+        if _rollout_reuse_group_affinity_enabled() and "uid" in prompts.non_tensor_batch:
+            group_ids = prompts.non_tensor_batch["uid"].tolist()
+            chunkes = [
+                prompts[group_slice]
+                for group_slice in group_preserving_slices(
+                    group_ids, len(self.agent_loop_workers)
+                )
+            ]
+        else:
+            chunkes = prompts.chunk(len(self.agent_loop_workers))
         outputs = await asyncio.gather(
             *[
                 worker.generate_sequences.remote(chunk)

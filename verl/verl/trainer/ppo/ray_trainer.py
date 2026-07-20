@@ -230,6 +230,30 @@ def compute_advantage(
     return data
 
 
+def _apply_rollout_extra_info(batch: DataProto, rollout_output: DataProto) -> None:
+    """Replace dataset extra info with branch-local metadata from a rollout.
+
+    Agent loops can derive reward inputs during generation (for example, the
+    individual assistant turns of a tool-using trajectory). Returning those
+    values under ``extra_info`` directly conflicts with the original dataset
+    field when :meth:`DataProto.union` checks overlapping keys.
+    ``rollout_extra_info`` is an explicit replacement channel: make it
+    authoritative on both sides of the subsequent union, then remove the
+    transport-only key.
+    """
+    key = "rollout_extra_info"
+    if key not in rollout_output.non_tensor_batch:
+        return
+    values = rollout_output.non_tensor_batch.pop(key)
+    if len(values) != len(batch):
+        raise ValueError(
+            "rollout_extra_info must contain one value per rollout branch: "
+            f"got {len(values)} values for batch size {len(batch)}"
+        )
+    batch.non_tensor_batch["extra_info"] = values
+    rollout_output.non_tensor_batch["extra_info"] = values
+
+
 class RayPPOTrainer:
     """Distributed PPO trainer using Ray for scalable reinforcement learning.
 
@@ -1456,6 +1480,7 @@ class RayPPOTrainer:
                     del combined_gen_batch, combined_gen_output
                     # repeat to align with repeated responses in rollout
                     batch = batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
+                    _apply_rollout_extra_info(batch, gen_batch_output)
                     batch = batch.union(gen_batch_output)
 
                     if "response_mask" not in batch.batch.keys():
@@ -1489,9 +1514,21 @@ class RayPPOTrainer:
                         rollout_data_dir = self.config.trainer.get("rollout_data_dir", None)
                         if rollout_data_dir:
                             self._log_rollout_data(batch, reward_extra_infos_dict, timing_raw, rollout_data_dir)
-                        print("VERL_PROFILE_ROLLOUT_ONLY=1: exiting after rollout/reward dump.")
-                        progress_bar.close()
-                        return
+                        rollout_only_steps = int(os.environ.get("VERL_PROFILE_ROLLOUT_ONLY_STEPS", "1"))
+                        if self.global_steps >= rollout_only_steps or is_last_step:
+                            print("VERL_PROFILE_ROLLOUT_ONLY=1: exiting after rollout/reward dump.")
+                            progress_bar.close()
+                            return
+                        print(
+                            "VERL_PROFILE_ROLLOUT_ONLY=1: dumped rollout/reward; "
+                            f"skipping training and continuing to step {self.global_steps + 1}."
+                        )
+                        # HYBRID SGLang rollout does not support wake_up() directly;
+                        # update_weights() is the supported path that leaves replicas awake.
+                        self.checkpoint_manager.update_weights(self.global_steps)
+                        progress_bar.update(1)
+                        self.global_steps += 1
+                        continue
 
                     # Operating Mode Selection:
                     # - Bypass mode: Sets old_log_probs = rollout_log_probs (2 policies: π_rollout, π_θ)
