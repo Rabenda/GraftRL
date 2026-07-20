@@ -237,12 +237,6 @@ LOG_INFERENCE_STEP = os.environ.get("SGLANG_LOG_INFERENCE_STEP", "0").lower() in
     "yes",
     "on",
 )
-GRPO_SIM_CACHE_ENABLED = os.environ.get("SGLANG_GRPO_SIM_CACHE", "0").lower() in (
-    "1",
-    "true",
-    "yes",
-    "on",
-)
 VLM_CACHEBLEND_ENABLED = os.environ.get("SGLANG_VLM_CACHEBLEND", "0").lower() in (
     "1",
     "true",
@@ -275,6 +269,8 @@ _CACHEBLEND_LOG_FIELDS = [
     "cacheblend_sparse_decode_used",
     "cacheblend_sparse_decode_kept_tokens",
     "cacheblend_sparse_decode_dropped_tokens",
+    "cacheblend_sparse_decode_direct_source",
+    "cacheblend_sparse_decode_incremental_append",
 ]
 
 
@@ -366,11 +362,13 @@ def _forward_batch_item_hash_to_rid(forward_batch) -> dict:
     return mapping
 
 
-def _register_grpo_request_meta_for_forward_batch(forward_batch) -> None:
-    if not (GRPO_SIM_CACHE_ENABLED or VLM_CACHEBLEND_ENABLED):
+def _register_rollout_request_meta_for_forward_batch(forward_batch) -> None:
+    if not VLM_CACHEBLEND_ENABLED:
         return
     try:
-        from sglang.srt.mem_cache.grpo_similarity_cache import register_request_meta
+        from sglang.srt.mem_cache.rollout_request_metadata import (
+            register_request_meta,
+        )
     except Exception:
         return
 
@@ -453,6 +451,10 @@ def _pop_vlm_cacheblend_log_fields() -> Optional[dict]:
             stats.sparse_decode_used = True
             stats.sparse_decode_kept_tokens = int(sparse.kept_tokens)
             stats.sparse_decode_dropped_tokens = int(sparse.dropped_tokens)
+            stats.sparse_decode_direct_source = bool(sparse.direct_source)
+            stats.sparse_decode_incremental_append = bool(
+                sparse.incremental_append
+            )
         return stats.to_dict() if stats is not None else None
     except Exception:
         return None
@@ -610,6 +612,20 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # Initialize the model runner
         self.initialize(min_per_gpu_memory)
         self.check_quantized_moe_compatibility()
+
+        # Sparse decode uses a fused Triton page-table compactor. Compile its finite
+        # block-size buckets before the HTTP server becomes ready; compiling lazily in
+        # the first rollout fragments continuous batches and charges seconds of JIT
+        # work to the first measured training step.
+        if self.device == "cuda" and VLM_CACHEBLEND_ENABLED:
+            from sglang.srt.mem_cache import vlm_cacheblend
+
+            if vlm_cacheblend.sparse_decode_enabled():
+                from sglang.srt.mem_cache.sparse_decode_kernels import (
+                    warmup_sparse_decode_kernels,
+                )
+
+                warmup_sparse_decode_kernels(torch.device("cuda"))
 
         # Temporary cached values
         self.support_pp = (
@@ -2456,8 +2472,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
     ) -> ModelRunnerOutput:
         self.forward_pass_id += 1
         inference_step_start = time.perf_counter()
-        if LOG_INFERENCE_STEP or GRPO_SIM_CACHE_ENABLED:
-            _register_grpo_request_meta_for_forward_batch(forward_batch)
+        if LOG_INFERENCE_STEP:
             _set_qwen25_vl_profile_context(
                 getattr(forward_batch, "training_global_step", -1),
                 self.forward_pass_id,
@@ -2469,7 +2484,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 item_hash_to_rid=_forward_batch_item_hash_to_rid(forward_batch),
             )
         if VLM_CACHEBLEND_ENABLED:
-            _register_grpo_request_meta_for_forward_batch(forward_batch)
+            _register_rollout_request_meta_for_forward_batch(forward_batch)
             _set_vlm_cacheblend_context(
                 forward_batch,
                 getattr(self.model_config, "image_token_id", None),

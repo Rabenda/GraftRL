@@ -74,16 +74,6 @@ _SGLANG_RUNTIME_ENV_KEYS = (
     "SGLANG_LOG_INFERENCE_STEP",
     "SGLANG_INFERENCE_LOG_DIR",
     "SGLANG_INFERENCE_LOG_SUFFIX",
-    "SGLANG_GRPO_SIM_CACHE",
-    "SGLANG_GRPO_SIM_RAW_COSINE_THRESH",
-    "SGLANG_GRPO_SIM_RAW_COSINE_RATIO",
-    "SGLANG_GRPO_REUSE_MODE",
-    "SGLANG_GRPO_ENABLE_PARTIAL_VIT_REUSE",
-    "SGLANG_GRPO_PARTIAL_REUSE_THRESHOLD",
-    "SGLANG_GRPO_PARTIAL_REUSE_GRANULARITY",
-    "SGLANG_GRPO_SIM_TARGET_TURNS",
-    "SGLANG_GRPO_SIM_MAX_GROUPS",
-    "SGLANG_GRPO_SIM_MAX_REQUEST_META",
     "TORCH_CUDA_ARCH_LIST",
     "PYTHONPATH",
 )
@@ -289,6 +279,17 @@ class SGLangHttpServer:
             f"{nnodes=}, {cuda_visible_devices=}, role={disaggregation_role}"
         )
         os.environ[visible_devices_keyword] = cuda_visible_devices
+        # LLMServerManager also sets this before creating replicas, but Ray actors do
+        # not reliably inherit driver-side environment mutations made after Ray init.
+        # Set it again in the process that launches SGLang's scheduler children so the
+        # model-side donor hook can actually publish prefill completion.
+        if os.environ.get("SGLANG_VLM_CACHEBLEND", "0").lower() in (
+            "1",
+            "true",
+            "yes",
+            "on",
+        ):
+            os.environ.setdefault("SGLANG_VLM_CACHEBLEND_PREFILL_READY_NOTIFY", "1")
 
         assert disaggregation_role in ("null", "prefill", "decode"), (
             f"disaggregation_role must be 'null'|'prefill'|'decode', got {disaggregation_role!r}"
@@ -778,7 +779,9 @@ class SGLangHttpServer:
             generate_request.lora_path = SGLANG_LORA_NAME
 
         try:
-            from sglang.srt.mem_cache.grpo_similarity_cache import register_request_meta
+            from sglang.srt.mem_cache.rollout_request_metadata import (
+                register_request_meta,
+            )
 
             register_request_meta(
                 request_id,
@@ -846,6 +849,8 @@ class SGLangHttpServer:
         prefill_launch_delay_ms = _meta_timing_ms(meta_info, "prefill_launch_delay")
         prefill_launch_latency_ms = _meta_timing_ms(meta_info, "prefill_launch_latency")
         _append_verl_sglang_generate_log(
+            server_pid=os.getpid(),
+            replica_rank=self.replica_rank,
             request_id=request_id,
             agent_request_id=agent_request_id or "",
             agent_turn="" if agent_turn is None else int(agent_turn),

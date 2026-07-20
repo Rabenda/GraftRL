@@ -51,6 +51,32 @@ def test_cacheblend_barrier_log_splits_wait_and_server_time() -> None:
     assert '"wait_policy": wait_policy' in source
 
 
+def test_cacheblend_prefill_ready_is_wired_before_server_start() -> None:
+    source = LLM_SERVER_SOURCE.read_text(encoding="utf-8")
+    server_source = SGLANG_SERVER_SOURCE.read_text(encoding="utf-8")
+    coordinator = source.index("await instance._init_cacheblend_coordinator()")
+    servers = source.index("await instance._initialize_llm_servers()")
+    assert coordinator < servers
+    assert "await self.global_cacheblend_coordinator.reset.remote()" in source
+    assert 'os.environ.setdefault("SGLANG_VLM_CACHEBLEND_PREFILL_READY_NOTIFY", "1")' in source
+    assert 'os.environ.setdefault("SGLANG_VLM_CACHEBLEND_PREFILL_READY_NOTIFY", "1")' in server_source
+
+
+def test_cacheblend_turn0_uses_automatic_prefix_donor() -> None:
+    source = LLM_SERVER_SOURCE.read_text(encoding="utf-8")
+    assert 'SGLANG_VLM_CACHEBLEND_PREFILL_DONOR", "1"' in source
+    assert 'request_suffix="_cacheblend_prefix_donor"' in source
+    assert "prefix_params[\"max_new_tokens\"]" in source
+    assert "and _vlm_cacheblend_prefill_donor_enabled()" in source
+
+
+def test_cacheblend_missing_global_step_fails_closed_at_rollout_boundary() -> None:
+    source = LLM_SERVER_SOURCE.read_text(encoding="utf-8")
+    assert "return step if step >= 0 else None" in source
+    assert "rollout-side CacheBlend routing/barrier is disabled for this request" in source
+    assert "if _vlm_cacheblend_enabled() and cacheblend_agent_uid:" in source
+
+
 def test_cacheblend_metadata_registration_failure_is_logged() -> None:
     source = SGLANG_SERVER_SOURCE.read_text(encoding="utf-8")
     assert "Failed to register SGLang request metadata" in source

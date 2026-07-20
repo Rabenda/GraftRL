@@ -41,6 +41,16 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _clear_model_version_bound_runtime_state() -> None:
+    """Release cached tensors that were produced by the current model weights."""
+    from sglang.srt.managers.mm_utils import clear_mm_embedding_cache
+    from sglang.srt.mem_cache import vlm_cacheblend
+
+    clear_mm_embedding_cache()
+    if vlm_cacheblend.cacheblend_enabled():
+        vlm_cacheblend.clear_runtime_state()
+
+
 class SchedulerUpdateWeightsMixin:
 
     def update_weights_from_disk(
@@ -49,6 +59,7 @@ class SchedulerUpdateWeightsMixin:
         """In-place update of the weights from disk."""
         success, message = self.tp_worker.update_weights_from_disk(recv_req)
         if success:
+            _clear_model_version_bound_runtime_state()
             if recv_req.flush_cache:
                 flush_cache_success = self.flush_cache()
                 assert flush_cache_success, "Cache flush failed after updating weights"
@@ -77,6 +88,7 @@ class SchedulerUpdateWeightsMixin:
         """Update the online model parameter."""
         success, message = self.tp_worker.update_weights_from_distributed(recv_req)
         if success:
+            _clear_model_version_bound_runtime_state()
             if recv_req.flush_cache:
                 flush_cache_success = self.flush_cache()
                 assert flush_cache_success, "Cache flush failed after updating weights"
@@ -92,6 +104,7 @@ class SchedulerUpdateWeightsMixin:
         success, message = worker.update_weights_from_tensor(recv_req)
         # TODO extract common code b/t update_weights_from_distributed and update_weights_from_tensor later
         if success:
+            _clear_model_version_bound_runtime_state()
             if recv_req.flush_cache:
                 flush_cache_success = self.flush_cache()
                 assert flush_cache_success, "Cache flush failed after updating weights"
@@ -106,6 +119,7 @@ class SchedulerUpdateWeightsMixin:
         """Update the online model parameter from IPC for checkpoint-engine integration."""
         success, message = self.tp_worker.update_weights_from_ipc(recv_req)
         if success:
+            _clear_model_version_bound_runtime_state()
             if recv_req.flush_cache:
                 flush_cache_success = self.flush_cache()
                 assert flush_cache_success, "Cache flush failed after updating weights"
@@ -129,6 +143,15 @@ class SchedulerUpdateWeightsMixin:
 
         if tags is None or len(tags) == 0:
             tags = GPU_MEMORY_ALL_TYPES
+
+        # Encoder outputs and donor tensors live outside SGLang's normal weight/KV
+        # allocators. Clear them before offload so sleep does not retain model-bound
+        # tensors or expose stale state after resume.
+        if (
+            GPU_MEMORY_TYPE_KV_CACHE in tags
+            or GPU_MEMORY_TYPE_WEIGHTS in tags
+        ):
+            _clear_model_version_bound_runtime_state()
 
         for tag in tags:
             self.offload_tags.add(tag)

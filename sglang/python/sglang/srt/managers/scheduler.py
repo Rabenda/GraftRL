@@ -2482,6 +2482,14 @@ class Scheduler(
     def flush_cache(self):
         """Flush the memory pool and cache."""
         if self._is_no_request():
+            # These tensors reference either the current model version or KV-pool
+            # locations. Release them before clearing the allocators.
+            from sglang.srt.managers.mm_utils import clear_mm_embedding_cache
+            from sglang.srt.mem_cache import vlm_cacheblend
+
+            clear_mm_embedding_cache()
+            if vlm_cacheblend.cacheblend_enabled():
+                vlm_cacheblend.clear_runtime_state()
             self.cur_batch = None
             self.last_batch = None
             self.tree_cache.reset()
@@ -2507,7 +2515,7 @@ class Scheduler(
         return success
 
     def get_internal_state(self, recv_req: GetInternalStateReq):
-        ret = vars(get_global_server_args())
+        ret = dict(vars(get_global_server_args()))
         ret["last_gen_throughput"] = self.last_gen_throughput
         ret["memory_usage"] = {
             "weight": round(self.tp_worker.model_runner.weight_load_mem_usage, 2),
@@ -2518,7 +2526,6 @@ class Scheduler(
             "graph": round(self.tp_worker.model_runner.graph_mem_usage, 2),
         }
         ret["effective_max_running_requests_per_dp"] = self.max_running_requests
-
         if not self.spec_algorithm.is_none() and self.spec_total_num_forward_ct > 0:
             ret["avg_spec_accept_length"] = (
                 self.spec_total_num_accepted_tokens / self.spec_total_num_forward_ct

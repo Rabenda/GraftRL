@@ -30,6 +30,12 @@ def _cfg(**kw):
         target_turn=1,
         max_groups=8,
         verbose=False,
+        # Unit tests opt into runtime gates explicitly so tensor-op invariants remain
+        # independent of production no-regression defaults.
+        min_reused_tokens=0,
+        min_reuse_ratio=0.0,
+        donor_reject_min_similarity=-1.0,
+        donor_reject_max_bad_ratio=1.0,
     )
     base.update(kw)
     return cb.VLMCacheBlendConfig(**base)
@@ -56,6 +62,81 @@ def test_cacheblend_select_env_alias_and_precedence():
             os.environ["SGLANG_VLM_CACHEBLEND_SELECTOR"] = old_selector
         cb.reload_config_from_env()
     print("ok test_cacheblend_select_env_alias_and_precedence")
+
+
+def test_sparse_decode_default_has_profitability_floor():
+    ratio_name = "SGLANG_VLM_CACHEBLEND_SPARSE_DECODE_MIN_DROP_RATIO"
+    tokens_name = "SGLANG_VLM_CACHEBLEND_SPARSE_DECODE_MIN_DROPPED_TOKENS"
+    old_ratio = os.environ.pop(ratio_name, None)
+    old_tokens = os.environ.pop(tokens_name, None)
+    try:
+        cfg = cb.VLMCacheBlendConfig.from_env()
+        assert cfg.sparse_decode_min_drop_ratio == 0.10
+        assert cfg.sparse_decode_min_dropped_tokens == 4096
+    finally:
+        if old_ratio is not None:
+            os.environ[ratio_name] = old_ratio
+        if old_tokens is not None:
+            os.environ[tokens_name] = old_tokens
+        cb.reload_config_from_env()
+    print("ok test_sparse_decode_default_has_profitability_floor")
+
+
+def test_sparse_decode_reuses_existing_host_metadata():
+    class DeviceFallbackMustNotRun(torch.Tensor):
+        @staticmethod
+        def __new__(cls, value):
+            return torch.Tensor._make_subclass(cls, value, False)
+
+        def detach(self):
+            raise AssertionError("unexpected decode GPU-to-CPU metadata copy")
+
+    class Req:
+        def __init__(self, req_pool_idx):
+            self.req_pool_idx = req_pool_idx
+
+    class Batch:
+        seq_lens_cpu = torch.tensor([5, 9], dtype=torch.int32)
+        reqs = [Req(7), Req(11)]
+
+    lens, reqs = cb._sparse_decode_host_metadata(
+        Batch(),
+        cache_seqlens=DeviceFallbackMustNotRun(torch.tensor([5, 9])),
+        req_pool_indices=DeviceFallbackMustNotRun(torch.tensor([7, 11])),
+        batch_size=2,
+        max_len=8,
+    )
+    assert lens == [5, 8]
+    assert reqs == [7, 11]
+    print("ok test_sparse_decode_reuses_existing_host_metadata")
+
+
+def test_prefill_defaults_have_no_regression_gates():
+    cfg = cb.VLMCacheBlendConfig.from_env()
+    assert cfg.min_reused_tokens == 64
+    assert cfg.min_reuse_ratio == 0.20
+    assert cfg.donor_reject_min_similarity == 0.50
+    assert cfg.donor_reject_max_bad_ratio == 0.25
+    print("ok test_prefill_defaults_have_no_regression_gates")
+
+
+def test_request_context_missing_global_step_fails_closed():
+    cb._CONFIG = _cfg(target_turns="all")
+
+    class Req:
+        rid = "req_t1"
+        agent_uid = "group"
+        agent_turn = 1
+        training_global_step = None
+
+    class Batch:
+        training_global_step = -1
+
+    contexts = cb._build_request_contexts_for_req(
+        Batch(), Req(), 0, image_token_id=151655
+    )
+    assert contexts == []
+    print("ok test_request_context_missing_global_step_fails_closed")
 
 
 def test_blend_kv():
@@ -391,6 +472,152 @@ def test_donor_store_lru():
     print("ok test_donor_store_lru")
 
 
+def test_donor_store_byte_budget_and_atomic_publish():
+    store = cb.DonorKVStore(max_groups=8, max_bytes=24)
+
+    def entry(key, elements):
+        donor = cb.DonorEntry(
+            group_key=(key,),
+            n_image_tokens=elements,
+            grid_sig=(1, 1, elements),
+            complete=True,
+        )
+        donor.record_layer(0, torch.zeros(elements), torch.zeros(elements))
+        return donor
+
+    # Two fp32 tensors x two elements = 16 bytes. Publishing a second donor evicts
+    # the first one to preserve the byte limit, independent of max_groups.
+    assert store.publish(entry("a", 2))
+    assert store.resident_bytes == 16
+    assert store.publish(entry("b", 2))
+    assert store.lookup(("a",)) is None
+    assert store.lookup(("b",)) is not None
+    assert store.resident_bytes == 16
+
+    # A donor larger than the entire budget is never made visible.
+    assert not store.publish(entry("oversized", 4))
+    assert store.lookup(("oversized",)) is None
+    assert store.resident_bytes == 16
+
+    incomplete = entry("incomplete", 1)
+    incomplete.complete = False
+    try:
+        store.publish(incomplete)
+        raise AssertionError("incomplete donor was published")
+    except ValueError:
+        pass
+
+    store.clear()
+    assert len(store) == 0 and store.resident_bytes == 0
+    print("ok test_donor_store_byte_budget_and_atomic_publish")
+
+
+def test_donor_store_reserves_before_allocation():
+    store = cb.DonorKVStore(max_groups=2, max_bytes=32)
+
+    def entry(key):
+        donor = cb.DonorEntry(
+            group_key=(key,),
+            n_image_tokens=2,
+            grid_sig=(1, 1, 2),
+            complete=True,
+        )
+        donor.record_layer(0, torch.zeros(2), torch.zeros(2))  # 16 bytes
+        return donor
+
+    assert store.publish(entry("old"))
+    # Reserving the full 32-byte budget evicts old before the caller allocates.
+    assert store.reserve(("new",), 32)
+    assert store.lookup(("old",)) is None
+    assert store.resident_bytes == 0
+    # Other reservations cannot overcommit the promised bytes.
+    assert not store.reserve(("other",), 1)
+    store.cancel_reservation(("new",))
+    assert store.reserve(("other",), 1)
+    store.cancel_reservation(("other",))
+    print("ok test_donor_store_reserves_before_allocation")
+
+
+def test_capture_rejects_oversized_donor_before_clone():
+    class NoCloneTensor(torch.Tensor):
+        clone_called = False
+
+        @staticmethod
+        def __new__(cls, value):
+            return torch.Tensor._make_subclass(cls, value, False)
+
+        def clone(self, *args, **kwargs):
+            type(self).clone_called = True
+            raise AssertionError("oversized donor reached clone")
+
+    class Pool:
+        def __init__(self):
+            self.k = NoCloneTensor(torch.zeros(8, 2, 4))
+            self.v = NoCloneTensor(torch.zeros(8, 2, 4))
+
+        def get_key_buffer(self, layer_id):
+            return self.k
+
+        def get_value_buffer(self, layer_id):
+            return self.v
+
+    class Batch:
+        token_to_kv_pool = Pool()
+
+    old_store = cb._DONOR_STORE
+    try:
+        # Four positions x (K+V) x 2x4 fp32 = 256 bytes; cap at 128.
+        cb._DONOR_STORE = cb.DonorKVStore(max_groups=4, max_bytes=128)
+        captured = cb.capture_donor_kv(
+            Batch(),
+            layer_ids=[0],
+            img_locs=torch.tensor([0, 1, 2, 3]),
+            group_key=("oversized",),
+            grid_sig=(1, 2, 2),
+            positions=None,
+        )
+        assert captured is None
+        assert not NoCloneTensor.clone_called
+        assert len(cb.get_donor_store()) == 0
+    finally:
+        cb._DONOR_STORE = old_store
+    print("ok test_capture_rejects_oversized_donor_before_clone")
+
+
+def test_clear_runtime_state_releases_model_bound_state():
+    cb._DONOR_STORE = cb.DonorKVStore(max_groups=4)
+    donor = cb.DonorEntry(
+        group_key=("g",),
+        n_image_tokens=1,
+        grid_sig=(1, 1, 1),
+        complete=True,
+    )
+    donor.record_layer(0, torch.zeros(1), torch.zeros(1))
+    assert cb.get_donor_store().publish(donor)
+
+    cb._SPARSE_DECODE_STORE = cb.SparseDecodePlanStore(max_plans=4)
+    cb._SPARSE_DECODE_STORE.put(
+        cb.SparseDecodePlan(
+            request_id="r",
+            req_pool_idx=1,
+            drop_locs=torch.tensor([3]),
+            n_image_tokens=1,
+            n_drop_tokens=1,
+        )
+    )
+    cb.set_request_context(
+        cb.RequestContext(
+            group_key=("g",), role="donor", image_token_id=1, global_step=1
+        )
+    )
+
+    cb.clear_runtime_state()
+    assert len(cb.get_donor_store()) == 0
+    assert len(cb.get_sparse_decode_store()) == 0
+    assert cb.get_request_context() is None
+    print("ok test_clear_runtime_state_releases_model_bound_state")
+
+
 def test_kv_deviation_and_blend_full():
     # blend with full recompute mask must equal recomputed tensors entirely.
     n, h, d = 7, 2, 4
@@ -598,6 +825,80 @@ def test_fast_apply_skips_direct_write_for_pool_reading_backend():
     print("ok test_fast_apply_skips_direct_write_for_pool_reading_backend")
 
 
+def test_fast_apply_pool_indices_cache_invalidates_on_mask_change():
+    """Pool scatter indices are reused across layers and follow a new mask."""
+    Batch, plan, donor_k, donor_v = _apply_fixture(fast_apply=True)
+    cache_locs = torch.tensor([2, 3, 5, 8, 9], dtype=torch.long)
+    k = torch.ones(5, 1, 2)
+    v = torch.ones(5, 1, 2) * 2
+    Batch.token_to_kv_pool.k[cache_locs] = k
+    Batch.token_to_kv_pool.v[cache_locs] = v
+
+    cb.apply_recipient_kv_blend_for_layer(
+        forward_batch=Batch(),
+        layer_id=0,
+        reads_kv_from_pool=True,
+    )
+    cached0 = plan.apply_cache["reuse_indices"]
+    # Same finalized plan: the exact index tensors should be reused.
+    cb.apply_recipient_kv_blend_for_layer(
+        forward_batch=Batch(),
+        layer_id=0,
+        reads_kv_from_pool=True,
+    )
+    cached1 = plan.apply_cache["reuse_indices"]
+    assert cached1[1] is cached0[1]
+    assert cached1[2] is cached0[2]
+
+    # Simulate bootstrap selecting a different reuse set. Tensor replacement and the
+    # updated count must invalidate both source and destination indices.
+    plan.recompute_mask = torch.tensor([True, False, False])
+    plan.recomputed_tokens = 1
+    plan.reused_tokens = 2
+    Batch.token_to_kv_pool.k.zero_()
+    Batch.token_to_kv_pool.v.zero_()
+    cb.apply_recipient_kv_blend_for_layer(
+        forward_batch=Batch(),
+        layer_id=0,
+        reads_kv_from_pool=True,
+    )
+    cached2 = plan.apply_cache["reuse_indices"]
+    assert cached2[0] != cached1[0]
+    assert cached2[1].tolist() == [1, 2]
+    assert cached2[2].tolist() == [5, 8]
+    assert torch.equal(Batch.token_to_kv_pool.k[5], donor_k[1])
+    assert torch.equal(Batch.token_to_kv_pool.k[8], donor_k[2])
+    assert torch.equal(Batch.token_to_kv_pool.k[3], torch.zeros(1, 2))
+    cb.clear_recipient_blend_plans()
+    print("ok test_fast_apply_pool_indices_cache_invalidates_on_mask_change")
+
+
+def test_fast_apply_pool_indices_support_inference_tensors():
+    """Inference tensors have no version counter but are the serving default."""
+    cb._CONFIG = _cfg(fast_path=True, fast_apply=True)
+    with torch.inference_mode():
+        mask = torch.tensor([False, True, False])
+        img_locs = torch.tensor([3, 5, 8], dtype=torch.long)
+    plan = cb.RecipientKVBlendPlan(
+        request_id="inference",
+        group_key=("g",),
+        img_locs=img_locs,
+        positions=None,
+        recompute_mask=mask,
+        grid_sig=(1, 1, 3),
+        n_image_tokens=3,
+        reused_tokens=2,
+        recomputed_tokens=1,
+        pos_mode="same",
+        select_mode="topr",
+    )
+    donor_idx, pool_dst = cb._apply_reuse_indices(plan, torch.device("cpu"))
+    assert donor_idx.tolist() == [0, 2]
+    assert pool_dst.tolist() == [3, 8]
+    assert plan.apply_cache["reuse_indices"][1] is donor_idx
+    print("ok test_fast_apply_pool_indices_support_inference_tensors")
+
+
 def test_fast_apply_reuse_indices_cache_invalidates_on_mask_change():
     """Cache keyed by mask sum: finalizing recompute mask must recompute indices."""
     cb._CONFIG = _cfg(fast_path=True, fast_apply=True)
@@ -621,6 +922,8 @@ def test_fast_apply_reuse_indices_cache_invalidates_on_mask_change():
     assert idx0.tolist() == [], idx0.tolist()
     # Bootstrap finalizes: only index 1 recomputes now -> reuse the other three.
     plan.recompute_mask = torch.tensor([False, True, False, False])
+    plan.recomputed_tokens = 1
+    plan.reused_tokens = 3
     idx1 = cb.recipient_reuse_token_indices(cache_locs)
     assert idx1.tolist() == [1, 4, 6], idx1.tolist()
     cb.clear_recipient_blend_plans()
@@ -887,6 +1190,41 @@ def test_low_value_gate_disables_small_reuse_set():
     print("ok test_low_value_gate_disables_small_reuse_set")
 
 
+def test_non_deferred_low_value_plan_is_removed_from_hot_path():
+    cb._CONFIG = _cfg(
+        select_mode="topr",
+        recompute_ratio=0.5,
+        min_reused_tokens=5,
+        min_reuse_ratio=0.0,
+    )
+    cb._DONOR_STORE = cb.DonorKVStore(max_groups=4)
+    donor = cb.DonorEntry(
+        group_key=("small",),
+        n_image_tokens=4,
+        grid_sig=(1, 1, 4),
+        positions=torch.arange(12).reshape(3, 4),
+        complete=True,
+    )
+    donor.record_layer(0, torch.zeros(4, 1, 2), torch.zeros(4, 1, 2))
+    assert cb.get_donor_store().publish(donor)
+    ctx = cb.RequestContext(
+        group_key=("small",),
+        role="recipient",
+        image_token_id=1,
+        request_id="small_req",
+        grid_sig=(1, 1, 4),
+    )
+    plan, stats = cb.build_recipient_kv_blend_plan(
+        ctx,
+        img_locs=torch.arange(4, dtype=torch.long),
+        img_positions=torch.arange(12).reshape(3, 4),
+    )
+    assert plan is None
+    assert stats.reused_tokens == 0 and stats.recomputed_tokens == 4
+    assert stats.fallback_reason.startswith("low_value_gate:")
+    print("ok test_non_deferred_low_value_plan_is_removed_from_hot_path")
+
+
 def test_finalize_recipient_plan_similarity_picks_low_cosine():
     # sim finalize must recompute low-cosine tokens and reuse high-cosine tokens.
     cfg = _cfg(select_mode="sim", sim_threshold=0.5, recompute_ratio=0.5)
@@ -930,6 +1268,81 @@ def test_finalize_recipient_plan_similarity_picks_low_cosine():
     assert not bool(plan.recompute_mask[0]) and not bool(plan.recompute_mask[3])
     assert plan.recomputed_tokens == 2 and plan.reused_tokens == 2
     print("ok test_finalize_recipient_plan_similarity_picks_low_cosine")
+
+
+def test_finalize_recipient_plan_similarity_rejects_unsafe_donor():
+    # Three below-threshold tokens exceed the 25% recompute budget.  They must not be
+    # silently capped to one recomputed token while two known-bad donor tokens are used.
+    cfg = _cfg(select_mode="sim", sim_threshold=0.5, recompute_ratio=0.25)
+    donor_k = torch.tensor([[[1.0, 0.0]]] * 4)
+    recipient_k = torch.tensor(
+        [
+            [[1.0, 0.0]],
+            [[-1.0, 0.0]],
+            [[-1.0, 0.0]],
+            [[-1.0, 0.0]],
+        ]
+    )
+    plan = cb.RecipientKVBlendPlan(
+        request_id="reject",
+        group_key=("g",),
+        img_locs=torch.arange(4, dtype=torch.long),
+        positions=None,
+        recompute_mask=torch.ones(4, dtype=torch.bool),
+        grid_sig=(1, 1, 4),
+        n_image_tokens=4,
+        reused_tokens=0,
+        recomputed_tokens=4,
+        pos_mode="same",
+        select_mode="sim",
+        bootstrap_layer_id=0,
+        pending_deviation=True,
+    )
+    cb.finalize_recipient_plan_similarity(plan, recipient_k, donor_k, cfg)
+    assert bool(plan.recompute_mask.all())
+    assert plan.recomputed_tokens == 4 and plan.reused_tokens == 0
+    assert plan.gate_reason.startswith("donor_reject:")
+    print("ok test_finalize_recipient_plan_similarity_rejects_unsafe_donor")
+
+
+def test_finalize_recipient_plan_deviation_rejects_obvious_mismatch():
+    cfg = _cfg(
+        select_mode="kvdev",
+        recompute_ratio=0.25,
+        donor_reject_min_similarity=0.5,
+        donor_reject_max_bad_ratio=0.25,
+        min_reused_tokens=0,
+        min_reuse_ratio=0.0,
+    )
+    donor_k = torch.tensor([[[1.0, 0.0]]] * 4)
+    recipient_k = torch.tensor(
+        [
+            [[1.0, 0.0]],
+            [[-1.0, 0.0]],
+            [[-1.0, 0.0]],
+            [[-1.0, 0.0]],
+        ]
+    )
+    plan = cb.RecipientKVBlendPlan(
+        request_id="kvdev_reject",
+        group_key=("g",),
+        img_locs=torch.arange(4, dtype=torch.long),
+        positions=None,
+        recompute_mask=torch.ones(4, dtype=torch.bool),
+        grid_sig=(1, 1, 4),
+        n_image_tokens=4,
+        reused_tokens=0,
+        recomputed_tokens=4,
+        pos_mode="same",
+        select_mode="kvdev",
+        bootstrap_layer_id=0,
+        pending_deviation=True,
+    )
+    cb.finalize_recipient_plan_deviation(plan, recipient_k, donor_k, cfg)
+    assert bool(plan.recompute_mask.all())
+    assert plan.recomputed_tokens == 4 and plan.reused_tokens == 0
+    assert plan.gate_reason.startswith("donor_reject:absolute_similarity:")
+    print("ok test_finalize_recipient_plan_deviation_rejects_obvious_mismatch")
 
 
 def test_build_plan_deferred_for_sim():
@@ -1125,6 +1538,130 @@ def test_sparse_decode_plan_register_and_build_batch():
     os.environ["SGLANG_VLM_CACHEBLEND_SPARSE_DECODE"] = "0"
     cb.reload_config_from_env()
     print("ok test_sparse_decode_plan_register_and_build_batch")
+
+
+def test_sparse_decode_position_plan_avoids_physical_location_search():
+    """Production plans resolve semantic columns once at prefill.
+
+    Decode must keep dropping those columns after physical KV locations change, and
+    keep_recent must still protect a column until the causal tail moves past it.
+    """
+    os.environ["SGLANG_VLM_CACHEBLEND"] = "1"
+    os.environ["SGLANG_VLM_CACHEBLEND_SPARSE_DECODE"] = "1"
+    os.environ["SGLANG_VLM_CACHEBLEND_SPARSE_DECODE_KEEP_RECENT"] = "2"
+    os.environ["SGLANG_VLM_CACHEBLEND_SPARSE_DECODE_KEEP_FIRST"] = "0"
+    os.environ["SGLANG_VLM_CACHEBLEND_SPARSE_DECODE_MIN_DROPPED_TOKENS"] = "0"
+    os.environ["SGLANG_VLM_CACHEBLEND_SPARSE_DECODE_MIN_DROP_RATIO"] = "0"
+    cb.reload_config_from_env()
+    cb.get_sparse_decode_store().clear()
+
+    plan = cb.RecipientKVBlendPlan(
+        request_id="reqPos",
+        group_key=("g",),
+        img_locs=torch.tensor([101, 102, 103]),
+        positions=None,
+        recompute_mask=torch.tensor([False, True, False]),
+        grid_sig=(1, 1, 1),
+        n_image_tokens=3,
+        reused_tokens=2,
+        recomputed_tokens=1,
+        pos_mode="same",
+        select_mode="kvdev",
+        pending_deviation=False,
+    )
+
+    class Pool:
+        req_to_token = torch.tensor(
+            [[10, 101, 102, 103, 20, 21, 22, 23]], dtype=torch.int32
+        )
+
+    class PrefillBatch:
+        req_to_token_pool = Pool()
+        seq_lens_cpu = [8]
+
+    drop_positions = cb._resolve_sparse_decode_drop_positions(
+        PrefillBatch(), plan, req_pool_idx=0, req_index=0
+    )
+    assert drop_positions is not None
+    assert drop_positions.tolist() == [1, 3]
+    sparse_plan = cb.register_sparse_decode_plan_from_blend(
+        plan, req_pool_idx=0, drop_positions=drop_positions
+    )
+    assert sparse_plan is not None
+    assert sparse_plan.drop_positions.tolist() == [1, 3]
+
+    class DecodeBatch:
+        req_pool_indices = torch.tensor([0], dtype=torch.long)
+        seq_lens_cpu = [8]
+
+    # Physical locations differ from prefill, but semantic columns 1 and 3 are stable.
+    page_table = torch.tensor(
+        [[50, 501, 502, 503, 60, 61, 62, 63]], dtype=torch.int32
+    )
+    batch = cb.build_sparse_decode_batch(
+        DecodeBatch(),
+        page_table=page_table,
+        cache_seqlens=torch.tensor([8], dtype=torch.int32),
+        page_size=1,
+    )
+    assert batch is not None
+    assert batch.dropped_tokens == 2
+    assert batch.page_table[0, :6].tolist() == [50, 502, 60, 61, 62, 63]
+
+    cb.get_sparse_decode_store().clear()
+    os.environ["SGLANG_VLM_CACHEBLEND_SPARSE_DECODE"] = "0"
+    cb.reload_config_from_env()
+    print("ok test_sparse_decode_position_plan_avoids_physical_location_search")
+
+
+def test_sparse_decode_static_batch_cache_invalidates_on_plan_replacement():
+    """A recycled req_pool_idx must never reuse the previous request's host plan."""
+    os.environ["SGLANG_VLM_CACHEBLEND"] = "1"
+    os.environ["SGLANG_VLM_CACHEBLEND_SPARSE_DECODE"] = "1"
+    os.environ["SGLANG_VLM_CACHEBLEND_SPARSE_DECODE_KEEP_RECENT"] = "0"
+    os.environ["SGLANG_VLM_CACHEBLEND_SPARSE_DECODE_MIN_DROP_RATIO"] = "0"
+    cb.reload_config_from_env()
+    store = cb.get_sparse_decode_store()
+    store.clear()
+
+    def put(position):
+        values = torch.tensor([position], dtype=torch.long)
+        store.put(
+            cb.SparseDecodePlan(
+                request_id=f"req-{position}",
+                req_pool_idx=0,
+                drop_locs=values,
+                n_image_tokens=1,
+                n_drop_tokens=1,
+                drop_positions=values,
+                drop_positions_host=(position,),
+                keep_recent=0,
+            )
+        )
+
+    class Batch:
+        req_pool_indices = torch.tensor([0], dtype=torch.long)
+        seq_lens_cpu = [4]
+
+    page_table = torch.tensor([[10, 11, 12, 13]], dtype=torch.int32)
+    cache_seqlens = torch.tensor([4], dtype=torch.int32)
+    put(1)
+    first = cb.build_sparse_decode_batch(
+        Batch(), page_table=page_table, cache_seqlens=cache_seqlens, page_size=1
+    )
+    assert first is not None and first.page_table[0, :3].tolist() == [10, 12, 13]
+
+    # Same pool slot and batch key, different semantic request/position.
+    put(2)
+    second = cb.build_sparse_decode_batch(
+        Batch(), page_table=page_table, cache_seqlens=cache_seqlens, page_size=1
+    )
+    assert second is not None and second.page_table[0, :3].tolist() == [10, 11, 13]
+
+    store.clear()
+    os.environ["SGLANG_VLM_CACHEBLEND_SPARSE_DECODE"] = "0"
+    cb.reload_config_from_env()
+    print("ok test_sparse_decode_static_batch_cache_invalidates_on_plan_replacement")
 
 
 def test_sparse_decode_keep_recent_protects_tail():
@@ -1335,11 +1872,15 @@ def test_sparse_decode_stats_to_dict():
         sparse_decode_used=True,
         sparse_decode_kept_tokens=12,
         sparse_decode_dropped_tokens=4,
+        sparse_decode_direct_source=True,
+        sparse_decode_incremental_append=True,
     )
     d = stats.to_dict()
     assert d["cacheblend_sparse_decode_used"] == "1"
     assert d["cacheblend_sparse_decode_kept_tokens"] == "12"
     assert d["cacheblend_sparse_decode_dropped_tokens"] == "4"
+    assert d["cacheblend_sparse_decode_direct_source"] == "1"
+    assert d["cacheblend_sparse_decode_incremental_append"] == "1"
     print("ok test_sparse_decode_stats_to_dict")
 
 

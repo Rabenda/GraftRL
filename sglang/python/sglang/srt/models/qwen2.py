@@ -703,7 +703,38 @@ class Qwen2Model(nn.Module):
                     ),
                 )
             )
+        self._cacheblend_notify_donor_groups(ctxs)
         _vlm_cacheblend.log_stats(self._cacheblend_aggregate_stats(stats_list))
+
+    @staticmethod
+    def _cacheblend_notify_donor_groups(ctxs) -> None:
+        """Publish readiness only after every target slot for a request is complete."""
+        groups = {}
+        for ctx in ctxs:
+            key = (
+                str(getattr(ctx, "request_id", "")),
+                int(getattr(ctx, "global_step", -1)),
+                str(getattr(ctx, "agent_uid", "")),
+                int(getattr(ctx, "agent_turn", -1)),
+            )
+            groups.setdefault(key, []).append(ctx)
+        store = _vlm_cacheblend.get_donor_store()
+        for group_ctxs in groups.values():
+            donor_ctx = next(
+                (ctx for ctx in group_ctxs if getattr(ctx, "role", None) == "donor"),
+                None,
+            )
+            if donor_ctx is None:
+                continue
+            complete = all(
+                (entry := store.lookup(ctx.group_key)) is not None
+                and bool(entry.complete)
+                for ctx in group_ctxs
+            )
+            if complete:
+                _vlm_cacheblend.notify_donor_prefill_ready(donor_ctx)
+            else:
+                _vlm_cacheblend.notify_donor_prefill_failed(donor_ctx)
 
     @staticmethod
     def _cacheblend_request_slices(forward_batch: ForwardBatch, input_ids: torch.Tensor):
@@ -819,9 +850,6 @@ class Qwen2Model(nn.Module):
                 positions=img_positions,
                 to_cpu=_vlm_cacheblend.get_config().donor_to_cpu,
             )
-            notified_ready = False
-            if donor_entry is not None:
-                notified_ready = _vlm_cacheblend.notify_donor_prefill_ready(ctx)
             return (
                 _vlm_cacheblend.CacheBlendStats(
                     role="donor",
@@ -830,9 +858,9 @@ class Qwen2Model(nn.Module):
                     pos_mode=_vlm_cacheblend.get_config().pos_mode,
                     select_mode=_vlm_cacheblend.get_config().select_mode,
                     fallback_reason=(
-                        "donor_captured_prefill_ready"
-                        if notified_ready
-                        else "donor_captured"
+                        "donor_captured"
+                        if donor_entry is not None
+                        else "donor_capture_rejected"
                     ),
                 ).finalize()
             )

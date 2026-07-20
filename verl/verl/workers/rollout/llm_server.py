@@ -44,8 +44,9 @@ logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 DEFAULT_ROUTING_CACHE_SIZE = 10000
 
 
-def _grpo_sim_cache_enabled() -> bool:
-    return os.environ.get("SGLANG_GRPO_SIM_CACHE", "0").lower() in (
+def _rollout_reuse_server_affinity_enabled() -> bool:
+    """Keep routing stable independently of whether a reuse backend is enabled."""
+    return os.environ.get("VERL_ROLLOUT_REUSE_SERVER_AFFINITY", "0").lower() in (
         "1",
         "true",
         "yes",
@@ -162,7 +163,7 @@ def _vlm_cacheblend_warmup_wait_timeout_s() -> float:
 
 
 def _vlm_cacheblend_prefill_donor_enabled() -> bool:
-    return os.environ.get("SGLANG_VLM_CACHEBLEND_PREFILL_DONOR", "0").lower() in (
+    return os.environ.get("SGLANG_VLM_CACHEBLEND_PREFILL_DONOR", "1").lower() in (
         "1",
         "true",
         "yes",
@@ -198,9 +199,10 @@ def _normalize_global_step(global_step: Optional[Any]) -> Optional[int]:
     if global_step is None:
         return None
     try:
-        return int(global_step)
+        step = int(global_step)
     except (TypeError, ValueError):
         return None
+    return step if step >= 0 else None
 
 
 def _cacheblend_group_key(agent_uid: str, global_step: Optional[Any]) -> str:
@@ -273,10 +275,21 @@ class GlobalCacheBlendCoordinator:
             self._changed.notify_all()
             return "donor"
 
-    async def mark_ready(self, key: str) -> None:
+    async def mark_ready(self, key: str) -> bool:
+        """Publish readiness without resurrecting a failed donor attempt.
+
+        The model-side prefill hook and the rollout-side generate completion both call
+        this method.  A capture failure can arrive from the model hook before generate
+        returns, so the later rollout callback must not turn ``failed`` back into
+        ``ready`` and release recipients toward a donor that does not exist.
+        """
         async with self._changed:
+            state = self._states.get(key)
+            if state not in ("in_progress", "ready"):
+                return False
             self._states[key] = "ready"
             self._changed.notify_all()
+            return True
 
     async def mark_failed(self, key: str) -> None:
         async with self._changed:
@@ -298,6 +311,13 @@ class GlobalCacheBlendCoordinator:
                 except asyncio.TimeoutError:
                     return False
             return self._states.get(key) == "ready"
+
+    async def reset(self) -> None:
+        """Drop detached-actor state when a new rollout manager starts."""
+        async with self._changed:
+            self._states.clear()
+            self._recent_steps.clear()
+            self._changed.notify_all()
 
     async def get_status(self) -> dict[str, Any]:
         async with self._changed:
@@ -602,12 +622,16 @@ class LLMServerClient:
         donor work into a one-token synthetic request: the first worker for a group
         submits it, the rest only wait for the coordinator to become ready.
         """
-        warmup_global_step = kwargs.pop("training_global_step", kwargs.pop("global_step", None))
+        warmup_global_step = _normalize_global_step(
+            kwargs.pop("training_global_step", kwargs.pop("global_step", None))
+        )
         if warmup_global_step is not None:
             kwargs["training_global_step"] = warmup_global_step
         if not (_vlm_cacheblend_enabled() and _vlm_cacheblend_prefill_donor_enabled()):
             return False
         if not agent_uid or agent_turn is None:
+            return False
+        if warmup_global_step is None:
             return False
         warmup_key = self._vlm_cacheblend_warmup_key(agent_uid, agent_turn, warmup_global_step)
         if warmup_key is None or self._cacheblend_coordinator is None:
@@ -649,7 +673,9 @@ class LLMServerClient:
                     **kwargs,
                 )
                 server_call_ms = (time.perf_counter() - call_start) * 1000.0
-                await self._cacheblend_coordinator.mark_ready.remote(warmup_key)
+                donor_ready = await self._cacheblend_coordinator.mark_ready.remote(
+                    warmup_key
+                )
                 total_ms = (time.perf_counter() - wait_start) * 1000.0
                 await self._log_cacheblend_barrier_event(
                     request_id=str(request_id),
@@ -662,7 +688,7 @@ class LLMServerClient:
                     wait_ms=total_ms,
                     barrier_wait_ms=barrier_wait_ms,
                     server_call_ms=server_call_ms,
-                    donor_ready=True,
+                    donor_ready=bool(donor_ready),
                     routing_request_id=str(routing_request_id),
                     server_id=str(server_id),
                 )
@@ -725,26 +751,43 @@ class LLMServerClient:
         Returns:
             TokenOutput | DiffusionOutput: token or diffusion output
         """
-        warmup_global_step = kwargs.pop("training_global_step", kwargs.pop("global_step", None))
+        warmup_global_step = _normalize_global_step(
+            kwargs.pop("training_global_step", kwargs.pop("global_step", None))
+        )
         if warmup_global_step is not None:
             kwargs["training_global_step"] = warmup_global_step
         elif _vlm_cacheblend_enabled() and agent_uid and not self._vlm_cacheblend_missing_step_warned:
             self._vlm_cacheblend_missing_step_warned = True
             logger.warning(
-                "VLM CacheBlend request has agent_uid=%s but no training_global_step/global_step; "
-                "routing and warmup keys will fall back to agent_uid only.",
+                "VLM CacheBlend request has agent_uid=%s but no valid training_global_step/global_step; "
+                "rollout-side CacheBlend routing/barrier is disabled for this request.",
                 agent_uid,
             )
+        cacheblend_agent_uid = (
+            agent_uid
+            if not _vlm_cacheblend_enabled() or warmup_global_step is not None
+            else None
+        )
         routing_request_id = request_id
-        if _vlm_cacheblend_enabled() and agent_uid:
-            routing_request_id = f"cacheblend_group:{_cacheblend_group_key(str(agent_uid), warmup_global_step)}"
-        elif _grpo_sim_cache_enabled() and agent_uid:
-            routing_request_id = f"grpo_agent_uid:{agent_uid}"
+        if _vlm_cacheblend_enabled() and cacheblend_agent_uid:
+            routing_request_id = (
+                f"cacheblend_group:{_cacheblend_group_key(str(cacheblend_agent_uid), warmup_global_step)}"
+            )
+        elif _rollout_reuse_server_affinity_enabled() and agent_uid:
+            routing_request_id = (
+                f"rollout_reuse_group:{_cacheblend_group_key(str(agent_uid), warmup_global_step)}"
+            )
 
         self._maybe_prune_warmed_uids(warmup_global_step)
-        warmup_key = self._vlm_cacheblend_warmup_key(agent_uid, agent_turn, warmup_global_step)
+        warmup_key = self._vlm_cacheblend_warmup_key(
+            cacheblend_agent_uid, agent_turn, warmup_global_step
+        )
 
-        async def _call_server() -> tuple[TokenOutput, str]:
+        async def _call_server(
+            *,
+            sampling_override: Optional[dict[str, Any]] = None,
+            request_suffix: str = "",
+        ) -> tuple[TokenOutput, str]:
             server_id, server = await self._acquire_server(routing_request_id)
             try:
                 multimodal_kwargs = {}
@@ -757,15 +800,24 @@ class LLMServerClient:
                     sglang_request_id = f"{request_id}_t{int(agent_turn)}"
                 else:
                     sglang_request_id = uuid4().hex
+                if request_suffix:
+                    sglang_request_id += request_suffix
 
                 output = await server.generate.remote(
                     request_id=sglang_request_id,
                     prompt_ids=prompt_ids,
-                    sampling_params=sampling_params,
+                    sampling_params=(
+                        sampling_params
+                        if sampling_override is None
+                        else sampling_override
+                    ),
                     image_data=image_data,
                     video_data=video_data,
                     agent_request_id=request_id,
                     agent_turn=agent_turn,
+                    # The SGLang side independently rejects CacheBlend when neither this
+                    # request nor the server has a valid model step. Preserve agent_uid
+                    # here so unrelated GRPO similarity metadata keeps working.
                     agent_uid=agent_uid,
                     rollout_idx=rollout_idx,
                     **multimodal_kwargs,
@@ -805,13 +857,40 @@ class LLMServerClient:
             barrier_wait_ms = (time.perf_counter() - wait_start) * 1000.0
             if acquire_role == "donor":
                 call_start = time.perf_counter()
+                donor_ready = False
                 try:
+                    # Turn0 has no non-prefix image graft, but all rollouts share the
+                    # exact prompt prefix. Prime RadixCache with one synthetic token and
+                    # release the group immediately; waiting for this branch's full
+                    # response previously stalled every recipient for ~9 seconds on
+                    # MMDU. Later turns use the model-side donor-prefill callback.
+                    if (
+                        int(agent_turn if agent_turn is not None else -1) == 0
+                        and _vlm_cacheblend_prefill_donor_enabled()
+                    ):
+                        prefix_params = dict(sampling_params)
+                        prefix_params.pop("max_tokens", None)
+                        prefix_params["max_new_tokens"] = (
+                            _vlm_cacheblend_prefill_donor_max_new_tokens()
+                        )
+                        await _call_server(
+                            sampling_override=prefix_params,
+                            request_suffix="_cacheblend_prefix_donor",
+                        )
+                        donor_ready = bool(
+                            await self._cacheblend_coordinator.mark_ready.remote(
+                                warmup_key
+                            )
+                        )
                     output, server_id = await _call_server()
                 except Exception:
                     await self._cacheblend_coordinator.mark_failed.remote(warmup_key)
                     raise
                 server_call_ms = (time.perf_counter() - call_start) * 1000.0
-                await self._cacheblend_coordinator.mark_ready.remote(warmup_key)
+                if not donor_ready:
+                    donor_ready = await self._cacheblend_coordinator.mark_ready.remote(
+                        warmup_key
+                    )
                 total_ms = (time.perf_counter() - wait_start) * 1000.0
                 await self._log_cacheblend_barrier_event(
                     request_id=str(request_id),
@@ -824,7 +903,7 @@ class LLMServerClient:
                     wait_ms=total_ms,
                     barrier_wait_ms=barrier_wait_ms,
                     server_call_ms=server_call_ms,
-                    donor_ready=True,
+                    donor_ready=bool(donor_ready),
                     routing_request_id=str(routing_request_id),
                     server_id=server_id,
                 )
@@ -999,9 +1078,26 @@ class LLMServerManager:
     async def create(cls, *args, **kwargs):
         """Create the LLMServerManager."""
         instance = cls(*args, **kwargs)
+        await instance._init_cacheblend_coordinator()
         await instance._initialize_llm_servers()
         await instance._init_global_load_balancer()
         return instance
+
+    async def _init_cacheblend_coordinator(self) -> None:
+        # The model-side donor hook can only release recipients at prefill completion if
+        # the named actor exists before SGLang replicas inherit their environment.
+        self.global_cacheblend_coordinator = GlobalCacheBlendCoordinator.options(
+            name=_vlm_cacheblend_coordinator_actor_name(),
+            namespace=_vlm_cacheblend_coordinator_actor_namespace(),
+            lifetime="detached",
+            get_if_exists=True,
+            num_cpus=0,
+        ).remote(
+            keep_steps=_vlm_cacheblend_warmup_keep_steps(),
+        )
+        await self.global_cacheblend_coordinator.reset.remote()
+        if _vlm_cacheblend_enabled():
+            os.environ.setdefault("SGLANG_VLM_CACHEBLEND_PREFILL_READY_NOTIFY", "1")
 
     async def _initialize_llm_servers(self, start_rank: int = 0):
         """Initialize the LLM server replicas.
@@ -1078,14 +1174,6 @@ class LLMServerManager:
         self.global_load_balancer = GlobalRequestLoadBalancer.remote(
             servers=dict(zip(self.server_addresses, self.server_handles, strict=True)),
             max_cache_size=DEFAULT_ROUTING_CACHE_SIZE,
-        )
-        self.global_cacheblend_coordinator = GlobalCacheBlendCoordinator.options(
-            name=_vlm_cacheblend_coordinator_actor_name(),
-            namespace=_vlm_cacheblend_coordinator_actor_namespace(),
-            lifetime="detached",
-            get_if_exists=True,
-        ).remote(
-            keep_steps=_vlm_cacheblend_warmup_keep_steps(),
         )
 
     def get_client(self, client_cls=LLMServerClient, **kwargs) -> LLMServerClient:

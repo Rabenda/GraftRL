@@ -23,11 +23,13 @@ unit tested directly. Integration glue lives in the model forward hooks.
 
 from __future__ import annotations
 
-import os
 import json
 import logging
+import math
+import os
 import threading
 import time
+from bisect import bisect_left
 from collections import OrderedDict
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
@@ -99,6 +101,11 @@ class VLMCacheBlendConfig:
     target_image_slots: str = "-1"
     # max number of groups kept in the donor store (LRU).
     max_groups: int = 64
+    # Hard resident-memory budget for donor K/V, independent of the group-count cap.
+    # A single oversized donor is rejected instead of temporarily exceeding the budget.
+    # Set to 0 for unlimited. The default bounds the formerly unbounded 64-group GPU
+    # footprint while still retaining many Qwen2.5-VL image donors.
+    max_donor_bytes: int = 2 * 1024 * 1024 * 1024
     # emit per-request stats to stderr/log for profiling.
     verbose: bool = False
     # First-stage recipient fast path: during prefill, after the backend writes
@@ -141,11 +148,17 @@ class VLMCacheBlendConfig:
     # on reuse. With ``max_groups`` donors x num_layers x image-span K/V this is the main
     # GPU-memory lever for the LLM side.
     donor_to_cpu: bool = False
-    # Low-value recipient gate. Disabled by default. When enabled, a recipient plan is
-    # converted to full recompute if the final reuse set is too small to justify the
-    # coordination/copy overhead.
-    min_reused_tokens: int = 0
-    min_reuse_ratio: float = 0.0
+    # Low-value recipient gate. Tiny grafts lose to plan/bootstrap/scatter overhead, so
+    # fail back to dense prefill unless at least this much useful work survives.  Set
+    # either value to 0 to disable that half of the gate.
+    min_reused_tokens: int = 64
+    min_reuse_ratio: float = 0.20
+    # Coarse absolute safety/value gate for the scale-relative ``kvdev`` selector.  The
+    # top-r selector always returns exactly r% recompute tokens, even for an unrelated
+    # same-shape image.  Reject the entire donor when too many bootstrap K vectors have
+    # cosine below this threshold.  A negative threshold disables the gate.
+    donor_reject_min_similarity: float = 0.50
+    donor_reject_max_bad_ratio: float = 0.25
     # Sparse decode (context-side): during autoregressive decode, skip attending to
     # donor-reused image-token KV slots that were grafted at prefill. Query is still one
     # token; only the context page table is shortened. Default off. Requires FA3 and
@@ -160,9 +173,12 @@ class VLMCacheBlendConfig:
     # prompts place instruction/system tokens before visual spans.
     sparse_decode_keep_first: int = 0
     # Skip sparse decode unless a decode forward can drop enough tokens to amortize the
-    # dynamic page-table build. Disabled by default for backward compatibility.
-    sparse_decode_min_dropped_tokens: int = 0
-    sparse_decode_min_drop_ratio: float = 0.0
+    # dynamic page-table build. Geo3K 64x4 CUDA-Graph profiles put the crossover between
+    # a batch=3 tail (~2.2k dropped entries, slightly slower than dense) and batch=9
+    # (~7.6k, still slightly faster), so fail closed below 4k aggregate saved entries.
+    # Keep the ratio floor as a second guard for unusually long mostly-dense batches.
+    sparse_decode_min_dropped_tokens: int = 4096
+    sparse_decode_min_drop_ratio: float = 0.10
     # Cap how many sparse-decode plans are retained across requests (LRU).
     sparse_decode_max_plans: int = 256
     # P1: incrementally extend each request's drop-column set by only the newly
@@ -203,6 +219,9 @@ class VLMCacheBlendConfig:
             .strip()
             .lower(),
             max_groups=_env_int("SGLANG_VLM_CACHEBLEND_MAX_GROUPS", 64),
+            max_donor_bytes=_env_int(
+                "SGLANG_VLM_CACHEBLEND_MAX_DONOR_BYTES", 2 * 1024 * 1024 * 1024
+            ),
             verbose=_env_flag("SGLANG_VLM_CACHEBLEND_VERBOSE", "0"),
             fast_path=_env_flag("SGLANG_VLM_CACHEBLEND_FAST_PATH", "1"),
             fast_apply=_env_flag("SGLANG_VLM_CACHEBLEND_FAST_APPLY", "0"),
@@ -218,8 +237,14 @@ class VLMCacheBlendConfig:
                 "SGLANG_VLM_CACHEBLEND_UNSAFE_POST_ATTENTION_OVERLAY", "0"
             ),
             donor_to_cpu=_env_flag("SGLANG_VLM_CACHEBLEND_DONOR_TO_CPU", "0"),
-            min_reused_tokens=_env_int("SGLANG_VLM_CACHEBLEND_MIN_REUSED_TOKENS", 0),
-            min_reuse_ratio=_env_float("SGLANG_VLM_CACHEBLEND_MIN_REUSE_RATIO", 0.0),
+            min_reused_tokens=_env_int("SGLANG_VLM_CACHEBLEND_MIN_REUSED_TOKENS", 64),
+            min_reuse_ratio=_env_float("SGLANG_VLM_CACHEBLEND_MIN_REUSE_RATIO", 0.20),
+            donor_reject_min_similarity=_env_float(
+                "SGLANG_VLM_CACHEBLEND_DONOR_REJECT_MIN_SIMILARITY", 0.50
+            ),
+            donor_reject_max_bad_ratio=_env_float(
+                "SGLANG_VLM_CACHEBLEND_DONOR_REJECT_MAX_BAD_RATIO", 0.25
+            ),
             sparse_decode=_env_flag("SGLANG_VLM_CACHEBLEND_SPARSE_DECODE", "0"),
             sparse_decode_mode=os.environ.get(
                 "SGLANG_VLM_CACHEBLEND_SPARSE_DECODE_MODE", "reuse"
@@ -233,10 +258,10 @@ class VLMCacheBlendConfig:
                 "SGLANG_VLM_CACHEBLEND_SPARSE_DECODE_KEEP_FIRST", 0
             ),
             sparse_decode_min_dropped_tokens=_env_int(
-                "SGLANG_VLM_CACHEBLEND_SPARSE_DECODE_MIN_DROPPED_TOKENS", 0
+                "SGLANG_VLM_CACHEBLEND_SPARSE_DECODE_MIN_DROPPED_TOKENS", 4096
             ),
             sparse_decode_min_drop_ratio=_env_float(
-                "SGLANG_VLM_CACHEBLEND_SPARSE_DECODE_MIN_DROP_RATIO", 0.0
+                "SGLANG_VLM_CACHEBLEND_SPARSE_DECODE_MIN_DROP_RATIO", 0.10
             ),
             sparse_decode_max_plans=_env_int(
                 "SGLANG_VLM_CACHEBLEND_SPARSE_DECODE_MAX_PLANS", 256
@@ -293,8 +318,18 @@ def target_turn_enabled(agent_turn: int, cfg: Optional[VLMCacheBlendConfig] = No
 def reload_config_from_env() -> VLMCacheBlendConfig:
     """Re-read env (useful for tests)."""
     global _CONFIG, _DUMP_ONCE_ENABLED, _DUMP_ONCE_DONE, _PREFILL_READY_ACTOR
-    global _SPARSE_DECODE_STORE
+    global _DONOR_STORE, _SPARSE_DECODE_STORE
     _CONFIG = VLMCacheBlendConfig.from_env()
+    _DONOR_STORE = DonorKVStore(
+        max_groups=_CONFIG.max_groups,
+        max_bytes=_CONFIG.max_donor_bytes,
+    )
+    # Tests and embedded servers can reload policy without a process restart. Cached
+    # batch plans include keep/gate policy from the old store and must not cross it.
+    with _SPARSE_DECODE_MASK_CACHE_LOCK:
+        _SPARSE_DECODE_MASK_CACHE.clear()
+    with _SPARSE_DECODE_STATIC_BATCH_CACHE_LOCK:
+        _SPARSE_DECODE_STATIC_BATCH_CACHE.clear()
     _DUMP_ONCE_ENABLED = _env_flag("SGLANG_VLM_CACHEBLEND_DUMP_ONCE", "0")
     _DUMP_ONCE_DONE = False
     _PREFILL_READY_ACTOR = None
@@ -335,6 +370,12 @@ class DonorEntry:
 
     def has_layer(self, layer_id: int) -> bool:
         return layer_id in self.layers
+
+    def resident_bytes(self) -> int:
+        tensors = [self.positions] if isinstance(self.positions, torch.Tensor) else []
+        for layer in self.layers.values():
+            tensors.extend((layer.k, layer.v))
+        return sum(int(t.numel()) * int(t.element_size()) for t in tensors)
 
 
 @dataclass
@@ -405,7 +446,17 @@ class SparseDecodePlan:
     mode: str = "reuse"
     keep_recent: int = 64
     keep_first: int = 0
+    # Stable request-sequence columns for the same tokens. Production registration
+    # resolves these once at prefill, so decode never has to search the live page table
+    # for physical KV locations on every generated token.
+    drop_positions: Optional[torch.Tensor] = None
+    drop_positions_host: Optional[Tuple[int, ...]] = field(
+        default=None, repr=False, compare=False
+    )
     drop_locs_cache: Dict[str, torch.Tensor] = field(
+        default_factory=dict, repr=False, compare=False
+    )
+    drop_positions_cache: Dict[str, torch.Tensor] = field(
         default_factory=dict, repr=False, compare=False
     )
     # P1 incremental membership cache (mutable, per page-table device). ``inc_drop_cols``
@@ -432,24 +483,101 @@ class SparseDecodeBatch:
 
     page_table: torch.Tensor
     cache_seqlens: torch.Tensor
-    cu_seqlens_k: torch.Tensor
+    cu_seqlens_k: Optional[torch.Tensor]
     max_seqlen_k: int
     kept_tokens: int
     dropped_tokens: int
     used_requests: int
+    direct_source: bool = False
+    incremental_append: bool = False
 
 
 class DonorKVStore:
-    """Thread-safe LRU store of donor branches keyed by GRPO group key.
+    """Thread-safe LRU store of donor LLM K/V keyed by rollout group key."""
 
-    Mirrors the role of ``_GROUP_CACHE`` in ``grpo_similarity_cache.py`` but stores
-    LLM-side K/V instead of ViT embeddings.
-    """
-
-    def __init__(self, max_groups: int = 64):
+    def __init__(self, max_groups: int = 64, max_bytes: int = 0):
         self._lock = threading.Lock()
         self._store: "OrderedDict[Tuple, DonorEntry]" = OrderedDict()
-        self._max_groups = max_groups
+        self._max_groups = max(0, int(max_groups))
+        self._max_bytes = max(0, int(max_bytes))
+        self._entry_bytes: Dict[Tuple, int] = {}
+        self._resident_bytes = 0
+        self._reservations: Dict[Tuple, int] = {}
+        self._reserved_bytes = 0
+
+    @property
+    def resident_bytes(self) -> int:
+        with self._lock:
+            return self._resident_bytes
+
+    @property
+    def max_bytes(self) -> int:
+        return self._max_bytes
+
+    def __len__(self) -> int:
+        with self._lock:
+            return len(self._store)
+
+    def publish(self, entry: DonorEntry) -> bool:
+        """Atomically publish a complete donor and enforce both LRU budgets."""
+        if not entry.complete:
+            raise ValueError("cannot publish an incomplete donor")
+        entry_bytes = entry.resident_bytes()
+        key = entry.group_key
+        with self._lock:
+            self._remove_reservation_locked(key)
+            self._remove_locked(key)
+            if self._max_groups == 0 or (
+                self._max_bytes > 0 and entry_bytes > self._max_bytes
+            ):
+                return False
+            self._store[key] = entry
+            self._entry_bytes[key] = entry_bytes
+            self._resident_bytes += entry_bytes
+            self._store.move_to_end(key)
+            self._evict_if_needed()
+            return key in self._store
+
+    def reserve(self, group_key: Tuple, entry_bytes: int) -> bool:
+        """Reserve budget before allocating a donor's cloned tensors.
+
+        Existing LRU entries are evicted here, rather than after allocation, so the
+        capture itself does not transiently exceed the configured store budget.
+        """
+        entry_bytes = max(0, int(entry_bytes))
+        with self._lock:
+            self._remove_reservation_locked(group_key)
+            self._remove_locked(group_key)
+            if self._max_groups == 0 or (
+                self._max_bytes > 0 and entry_bytes > self._max_bytes
+            ):
+                return False
+            while self._store and (
+                len(self._store) + len(self._reservations) + 1 > self._max_groups
+                or (
+                    self._max_bytes > 0
+                    and self._resident_bytes + self._reserved_bytes + entry_bytes
+                    > self._max_bytes
+                )
+            ):
+                key = next(iter(self._store))
+                self._remove_locked(key)
+            if (
+                len(self._store) + len(self._reservations) + 1 > self._max_groups
+                or (
+                    self._max_bytes > 0
+                    and self._resident_bytes + self._reserved_bytes + entry_bytes
+                    > self._max_bytes
+                )
+            ):
+                return False
+            self._reservations[group_key] = entry_bytes
+            self._reserved_bytes += entry_bytes
+            return True
+
+    def cancel_reservation(self, group_key: Tuple) -> None:
+        with self._lock:
+            self._remove_reservation_locked(group_key)
 
     def get_or_create_donor(
         self,
@@ -484,17 +612,47 @@ class DonorKVStore:
             entry = self._store.get(group_key)
             if entry is not None:
                 entry.complete = True
+                old_bytes = self._entry_bytes.get(group_key, 0)
+                new_bytes = entry.resident_bytes()
+                self._entry_bytes[group_key] = new_bytes
+                self._resident_bytes += new_bytes - old_bytes
+                self._evict_if_needed()
 
     def drop(self, group_key: Tuple) -> None:
         with self._lock:
-            self._store.pop(group_key, None)
+            self._remove_locked(group_key)
+
+    def clear(self) -> None:
+        with self._lock:
+            self._store.clear()
+            self._entry_bytes.clear()
+            self._resident_bytes = 0
+            self._reservations.clear()
+            self._reserved_bytes = 0
+
+    def _remove_locked(self, group_key: Tuple) -> None:
+        self._store.pop(group_key, None)
+        self._resident_bytes -= self._entry_bytes.pop(group_key, 0)
+
+    def _remove_reservation_locked(self, group_key: Tuple) -> None:
+        self._reserved_bytes -= self._reservations.pop(group_key, 0)
 
     def _evict_if_needed(self) -> None:
-        while len(self._store) > self._max_groups:
-            self._store.popitem(last=False)
+        while self._store and (
+            len(self._store) + len(self._reservations) > self._max_groups
+            or (
+                self._max_bytes > 0
+                and self._resident_bytes + self._reserved_bytes > self._max_bytes
+            )
+        ):
+            key = next(iter(self._store))
+            self._remove_locked(key)
 
 
-_DONOR_STORE = DonorKVStore(max_groups=_CONFIG.max_groups)
+_DONOR_STORE = DonorKVStore(
+    max_groups=_CONFIG.max_groups,
+    max_bytes=_CONFIG.max_donor_bytes,
+)
 
 
 def get_donor_store() -> DonorKVStore:
@@ -711,7 +869,12 @@ def finalize_recipient_plan_deviation(
     Picks the high-KV-deviation ("high-risk") tokens to recompute and reuses the rest.
     Mutates ``plan`` in place and returns the per-token deviation (for logging/tests).
     """
-    deviation = kv_deviation(recipient_k.float(), donor_k_aligned.float())
+    recipient_float = recipient_k.float()
+    donor_float = donor_k_aligned.float()
+    deviation = kv_deviation(recipient_float, donor_float)
+    similarity = kv_cosine_similarity(recipient_float, donor_float)
+    if reject_recipient_plan_by_similarity(plan, similarity, cfg):
+        return deviation
     mask = select_recompute_tokens(
         plan.n_image_tokens, cfg, deviation=deviation, device=deviation.device
     )
@@ -723,14 +886,83 @@ def finalize_recipient_plan_deviation(
     return deviation
 
 
+def reject_recipient_plan_by_similarity(
+    plan: "RecipientKVBlendPlan",
+    similarity: torch.Tensor,
+    cfg: Optional[VLMCacheBlendConfig] = None,
+) -> bool:
+    """Fail a whole recipient back to dense prefill on an obvious donor mismatch.
+
+    This gate is deliberately coarse: token ranking remains the job of ``kvdev``;
+    cosine only detects that the donor is globally outside the approximation regime.
+    It therefore fixes the same-grid/different-content hole without turning the group
+    key into an exact content hash (which would prohibit useful approximate reuse).
+    """
+    cfg = cfg or get_config()
+    threshold = float(getattr(cfg, "donor_reject_min_similarity", -1.0))
+    max_bad_ratio = min(
+        1.0,
+        max(0.0, float(getattr(cfg, "donor_reject_max_bad_ratio", 1.0))),
+    )
+    if threshold < 0.0 or similarity.numel() == 0:
+        return False
+    bad_tokens = int((similarity < threshold).sum().item())
+    bad_ratio = bad_tokens / int(similarity.numel())
+    if bad_ratio <= max_bad_ratio:
+        return False
+
+    plan.recompute_mask = torch.ones(
+        plan.n_image_tokens,
+        dtype=torch.bool,
+        device=plan.recompute_mask.device,
+    )
+    plan.recomputed_tokens = int(plan.n_image_tokens)
+    plan.reused_tokens = 0
+    plan.pending_deviation = False
+    plan.gate_reason = (
+        "donor_reject:absolute_similarity:"
+        f"bad={bad_tokens}/{int(similarity.numel())}={bad_ratio:.4f}>"
+        f"{max_bad_ratio:.4f}:threshold={threshold:.4f}"
+    )
+    return True
+
+
 def finalize_recipient_plan_similarity(
     plan: "RecipientKVBlendPlan",
     recipient_k: torch.Tensor,
     donor_k_aligned: torch.Tensor,
     cfg: VLMCacheBlendConfig,
 ) -> torch.Tensor:
-    """Resolve a deferred ``sim`` plan from bootstrap-layer cosine similarity."""
+    """Resolve a deferred ``sim`` plan from bootstrap-layer cosine similarity.
+
+    ``recompute_ratio`` is a compute budget, not permission to reuse tokens that fail
+    the absolute similarity threshold.  If the unsafe set exceeds that budget, reject
+    the donor for this request and run the normal full-prefill path.  The old behavior
+    silently kept only the worst ``r%`` in the recompute set and grafted every other
+    below-threshold token.
+    """
     similarity = kv_cosine_similarity(recipient_k, donor_k_aligned)
+    unsafe = similarity < cfg.sim_threshold
+    unsafe_tokens = int(unsafe.sum().item())
+    recompute_budget = _topr_count(plan.n_image_tokens, cfg.recompute_ratio)
+    if unsafe_tokens > recompute_budget:
+        plan.recompute_mask = torch.ones(
+            plan.n_image_tokens,
+            dtype=torch.bool,
+            device=plan.recompute_mask.device,
+        )
+        plan.recomputed_tokens = int(plan.n_image_tokens)
+        plan.reused_tokens = 0
+        plan.pending_deviation = False
+        unsafe_ratio = (
+            unsafe_tokens / plan.n_image_tokens if plan.n_image_tokens > 0 else 0.0
+        )
+        plan.gate_reason = (
+            "donor_reject:low_similarity_tokens_exceed_budget:"
+            f"{unsafe_tokens}/{plan.n_image_tokens}={unsafe_ratio:.4f}>"
+            f"{recompute_budget}/{plan.n_image_tokens}"
+        )
+        return similarity
     mask = select_recompute_tokens(
         plan.n_image_tokens, cfg, similarity=similarity, device=similarity.device
     )
@@ -748,8 +980,7 @@ def apply_low_value_gate(
 ) -> bool:
     """Disable recipient reuse when the finalized reuse set is too small.
 
-    Returns True if the plan was converted to full recompute. The gate is intentionally
-    opt-in via env vars so existing experiments keep identical behavior.
+    Returns True if the plan was converted to full recompute.
     """
     cfg = cfg or get_config()
     min_tokens = max(0, int(getattr(cfg, "min_reused_tokens", 0) or 0))
@@ -878,6 +1109,8 @@ def build_recipient_kv_blend_plan(
             stats.recomputed_tokens = plan.recomputed_tokens
             stats.reused_tokens = plan.reused_tokens
             stats.fallback_reason = plan.gate_reason
+            stats.extend_wall_ms = plan.plan_wall_ms
+            return None, stats.finalize()
         stats.extend_wall_ms = plan.plan_wall_ms
     return plan, stats.finalize()
 
@@ -943,6 +1176,56 @@ def _apply_direct_tensor_mapping(
     return donor_idx, kv_idx
 
 
+def _apply_reuse_indices(
+    plan: "RecipientKVBlendPlan",
+    device: torch.device,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Return cached ``(donor_idx, pool_dst)`` indices for a finalized plan.
+
+    ``img_locs`` and ``recompute_mask`` are layer-invariant within one extend
+    forward.  Rebuilding the boolean mask in every decoder layer used to include a
+    ``bool(mask.any())`` check, which synchronizes CUDA with the host once per plan
+    and layer.  A multi-slot batch can execute thousands of those checks.
+
+    Cache the compact source/destination indices instead.  The signature includes
+    both tensor identity/version and the finalized reuse count, so bootstrap mask
+    replacement as well as an in-place mutation invalidates the entry.
+    """
+    def _safe_tensor_version(tensor: torch.Tensor) -> int:
+        # Inference tensors intentionally do not expose a version counter.  Their
+        # plan tensors are immutable here, and mask finalization replaces the tensor,
+        # so identity plus the finalized count still provides invalidation.
+        try:
+            return int(tensor._version)
+        except RuntimeError:
+            return -1
+
+    mask = plan.recompute_mask
+    img_locs = plan.img_locs
+    signature = (
+        int(mask.data_ptr()),
+        _safe_tensor_version(mask),
+        int(mask.numel()),
+        int(img_locs.data_ptr()),
+        _safe_tensor_version(img_locs),
+        int(img_locs.numel()),
+        int(plan.reused_tokens),
+        str(device),
+    )
+    if get_config().fast_apply:
+        cached = plan.apply_cache.get("reuse_indices")
+        if cached is not None and cached[0] == signature:
+            return cached[1], cached[2]
+
+    mask_on_device = mask.to(device=device, dtype=torch.bool)
+    donor_idx = torch.nonzero(~mask_on_device, as_tuple=False).flatten()
+    img_locs_on_device = img_locs.to(device=device, dtype=torch.long)
+    pool_dst = img_locs_on_device.index_select(0, donor_idx)
+    if get_config().fast_apply:
+        plan.apply_cache["reuse_indices"] = (signature, donor_idx, pool_dst)
+    return donor_idx, pool_dst
+
+
 def apply_recipient_kv_blend_for_layer(
     *,
     forward_batch: Any,
@@ -966,7 +1249,11 @@ def apply_recipient_kv_blend_for_layer(
     dead write, so with ``fast_apply`` we skip it (Method B). Other extend kernels
     (triton/ragged) do consume the direct tensors, so the default keeps writing them.
     """
-    plans = get_recipient_blend_plans()
+    plans = tuple(
+        plan
+        for plan in get_recipient_blend_plans()
+        if plan.pending_deviation or int(plan.reused_tokens) > 0
+    )
     if not plans:
         return 0
     skip_direct_write = bool(reads_kv_from_pool) and get_config().fast_apply
@@ -983,6 +1270,8 @@ def apply_recipient_kv_blend_for_layer(
     for plan in plans:
         plan_started = time.perf_counter()
         try:
+            if not plan.pending_deviation and int(plan.reused_tokens) <= 0:
+                continue
             donor = get_donor_store().lookup(plan.group_key)
             if donor is None or not donor.complete or not donor.has_layer(layer_id):
                 continue
@@ -1018,9 +1307,13 @@ def apply_recipient_kv_blend_for_layer(
                     ) * 1000.0
                 else:
                     plan.pending_deviation = False
-            recompute_mask = plan.recompute_mask.to(device=k_buf.device, dtype=torch.bool)
-            reuse_mask = ~recompute_mask
-            if img_locs.numel() == 0 or not bool(reuse_mask.any()):
+            # ``reused_tokens`` is finalized together with the mask, so this host-side
+            # guard avoids the old per-layer CUDA synchronization from
+            # ``bool(reuse_mask.any())``.
+            if img_locs.numel() == 0 or int(plan.reused_tokens) <= 0:
+                continue
+            donor_idx, dst = _apply_reuse_indices(plan, k_buf.device)
+            if donor_idx.numel() == 0:
                 continue
             donor_k = donor_layer.k.to(device=k_buf.device, dtype=k_buf.dtype)
             donor_v = donor_layer.v.to(device=v_buf.device, dtype=v_buf.dtype)
@@ -1031,11 +1324,10 @@ def apply_recipient_kv_blend_for_layer(
                 pos_mode=plan.pos_mode,
                 rotary_emb=rotary_emb,
             ).to(device=k_buf.device, dtype=k_buf.dtype)
-            dst = img_locs[reuse_mask]
-            donor_k_reuse = donor_k[reuse_mask]
-            donor_v_reuse = donor_v[reuse_mask]
-            k_buf[dst] = donor_k_reuse
-            v_buf[dst] = donor_v_reuse
+            donor_k_reuse = donor_k.index_select(0, donor_idx)
+            donor_v_reuse = donor_v.index_select(0, donor_idx)
+            k_buf.index_copy_(0, dst, donor_k_reuse)
+            v_buf.index_copy_(0, dst, donor_v_reuse)
             if (
                 not skip_direct_write
                 and cache_locs is not None
@@ -1046,7 +1338,7 @@ def apply_recipient_kv_blend_for_layer(
                 # Method B (fast apply) memoizes it so the O(reuse x tokens) match matrix
                 # is built once instead of at every layer; the result is identical.
                 donor_idx, kv_idx = _apply_direct_tensor_mapping(
-                    plan, dst, cache_locs, k.device, int(reuse_mask.sum())
+                    plan, dst, cache_locs, k.device, int(plan.reused_tokens)
                 )
                 if kv_idx is not None and kv_idx.numel() > 0:
                     k[kv_idx] = donor_k_reuse.to(device=k.device, dtype=k.dtype)[
@@ -1091,6 +1383,8 @@ class CacheBlendStats:
     sparse_decode_used: bool = False
     sparse_decode_kept_tokens: int = 0
     sparse_decode_dropped_tokens: int = 0
+    sparse_decode_direct_source: bool = False
+    sparse_decode_incremental_append: bool = False
 
     def finalize(self) -> "CacheBlendStats":
         if self.n_image_tokens > 0:
@@ -1142,6 +1436,12 @@ class CacheBlendStats:
             "cacheblend_sparse_decode_dropped_tokens": str(
                 self.sparse_decode_dropped_tokens
             ),
+            "cacheblend_sparse_decode_direct_source": (
+                "1" if self.sparse_decode_direct_source else "0"
+            ),
+            "cacheblend_sparse_decode_incremental_append": (
+                "1" if self.sparse_decode_incremental_append else "0"
+            ),
         }
 
 
@@ -1171,12 +1471,10 @@ def pop_last_stats() -> Optional[CacheBlendStats]:
 # Per-request context (set by the scheduler / agent loop, read by the LLM forward)
 # --------------------------------------------------------------------------- #
 #
-# Role/group resolution needs GRPO agent metadata (``agent_uid``, ``agent_turn``)
-# which already exists in ``grpo_similarity_cache`` (``_REQUEST_META`` keyed by rid).
-# The LLM forward (Qwen2Model.forward) does not see the rid directly, so the
-# integration sets a thread-local context just before model.forward, the same place
-# the ViT cache resolves donor/recipient. Default is None => the forward hook is a
-# pure no-op and the baseline path is unchanged.
+# Role/group resolution needs rollout metadata (``agent_uid``, ``agent_turn``).
+# The LLM forward (Qwen2Model.forward) does not see the request id directly, so the
+# integration sets a thread-local context just before model.forward. Default is None
+# and therefore the forward hook is a pure no-op on the baseline path.
 @dataclass
 class RequestContext:
     group_key: Tuple
@@ -1319,6 +1617,26 @@ def notify_donor_prefill_ready(ctx: RequestContext) -> bool:
         return False
 
 
+def notify_donor_prefill_failed(ctx: RequestContext) -> bool:
+    """Release rollout-side waiters when donor capture cannot publish usable KV."""
+    if not (cacheblend_enabled() and _prefill_ready_notify_enabled()):
+        return False
+    if getattr(ctx, "role", None) != "donor":
+        return False
+    warmup_key = _prefill_ready_warmup_key(ctx)
+    if not warmup_key:
+        return False
+    actor = _get_prefill_ready_actor()
+    if actor is None:
+        return False
+    try:
+        actor.mark_failed.remote(warmup_key)
+        return True
+    except Exception as exc:
+        _warn_prefill_ready_once(f"mark_failed_failed:{type(exc).__name__}")
+        return False
+
+
 def set_source_input_ids(input_ids: Optional[torch.Tensor]) -> None:
     _SOURCE_INPUT_IDS.value = input_ids
 
@@ -1384,6 +1702,7 @@ class SparseDecodePlanStore:
         self._lock = threading.Lock()
         self._store: "OrderedDict[int, SparseDecodePlan]" = OrderedDict()
         self._max_plans = max(1, int(max_plans))
+        self._revision = 0
 
     def put(self, plan: SparseDecodePlan) -> None:
         key = int(plan.req_pool_idx)
@@ -1392,6 +1711,7 @@ class SparseDecodePlanStore:
             self._store.move_to_end(key)
             while len(self._store) > self._max_plans:
                 self._store.popitem(last=False)
+            self._revision += 1
 
     def get(self, req_pool_idx: int) -> Optional[SparseDecodePlan]:
         key = int(req_pool_idx)
@@ -1401,13 +1721,52 @@ class SparseDecodePlanStore:
                 self._store.move_to_end(key)
             return plan
 
+    def get_many(self, req_pool_indices: List[int]) -> List[Optional[SparseDecodePlan]]:
+        """Resolve one decode batch under a single lock."""
+
+        plans: List[Optional[SparseDecodePlan]] = []
+        with self._lock:
+            for req_pool_idx in req_pool_indices:
+                key = int(req_pool_idx)
+                plan = self._store.get(key)
+                if plan is not None:
+                    self._store.move_to_end(key)
+                plans.append(plan)
+        return plans
+
+    @property
+    def revision(self) -> int:
+        """Semantic store version used by the decode batch-plan cache."""
+
+        with self._lock:
+            return self._revision
+
+    def get_many_with_revision(
+        self, req_pool_indices: List[int]
+    ) -> Tuple[int, List[Optional[SparseDecodePlan]]]:
+        """Atomically snapshot the store version and requested plans."""
+
+        plans: List[Optional[SparseDecodePlan]] = []
+        with self._lock:
+            revision = self._revision
+            for req_pool_idx in req_pool_indices:
+                key = int(req_pool_idx)
+                plan = self._store.get(key)
+                if plan is not None:
+                    self._store.move_to_end(key)
+                plans.append(plan)
+        return revision, plans
+
     def drop(self, req_pool_idx: int) -> None:
         with self._lock:
-            self._store.pop(int(req_pool_idx), None)
+            if self._store.pop(int(req_pool_idx), None) is not None:
+                self._revision += 1
 
     def clear(self) -> None:
         with self._lock:
-            self._store.clear()
+            if self._store:
+                self._store.clear()
+                self._revision += 1
 
     def __len__(self) -> int:
         with self._lock:
@@ -1417,6 +1776,51 @@ class SparseDecodePlanStore:
 _SPARSE_DECODE_STORE: Optional[SparseDecodePlanStore] = None
 _SPARSE_DECODE_STORE_LOCK = threading.Lock()
 _SPARSE_DECODE_LAST_BATCH = threading.local()
+
+
+@dataclass
+class _SparseDecodeMaskWorkspace:
+    """Stable per-batch CUDA storage reused across consecutive decode tokens."""
+
+    capacity: int
+    drop_mask: torch.Tensor
+    keep_recent: torch.Tensor
+    keep_first: torch.Tensor
+    output_page_table: torch.Tensor
+    sparse_lens: torch.Tensor
+    previous_seq_lens: torch.Tensor
+    last_seq_lens_cpu: Optional[Tuple[int, ...]] = None
+    last_drop_counts: Optional[Tuple[int, ...]] = None
+    append_ready: bool = False
+
+
+@dataclass(frozen=True)
+class _SparseDecodeStaticBatch:
+    """Host-side routing that is invariant while a decode batch is stable."""
+
+    cache_key: Tuple
+    cand_orig: Tuple[int, ...]
+    cand_plans: Tuple[SparseDecodePlan, ...]
+    keep_recent: Tuple[int, ...]
+    keep_first: Tuple[int, ...]
+    drop_upper_bound: int
+    all_have_positions: bool
+    steady_drop_counts: Tuple[int, ...]
+    steady_min_seq_lens: Tuple[int, ...]
+    steady_dropped_total: int
+    steady_used_requests: int
+
+
+_SPARSE_DECODE_MASK_CACHE: "OrderedDict[Tuple, _SparseDecodeMaskWorkspace]" = (
+    OrderedDict()
+)
+_SPARSE_DECODE_MASK_CACHE_LOCK = threading.Lock()
+_SPARSE_DECODE_MASK_CACHE_MAX = 8
+_SPARSE_DECODE_STATIC_BATCH_CACHE: "OrderedDict[Tuple, _SparseDecodeStaticBatch]" = (
+    OrderedDict()
+)
+_SPARSE_DECODE_STATIC_BATCH_CACHE_LOCK = threading.Lock()
+_SPARSE_DECODE_STATIC_BATCH_CACHE_MAX = 16
 
 
 def get_sparse_decode_store() -> SparseDecodePlanStore:
@@ -1430,15 +1834,129 @@ def get_sparse_decode_store() -> SparseDecodePlanStore:
     return _SPARSE_DECODE_STORE
 
 
+def _get_sparse_decode_static_batch(
+    store: SparseDecodePlanStore,
+    req_cpu: List[int],
+) -> _SparseDecodeStaticBatch:
+    """Resolve stable request→plan routing once per batch composition.
+
+    Normal decode runs tens or hundreds of forwards with the same request rows.  The
+    old path reacquired the store lock, rebuilt candidate lists, and bisected every
+    plan on every token.  A store revision makes this cache safe across pool-slot
+    reuse, request completion, KV flushes, and newly registered recipient plans.
+    """
+
+    req_key = tuple(int(value) for value in req_cpu)
+    revision = store.revision
+    cache_key = (id(store), revision, req_key)
+    with _SPARSE_DECODE_STATIC_BATCH_CACHE_LOCK:
+        cached = _SPARSE_DECODE_STATIC_BATCH_CACHE.get(cache_key)
+        if cached is not None:
+            _SPARSE_DECODE_STATIC_BATCH_CACHE.move_to_end(cache_key)
+            return cached
+
+    # Snapshot under the store lock; a concurrent semantic change gets its own key.
+    revision, plans_for_batch = store.get_many_with_revision(req_cpu)
+    cache_key = (id(store), revision, req_key)
+    with _SPARSE_DECODE_STATIC_BATCH_CACHE_LOCK:
+        cached = _SPARSE_DECODE_STATIC_BATCH_CACHE.get(cache_key)
+        if cached is not None:
+            _SPARSE_DECODE_STATIC_BATCH_CACHE.move_to_end(cache_key)
+            return cached
+
+    batch_size = len(req_cpu)
+    cand_orig: List[int] = []
+    cand_plans: List[SparseDecodePlan] = []
+    keep_recent = [0] * batch_size
+    keep_first = [0] * batch_size
+    steady_drop_counts = [0] * batch_size
+    steady_min_seq_lens = [0] * batch_size
+    drop_upper_bound = 0
+    all_have_positions = True
+    for row, plan in enumerate(plans_for_batch):
+        if plan is None or int(plan.n_drop_tokens) <= 0:
+            continue
+        cand_orig.append(row)
+        cand_plans.append(plan)
+        recent = max(0, int(plan.keep_recent))
+        first = max(0, int(getattr(plan, "keep_first", 0)))
+        keep_recent[row] = recent
+        keep_first[row] = first
+        drop_upper_bound += int(plan.n_drop_tokens)
+        positions_host = plan.drop_positions_host
+        if positions_host is None:
+            positions = plan.drop_positions
+            if positions is None or int(positions.numel()) == 0:
+                all_have_positions = False
+                continue
+            positions_host = tuple(int(value) for value in positions.tolist())
+            plan.drop_positions_host = positions_host
+        if not positions_host:
+            all_have_positions = False
+            continue
+        lo = bisect_left(positions_host, first)
+        count = max(0, len(positions_host) - lo)
+        steady_drop_counts[row] = count
+        if count > 0:
+            # Once the causal tail has passed the final drop position this count can
+            # never change during append-only decode.
+            steady_min_seq_lens[row] = int(positions_host[-1]) + 1 + recent
+
+    static = _SparseDecodeStaticBatch(
+        cache_key=cache_key,
+        cand_orig=tuple(cand_orig),
+        cand_plans=tuple(cand_plans),
+        keep_recent=tuple(keep_recent),
+        keep_first=tuple(keep_first),
+        drop_upper_bound=int(drop_upper_bound),
+        all_have_positions=bool(all_have_positions),
+        steady_drop_counts=tuple(steady_drop_counts),
+        steady_min_seq_lens=tuple(steady_min_seq_lens),
+        steady_dropped_total=sum(steady_drop_counts),
+        steady_used_requests=sum(count > 0 for count in steady_drop_counts),
+    )
+    with _SPARSE_DECODE_STATIC_BATCH_CACHE_LOCK:
+        _SPARSE_DECODE_STATIC_BATCH_CACHE[cache_key] = static
+        _SPARSE_DECODE_STATIC_BATCH_CACHE.move_to_end(cache_key)
+        while (
+            len(_SPARSE_DECODE_STATIC_BATCH_CACHE)
+            > _SPARSE_DECODE_STATIC_BATCH_CACHE_MAX
+        ):
+            _SPARSE_DECODE_STATIC_BATCH_CACHE.popitem(last=False)
+    return static
+
+
 def sparse_decode_enabled() -> bool:
     cfg = get_config()
     return bool(cacheblend_enabled() and cfg.sparse_decode)
+
+
+def clear_runtime_state() -> None:
+    """Drop all model-version-bound CacheBlend state.
+
+    Donor K/V and sparse plans must never survive a KV-cache flush or a weight update.
+    Keeping this as one entry point makes lifecycle hooks fail closed and releases donor
+    tensors before the runtime calls ``empty_cache``.
+    """
+    get_donor_store().clear()
+    clear_recipient_blend_plans()
+    store = _SPARSE_DECODE_STORE
+    if store is not None:
+        store.clear()
+    with _SPARSE_DECODE_MASK_CACHE_LOCK:
+        _SPARSE_DECODE_MASK_CACHE.clear()
+    with _SPARSE_DECODE_STATIC_BATCH_CACHE_LOCK:
+        _SPARSE_DECODE_STATIC_BATCH_CACHE.clear()
+    set_request_context(None)
+    set_source_input_ids(None)
+    set_last_sparse_decode_batch(None)
 
 
 def register_sparse_decode_plan_from_blend(
     plan: "RecipientKVBlendPlan",
     *,
     req_pool_idx: int,
+    drop_positions: Optional[torch.Tensor] = None,
 ) -> Optional[SparseDecodePlan]:
     """Persist a sparse-decode plan from a finalized recipient blend plan.
 
@@ -1466,6 +1984,13 @@ def register_sparse_decode_plan_from_blend(
     drop_locs = (
         plan.img_locs.to(dtype=torch.long)[reuse_mask].detach().cpu().contiguous()
     )
+    drop_positions_cpu = None
+    if drop_positions is not None:
+        drop_positions_cpu = (
+            drop_positions.to(dtype=torch.long).detach().cpu().contiguous()
+        )
+        if int(drop_positions_cpu.numel()) != int(drop_locs.numel()):
+            drop_positions_cpu = None
     store = get_sparse_decode_store()
     existing = store.get(int(req_pool_idx))
     if existing is not None and existing.drop_locs.numel() > 0:
@@ -1474,6 +1999,12 @@ def register_sparse_decode_plan_from_blend(
             sorted=True,
         )
         drop_locs = merged.contiguous()
+        if existing.drop_positions is not None and drop_positions_cpu is not None:
+            drop_positions_cpu = torch.unique(
+                torch.cat([existing.drop_positions, drop_positions_cpu]), sorted=True
+            ).contiguous()
+        elif existing.drop_positions is not None:
+            drop_positions_cpu = existing.drop_positions
         n_image = int(existing.n_image_tokens) + int(plan.n_image_tokens)
     else:
         n_image = int(plan.n_image_tokens)
@@ -1481,6 +2012,12 @@ def register_sparse_decode_plan_from_blend(
         request_id=str(plan.request_id),
         req_pool_idx=int(req_pool_idx),
         drop_locs=drop_locs,
+        drop_positions=drop_positions_cpu,
+        drop_positions_host=(
+            tuple(int(value) for value in drop_positions_cpu.tolist())
+            if drop_positions_cpu is not None
+            else None
+        ),
         n_image_tokens=n_image,
         n_drop_tokens=int(drop_locs.numel()),
         mode=mode,
@@ -1519,6 +2056,24 @@ def _sparse_decode_drop_locs_for_device(
     locs = plan.drop_locs.to(device=device, dtype=dtype, non_blocking=True).contiguous()
     plan.drop_locs_cache[key] = locs
     return locs
+
+
+def _sparse_decode_drop_positions_for_device(
+    plan: SparseDecodePlan,
+    *,
+    device: torch.device,
+) -> Optional[torch.Tensor]:
+    positions = plan.drop_positions
+    if positions is None:
+        return None
+    key = str(device)
+    cached = plan.drop_positions_cache.get(key)
+    if cached is None:
+        cached = positions.to(
+            device=device, dtype=torch.long, non_blocking=True
+        ).contiguous()
+        plan.drop_positions_cache[key] = cached
+    return cached
 
 
 def _sparse_decode_incremental_drop_mask(
@@ -1662,22 +2217,25 @@ def build_sparse_decode_batch(
     page_table: torch.Tensor,
     cache_seqlens: torch.Tensor,
     page_size: int = 1,
+    req_pool_indices: Optional[torch.Tensor] = None,
+    seq_lens_cpu: Optional[Any] = None,
+    req_pool_indices_cpu: Optional[Any] = None,
+    output_page_table: Optional[torch.Tensor] = None,
+    output_cache_seqlens: Optional[torch.Tensor] = None,
+    source_req_to_token: Optional[torch.Tensor] = None,
 ) -> Optional[SparseDecodeBatch]:
-    """Build a shortened decode page table that drops reusable image context tokens.
+    """Build a shortened page table for normal token-by-token decode.
 
-    Constraints:
-      - ``page_size`` must be 1 for token-level skipping. Larger pages fall back to dense
-        because the FA page table can only drop whole pages safely.
-      - Only normal decode (no speculative / cascade / local-attn) should call this.
-      - Dropped tokens are donor-reused image KV slots registered at prefill time.
-      - The most recent ``keep_recent`` tokens are always retained.
+    Production plans carry stable request token positions, resolved once during
+    recipient prefill. This avoids the old per-token physical-KV membership search and
+    eliminates GPU-to-CPU synchronizations from the hot decode path. Location-only
+    plans retain the previous compatibility path.
     """
     set_last_sparse_decode_batch(None)
-    if not sparse_decode_enabled():
+    if not sparse_decode_enabled() or int(page_size) != 1:
         return None
-    if int(page_size) != 1:
-        return None
-    req_pool_indices = getattr(forward_batch, "req_pool_indices", None)
+    if req_pool_indices is None:
+        req_pool_indices = getattr(forward_batch, "req_pool_indices", None)
     if req_pool_indices is None or page_table is None or cache_seqlens is None:
         return None
     if page_table.ndim != 2 or cache_seqlens.ndim != 1:
@@ -1685,173 +2243,645 @@ def build_sparse_decode_batch(
     batch_size = int(page_table.shape[0])
     if batch_size == 0 or int(cache_seqlens.numel()) != batch_size:
         return None
-    flat_req = req_pool_indices.reshape(-1)
-    if int(flat_req.numel()) < batch_size:
+    if source_req_to_token is not None and (
+        source_req_to_token.ndim != 2
+        or source_req_to_token.device != page_table.device
+        or source_req_to_token.dtype != page_table.dtype
+        or int(source_req_to_token.shape[1]) < int(page_table.shape[1])
+        or req_pool_indices.device != page_table.device
+    ):
         return None
 
     store = get_sparse_decode_store()
+    if len(store) == 0:
+        return None
     cfg = get_config()
     device = page_table.device
     dtype = page_table.dtype
     max_len = int(page_table.shape[1])
-
-    lens_cpu = [
-        max(0, min(int(v), max_len))
-        for v in cache_seqlens.detach().to(device="cpu", dtype=torch.long).tolist()
-    ]
-    req_cpu = (
-        flat_req[:batch_size]
-        .detach()
-        .to(device="cpu", dtype=torch.long)
-        .tolist()
+    host_meta = _sparse_decode_host_metadata(
+        forward_batch,
+        cache_seqlens=cache_seqlens,
+        req_pool_indices=req_pool_indices,
+        batch_size=batch_size,
+        max_len=max_len,
+        seq_lens_cpu=seq_lens_cpu,
+        req_pool_indices_cpu=req_pool_indices_cpu,
     )
+    if host_meta is None:
+        return None
+    lens_cpu, req_cpu = host_meta
     total_tokens = sum(lens_cpu)
     if total_tokens <= 0:
         return None
 
-    # Collect drop candidates on CPU (no per-row device sync). Only rows with a
-    # registered plan and pending drops matter; everything else passes through. Encoding
-    # a compact candidate row id into the key lets one batched isin replace per-row isin
-    # while preserving per-request isolation. ``row_stride`` is sized from ``batch_size``
-    # (>= n_candidate) so it is a safe upper stride for realistic KV-loc magnitudes.
-    row_stride = torch.iinfo(torch.int64).max // max(batch_size + 1, 1)
-    cand_orig: List[int] = []
-    cand_plans: List[SparseDecodePlan] = []
-    cand_drop_pieces: List[torch.Tensor] = []
-    keep_recent_cpu = [0] * batch_size
-    keep_first_cpu = [0] * batch_size
-    drop_upper_bound = 0
-    for b, req_pool_idx in enumerate(req_cpu):
-        if lens_cpu[b] <= 0:
-            continue
-        plan = store.get(int(req_pool_idx))
-        if plan is None or int(plan.n_drop_tokens) <= 0:
-            continue
-        keep_recent_cpu[b] = max(0, int(plan.keep_recent))
-        keep_first_cpu[b] = max(0, int(getattr(plan, "keep_first", 0)))
-        drop_locs = _sparse_decode_drop_locs_for_device(
-            plan, device=device, dtype=torch.long
-        )
-        if int(drop_locs.numel()) <= 0:
-            continue
-        j = len(cand_orig)
-        cand_orig.append(b)
-        cand_plans.append(plan)
-        cand_drop_pieces.append(drop_locs + (j * row_stride))
-        drop_upper_bound += int(drop_locs.numel())
+    static_batch = _get_sparse_decode_static_batch(store, req_cpu)
+    cand_orig = static_batch.cand_orig
+    cand_plans = static_batch.cand_plans
+    keep_recent_cpu = static_batch.keep_recent
+    keep_first_cpu = static_batch.keep_first
+    drop_upper_bound = static_batch.drop_upper_bound
+    all_have_positions = static_batch.all_have_positions
 
-    if not cand_drop_pieces:
+    if not cand_plans or any(lens_cpu[row] <= 0 for row in cand_orig):
         return None
 
-    # [gate: early bail] Each page-table row holds unique KV slots, so a request can
-    # match at most ``n_drop_tokens`` of its drop_locs, and keep_recent/keep_first only
-    # remove drops. Hence ``drop_upper_bound`` (sum of candidate drop_locs) upper-bounds
-    # the true dropped_total. If even the bound cannot satisfy the min-drop gate, bail
-    # before allocating any (batch, max_len) tensor. When gates are 0 (default), this is
-    # inert and behavior is unchanged.
-    min_dropped = max(0, int(getattr(cfg, "sparse_decode_min_dropped_tokens", 0) or 0))
-    min_ratio = max(0.0, float(getattr(cfg, "sparse_decode_min_drop_ratio", 0.0) or 0.0))
+    min_dropped = max(
+        0, int(getattr(cfg, "sparse_decode_min_dropped_tokens", 0) or 0)
+    )
+    min_ratio = max(
+        0.0, float(getattr(cfg, "sparse_decode_min_drop_ratio", 0.0) or 0.0)
+    )
     if min_dropped > 0 and drop_upper_bound < min_dropped:
         return None
-    if (
-        min_ratio > 0.0
-        and total_tokens > 0
-        and (drop_upper_bound / total_tokens) < min_ratio
-    ):
+    if min_ratio > 0.0 and (drop_upper_bound / total_tokens) < min_ratio:
         return None
+
+    if all_have_positions and page_table.is_cuda:
+        return _build_sparse_decode_position_cuda(
+            forward_batch=forward_batch,
+            page_table=page_table,
+            cache_seqlens=cache_seqlens,
+            lens_cpu=lens_cpu,
+            req_cpu=req_cpu,
+            cand_orig=cand_orig,
+            cand_plans=cand_plans,
+            keep_recent_cpu=keep_recent_cpu,
+            keep_first_cpu=keep_first_cpu,
+            total_tokens=total_tokens,
+            min_dropped=min_dropped,
+            min_ratio=min_ratio,
+            static_batch=static_batch,
+            output_page_table=output_page_table,
+            output_cache_seqlens=output_cache_seqlens,
+            source_req_to_token=source_req_to_token,
+            source_req_pool_indices=req_pool_indices,
+        )
 
     lens = torch.tensor(lens_cpu, dtype=torch.int32, device=device)
     pos = torch.arange(max_len, dtype=torch.int32, device=device).unsqueeze(0)
     valid_mask = pos < lens.unsqueeze(1)
 
-    if cfg.sparse_decode_incremental:
-        # P1: extend each request's cached drop columns by only the newly appended
-        # decode positions instead of re-scanning the whole context every forward.
-        drop_mask = _sparse_decode_incremental_drop_mask(
-            cand_orig=cand_orig,
-            cand_plans=cand_plans,
-            page_table=page_table,
-            lens_cpu=lens_cpu,
-            batch_size=batch_size,
-            max_len=max_len,
-            device=device,
-        )
-    else:
-        # Full recompute: restrict the int64 key encoding + isin to candidate rows,
-        # then scatter the drop mask back to the full batch. Non-candidate rows keep
-        # drop_mask == False.
-        cand_idx = torch.tensor(cand_orig, dtype=torch.long, device=device)
-        n_cand = int(cand_idx.numel())
-        cand_offsets = (
-            torch.arange(n_cand, dtype=torch.long, device=device).unsqueeze(1)
-            * row_stride
-        )
-        cand_page_keys = (
-            page_table.index_select(0, cand_idx).to(dtype=torch.long) + cand_offsets
-        )
-        drop_keys = torch.cat(cand_drop_pieces).contiguous()
-        cand_drop_mask = torch.isin(cand_page_keys, drop_keys)
-
+    exact_drop_counts_cpu: Optional[List[int]] = None
+    if all_have_positions:
         drop_mask = page_table.new_zeros((batch_size, max_len), dtype=torch.bool)
-        drop_mask[cand_idx] = cand_drop_mask
-    drop_mask &= valid_mask
+        position_pieces: List[torch.Tensor] = []
+        position_rows: List[int] = []
+        position_counts: List[int] = []
+        exact_drop_counts_cpu = [0] * batch_size
+        for b, plan in zip(cand_orig, cand_plans):
+            positions_cpu = plan.drop_positions
+            assert positions_cpu is not None
+            cutoff = max(0, lens_cpu[b] - keep_recent_cpu[b])
+            first = keep_first_cpu[b]
+            positions_host = plan.drop_positions_host
+            if positions_host is None:
+                positions_host = tuple(int(value) for value in positions_cpu.tolist())
+                plan.drop_positions_host = positions_host
+            lo = bisect_left(positions_host, first)
+            hi = bisect_left(positions_host, min(cutoff, max_len))
+            drop_count = max(0, hi - lo)
+            if drop_count >= lens_cpu[b] and lens_cpu[b] > 0:
+                drop_count -= int((lens_cpu[b] - 1) in positions_host[lo:hi])
+            exact_drop_counts_cpu[b] = drop_count
+            positions = _sparse_decode_drop_positions_for_device(
+                plan, device=device
+            )
+            if positions is None or int(positions.numel()) == 0:
+                continue
+            position_pieces.append(positions)
+            position_rows.append(int(b))
+            position_counts.append(int(positions.numel()))
+        if position_pieces:
+            cols = torch.cat(position_pieces)
+            rows = torch.repeat_interleave(
+                torch.tensor(position_rows, dtype=torch.long, device=device),
+                torch.tensor(position_counts, dtype=torch.long, device=device),
+            )
+            drop_mask[rows, cols] = True
+    else:
+        # Compatibility for direct/unit callers that did not register semantic
+        # positions. Production registration always bypasses this context-wide search.
+        row_stride = torch.iinfo(torch.int64).max // max(batch_size + 1, 1)
+        cand_drop_pieces: List[torch.Tensor] = []
+        for j, plan in enumerate(cand_plans):
+            drop_locs = _sparse_decode_drop_locs_for_device(
+                plan, device=device, dtype=torch.long
+            )
+            cand_drop_pieces.append(drop_locs + (j * row_stride))
+        if cfg.sparse_decode_incremental:
+            drop_mask = _sparse_decode_incremental_drop_mask(
+                cand_orig=cand_orig,
+                cand_plans=cand_plans,
+                page_table=page_table,
+                lens_cpu=lens_cpu,
+                batch_size=batch_size,
+                max_len=max_len,
+                device=device,
+            )
+        else:
+            cand_idx = torch.tensor(cand_orig, dtype=torch.long, device=device)
+            n_cand = int(cand_idx.numel())
+            cand_offsets = (
+                torch.arange(n_cand, dtype=torch.long, device=device).unsqueeze(1)
+                * row_stride
+            )
+            cand_page_keys = (
+                page_table.index_select(0, cand_idx).to(dtype=torch.long)
+                + cand_offsets
+            )
+            drop_keys = torch.cat(cand_drop_pieces).contiguous()
+            cand_drop_mask = torch.isin(cand_page_keys, drop_keys)
+            drop_mask = page_table.new_zeros(
+                (batch_size, max_len), dtype=torch.bool
+            )
+            drop_mask[cand_idx] = cand_drop_mask
 
-    keep_recent = torch.tensor(keep_recent_cpu, dtype=torch.int32, device=device)
+    drop_mask &= valid_mask
+    keep_recent = torch.tensor(
+        keep_recent_cpu, dtype=torch.int32, device=device
+    )
     keep_first = torch.tensor(keep_first_cpu, dtype=torch.int32, device=device)
     keep_from = torch.clamp(lens - keep_recent, min=0)
-    recent_protected = (keep_recent.unsqueeze(1) > 0) & (
-        pos >= keep_from.unsqueeze(1)
+    drop_mask &= ~(
+        (keep_recent.unsqueeze(1) > 0) & (pos >= keep_from.unsqueeze(1))
     )
-    first_protected = (keep_first.unsqueeze(1) > 0) & (
-        pos < keep_first.unsqueeze(1)
+    drop_mask &= ~(
+        (keep_first.unsqueeze(1) > 0) & (pos < keep_first.unsqueeze(1))
     )
-    drop_mask &= ~recent_protected
-    drop_mask &= ~first_protected
 
-    drop_counts = drop_mask.sum(dim=1, dtype=torch.int32)
-    all_dropped = (drop_counts >= lens) & (lens > 0)
-    if bool(all_dropped.any()):
-        rows = torch.nonzero(all_dropped, as_tuple=False).flatten()
-        drop_mask[rows, lens[rows].to(dtype=torch.long) - 1] = False
+    if exact_drop_counts_cpu is not None:
+        dropped_total = sum(exact_drop_counts_cpu)
+        used_requests = sum(count > 0 for count in exact_drop_counts_cpu)
+        sparse_lens_cpu = [
+            lens_cpu[b] - exact_drop_counts_cpu[b] for b in range(batch_size)
+        ]
+    else:
         drop_counts = drop_mask.sum(dim=1, dtype=torch.int32)
-
-    used_requests = int((drop_counts > 0).sum().item())
-    dropped_total = int(drop_counts.sum().item())
+        all_dropped = (drop_counts >= lens) & (lens > 0)
+        if bool(all_dropped.any()):
+            rows = torch.nonzero(all_dropped, as_tuple=False).flatten()
+            drop_mask[rows, lens[rows].to(dtype=torch.long) - 1] = False
+            drop_counts = drop_mask.sum(dim=1, dtype=torch.int32)
+        drop_counts_cpu = drop_counts.detach().cpu().tolist()
+        dropped_total = sum(int(value) for value in drop_counts_cpu)
+        used_requests = sum(int(value) > 0 for value in drop_counts_cpu)
+        sparse_lens_cpu = [
+            lens_cpu[b] - int(drop_counts_cpu[b]) for b in range(batch_size)
+        ]
 
     if used_requests == 0 or dropped_total == 0:
         return None
-    min_dropped = max(0, int(getattr(cfg, "sparse_decode_min_dropped_tokens", 0) or 0))
-    min_ratio = max(0.0, float(getattr(cfg, "sparse_decode_min_drop_ratio", 0.0) or 0.0))
-    drop_ratio = (dropped_total / total_tokens) if total_tokens > 0 else 0.0
+    drop_ratio = dropped_total / total_tokens
     if min_dropped > 0 and dropped_total < min_dropped:
         return None
     if min_ratio > 0.0 and drop_ratio < min_ratio:
         return None
 
     keep_mask = valid_mask & ~drop_mask
-    sparse_lens = keep_mask.sum(dim=1, dtype=torch.int32)
-    max_sparse = int(sparse_lens.max().item()) if int(sparse_lens.numel()) > 0 else 0
-    out = page_table.new_zeros((batch_size, max_sparse), dtype=dtype)
-    if max_sparse > 0:
+    sparse_lens = torch.tensor(
+        sparse_lens_cpu, dtype=torch.int32, device=device
+    )
+    max_sparse = max(sparse_lens_cpu, default=0)
+    if max_sparse <= 0:
+        return None
+
+    if page_table.is_cuda:
+        from sglang.srt.mem_cache.sparse_decode_kernels import compact_page_table
+
+        out = compact_page_table(page_table, keep_mask, max_sparse)
+    else:
+        # Reference/fallback path also keeps CPU-only unit tests independent of Triton.
+        out = page_table.new_zeros((batch_size, max_sparse), dtype=dtype)
         ranks = torch.cumsum(keep_mask.to(dtype=torch.int32), dim=1) - 1
         rows, cols = torch.nonzero(keep_mask, as_tuple=True)
         out[rows, ranks[rows, cols].to(dtype=torch.long)] = page_table[rows, cols]
-    lens = sparse_lens
+
     cu = torch.nn.functional.pad(
-        torch.cumsum(lens, dim=0, dtype=torch.int32), (1, 0)
+        torch.cumsum(sparse_lens, dim=0, dtype=torch.int32), (1, 0)
     )
-    kept_total = int(sparse_lens.sum().item())
     batch = SparseDecodeBatch(
         page_table=out,
-        cache_seqlens=lens,
+        cache_seqlens=sparse_lens,
         cu_seqlens_k=cu,
         max_seqlen_k=int(max_sparse),
-        kept_tokens=int(kept_total),
+        kept_tokens=int(total_tokens - dropped_total),
         dropped_tokens=int(dropped_total),
         used_requests=int(used_requests),
     )
     set_last_sparse_decode_batch(batch)
     return batch
+
+
+def _sparse_decode_mask_workspace(
+    *,
+    page_table: torch.Tensor,
+    req_cpu: List[int],
+    cand_orig: List[int],
+    cand_plans: List[SparseDecodePlan],
+    keep_recent_cpu: List[int],
+    keep_first_cpu: List[int],
+    cache_key: Optional[Tuple] = None,
+    output_page_table: Optional[torch.Tensor] = None,
+    output_sparse_lens: Optional[torch.Tensor] = None,
+) -> _SparseDecodeMaskWorkspace:
+    """Get stable drop masks without rebuilding them for every generated token."""
+
+    batch_size, max_len = (int(v) for v in page_table.shape)
+    capacity = 1 << max(0, max_len - 1).bit_length()
+    if cache_key is None:
+        plans_by_row = {row: plan for row, plan in zip(cand_orig, cand_plans)}
+        key = (
+            str(page_table.device),
+            tuple(
+                (int(req_idx), id(plans_by_row[b]) if b in plans_by_row else 0)
+                for b, req_idx in enumerate(req_cpu)
+            ),
+        )
+    else:
+        key = (str(page_table.device), cache_key)
+    if output_page_table is not None or output_sparse_lens is not None:
+        if output_page_table is None or output_sparse_lens is None:
+            raise ValueError("both sparse decode output buffers must be provided")
+        if (
+            output_page_table.device != page_table.device
+            or output_page_table.dtype != page_table.dtype
+            or output_page_table.ndim != 2
+            or int(output_page_table.shape[0]) < batch_size
+            or int(output_page_table.shape[1]) < capacity
+            or output_sparse_lens.device != page_table.device
+            or output_sparse_lens.dtype != torch.int32
+            or output_sparse_lens.ndim != 1
+            or int(output_sparse_lens.numel()) < batch_size
+        ):
+            raise ValueError("sparse decode output buffers are too small or incompatible")
+        output_page_table = output_page_table[:batch_size]
+        output_sparse_lens = output_sparse_lens[:batch_size]
+        key = (
+            key,
+            int(output_page_table.data_ptr()),
+            int(output_sparse_lens.data_ptr()),
+        )
+    with _SPARSE_DECODE_MASK_CACHE_LOCK:
+        cached = _SPARSE_DECODE_MASK_CACHE.get(key)
+        if cached is not None and cached.capacity >= max_len:
+            _SPARSE_DECODE_MASK_CACHE.move_to_end(key)
+            return cached
+
+    drop_mask = torch.zeros(
+        (batch_size, capacity), dtype=torch.bool, device=page_table.device
+    )
+    position_pieces: List[torch.Tensor] = []
+    position_rows: List[int] = []
+    position_counts: List[int] = []
+    for row, plan in zip(cand_orig, cand_plans):
+        positions = _sparse_decode_drop_positions_for_device(
+            plan, device=page_table.device
+        )
+        if positions is None or int(positions.numel()) == 0:
+            continue
+        positions = positions[positions < capacity]
+        if int(positions.numel()) == 0:
+            continue
+        position_pieces.append(positions)
+        position_rows.append(int(row))
+        position_counts.append(int(positions.numel()))
+    if position_pieces:
+        cols = torch.cat(position_pieces)
+        rows = torch.repeat_interleave(
+            torch.tensor(position_rows, dtype=torch.long, device=page_table.device),
+            torch.tensor(position_counts, dtype=torch.long, device=page_table.device),
+        )
+        drop_mask[rows, cols] = True
+
+    workspace = _SparseDecodeMaskWorkspace(
+        capacity=capacity,
+        drop_mask=drop_mask,
+        keep_recent=torch.tensor(
+            keep_recent_cpu, dtype=torch.int32, device=page_table.device
+        ),
+        keep_first=torch.tensor(
+            keep_first_cpu, dtype=torch.int32, device=page_table.device
+        ),
+        output_page_table=(
+            output_page_table
+            if output_page_table is not None
+            else page_table.new_empty((batch_size, capacity))
+        ),
+        sparse_lens=(
+            output_sparse_lens
+            if output_sparse_lens is not None
+            else torch.empty(
+                (batch_size,), dtype=torch.int32, device=page_table.device
+            )
+        ),
+        previous_seq_lens=torch.empty(
+            (batch_size,), dtype=torch.int32, device=page_table.device
+        ),
+    )
+    with _SPARSE_DECODE_MASK_CACHE_LOCK:
+        _SPARSE_DECODE_MASK_CACHE[key] = workspace
+        _SPARSE_DECODE_MASK_CACHE.move_to_end(key)
+        while len(_SPARSE_DECODE_MASK_CACHE) > _SPARSE_DECODE_MASK_CACHE_MAX:
+            _SPARSE_DECODE_MASK_CACHE.popitem(last=False)
+    return workspace
+
+
+def _build_sparse_decode_position_cuda(
+    *,
+    forward_batch: Any,
+    page_table: torch.Tensor,
+    cache_seqlens: torch.Tensor,
+    lens_cpu: List[int],
+    req_cpu: List[int],
+    cand_orig: List[int],
+    cand_plans: List[SparseDecodePlan],
+    keep_recent_cpu: List[int],
+    keep_first_cpu: List[int],
+    total_tokens: int,
+    min_dropped: int,
+    min_ratio: float,
+    static_batch: _SparseDecodeStaticBatch,
+    output_page_table: Optional[torch.Tensor] = None,
+    output_cache_seqlens: Optional[torch.Tensor] = None,
+    source_req_to_token: Optional[torch.Tensor] = None,
+    source_req_pool_indices: Optional[torch.Tensor] = None,
+) -> Optional[SparseDecodeBatch]:
+    """CUDA fast path for production plans with stable semantic positions."""
+
+    batch_size = int(page_table.shape[0])
+    steady_drop_set = all(
+        lens_cpu[row] >= static_batch.steady_min_seq_lens[row]
+        and static_batch.steady_drop_counts[row] < lens_cpu[row]
+        for row in cand_orig
+    )
+    if steady_drop_set:
+        drop_counts = static_batch.steady_drop_counts
+        dropped_total = static_batch.steady_dropped_total
+        used_requests = static_batch.steady_used_requests
+    else:
+        dynamic_drop_counts = [0] * batch_size
+        for row, plan in zip(cand_orig, cand_plans):
+            positions_host = plan.drop_positions_host
+            assert positions_host is not None
+            seq_len = lens_cpu[row]
+            first = keep_first_cpu[row]
+            cutoff = max(0, seq_len - keep_recent_cpu[row])
+            lo = bisect_left(positions_host, first)
+            hi = bisect_left(positions_host, cutoff)
+            count = max(0, hi - lo)
+            if (
+                count >= seq_len
+                and seq_len > 0
+                and (seq_len - 1) in positions_host[lo:hi]
+            ):
+                count -= 1
+            dynamic_drop_counts[row] = count
+        drop_counts = dynamic_drop_counts
+        dropped_total = sum(drop_counts)
+        used_requests = sum(count > 0 for count in drop_counts)
+    if used_requests == 0 or dropped_total == 0:
+        return None
+    drop_ratio = dropped_total / total_tokens
+    if min_dropped > 0 and dropped_total < min_dropped:
+        return None
+    if min_ratio > 0.0 and drop_ratio < min_ratio:
+        return None
+
+    sparse_lens_cpu = [
+        lens_cpu[row] - drop_counts[row] for row in range(batch_size)
+    ]
+    max_sparse = max(sparse_lens_cpu, default=0)
+    if max_sparse <= 0:
+        return None
+    workspace = _sparse_decode_mask_workspace(
+        page_table=page_table,
+        req_cpu=req_cpu,
+        cand_orig=cand_orig,
+        cand_plans=cand_plans,
+        keep_recent_cpu=keep_recent_cpu,
+        keep_first_cpu=keep_first_cpu,
+        cache_key=static_batch.cache_key,
+        output_page_table=output_page_table,
+        output_sparse_lens=output_cache_seqlens,
+    )
+    from sglang.srt.mem_cache.sparse_decode_kernels import (
+        append_sparse_page_table,
+        append_sparse_req_to_token,
+        compact_sparse_page_table,
+        compact_sparse_req_to_token,
+    )
+
+    drop_counts_key = tuple(int(value) for value in drop_counts)
+    previous_lens = workspace.last_seq_lens_cpu
+    can_append = bool(
+        steady_drop_set
+        and workspace.append_ready
+        and workspace.last_drop_counts == drop_counts_key
+        and previous_lens is not None
+        and len(previous_lens) == len(lens_cpu)
+        and all(current >= previous for current, previous in zip(lens_cpu, previous_lens))
+    )
+    use_direct_source = (
+        source_req_to_token is not None and source_req_pool_indices is not None
+    )
+    if can_append:
+        max_growth = max(
+            (current - previous for current, previous in zip(lens_cpu, previous_lens)),
+            default=0,
+        )
+        if use_direct_source:
+            out, sparse_lens = append_sparse_req_to_token(
+                source_req_to_token,
+                source_req_pool_indices,
+                cache_seqlens,
+                workspace.previous_seq_lens,
+                workspace.sparse_lens,
+                workspace.output_page_table,
+                max_growth,
+            )
+        else:
+            out, sparse_lens = append_sparse_page_table(
+                page_table,
+                cache_seqlens,
+                workspace.previous_seq_lens,
+                workspace.sparse_lens,
+                workspace.output_page_table,
+                max_growth,
+            )
+    else:
+        if use_direct_source:
+            out, sparse_lens = compact_sparse_req_to_token(
+                source_req_to_token,
+                source_req_pool_indices,
+                workspace.drop_mask,
+                cache_seqlens,
+                workspace.keep_recent,
+                workspace.keep_first,
+                int(page_table.shape[1]),
+                workspace.capacity,
+                output=workspace.output_page_table,
+                sparse_lens=workspace.sparse_lens,
+            )
+        else:
+            out, sparse_lens = compact_sparse_page_table(
+                page_table,
+                workspace.drop_mask,
+                cache_seqlens,
+                workspace.keep_recent,
+                workspace.keep_first,
+                # A fixed power-of-two width lets consecutive decode tokens overwrite
+                # the same allocation. FlashAttention obeys cache_seqlens, so the
+                # rectangular tail is never attended.
+                workspace.capacity,
+                output=workspace.output_page_table,
+                sparse_lens=workspace.sparse_lens,
+            )
+        workspace.previous_seq_lens.copy_(cache_seqlens)
+    workspace.last_seq_lens_cpu = tuple(int(value) for value in lens_cpu)
+    workspace.last_drop_counts = drop_counts_key
+    workspace.append_ready = bool(steady_drop_set)
+    batch = SparseDecodeBatch(
+        page_table=out,
+        cache_seqlens=sparse_lens,
+        # Normal single-token FlashAttention decode consumes cache_seqlens directly;
+        # cu_seqlens_k is only a prefill/spec-decode input. Do not allocate and launch
+        # an unused cumsum+pad pair on every generated token.
+        cu_seqlens_k=None,
+        max_seqlen_k=int(max_sparse),
+        kept_tokens=int(total_tokens - dropped_total),
+        dropped_tokens=int(dropped_total),
+        used_requests=int(used_requests),
+        direct_source=bool(use_direct_source),
+        incremental_append=bool(can_append),
+    )
+    set_last_sparse_decode_batch(batch)
+    return batch
+
+
+def _sparse_decode_host_metadata(
+    forward_batch: Any,
+    *,
+    cache_seqlens: torch.Tensor,
+    req_pool_indices: torch.Tensor,
+    batch_size: int,
+    max_len: int,
+    seq_lens_cpu: Optional[Any] = None,
+    req_pool_indices_cpu: Optional[Any] = None,
+) -> Optional[Tuple[List[int], List[int]]]:
+    """Resolve decode row metadata without introducing a new GPU synchronization.
+
+    SGLang already carries sequence lengths on the host and retains the source ``Req``
+    objects.  Prefer those values; older/direct callers fall back to copying the two
+    device tensors.  This helper sits outside the page-table algorithm so the fallback
+    remains behaviorally identical.
+    """
+
+    host_lens = (
+        seq_lens_cpu
+        if seq_lens_cpu is not None
+        else getattr(forward_batch, "seq_lens_cpu", None)
+    )
+    lens_values: Optional[List[Any]] = None
+    if isinstance(host_lens, torch.Tensor):
+        if host_lens.device.type == "cpu" and int(host_lens.numel()) >= batch_size:
+            lens_values = host_lens.reshape(-1)[:batch_size].tolist()
+    elif host_lens is not None:
+        try:
+            values = list(host_lens)
+            if len(values) >= batch_size:
+                lens_values = values[:batch_size]
+        except (TypeError, ValueError):
+            pass
+    if lens_values is None:
+        if int(cache_seqlens.numel()) < batch_size:
+            return None
+        lens_values = (
+            cache_seqlens.reshape(-1)[:batch_size]
+            .detach()
+            .to(device="cpu", dtype=torch.long)
+            .tolist()
+        )
+    lens_cpu = [max(0, min(int(v), max_len)) for v in lens_values]
+
+    req_values: Optional[List[int]] = None
+    if req_pool_indices_cpu is not None:
+        try:
+            values = list(req_pool_indices_cpu)
+            if len(values) >= batch_size:
+                req_values = [int(value) for value in values[:batch_size]]
+        except (TypeError, ValueError):
+            req_values = None
+    reqs = list(getattr(forward_batch, "reqs", None) or [])
+    if req_values is None and len(reqs) >= batch_size:
+        candidate = [getattr(req, "req_pool_idx", None) for req in reqs[:batch_size]]
+        if all(value is not None for value in candidate):
+            try:
+                req_values = [int(value) for value in candidate]
+            except (TypeError, ValueError):
+                req_values = None
+    if req_values is None:
+        flat_req = req_pool_indices.reshape(-1)
+        if int(flat_req.numel()) < batch_size:
+            return None
+        req_values = (
+            flat_req[:batch_size]
+            .detach()
+            .to(device="cpu", dtype=torch.long)
+            .tolist()
+        )
+    return lens_cpu, req_values
+
+
+def _resolve_sparse_decode_drop_positions(
+    forward_batch: Any,
+    plan: "RecipientKVBlendPlan",
+    *,
+    req_pool_idx: int,
+    req_index: int,
+) -> Optional[torch.Tensor]:
+    """Map reusable physical KV slots to stable request token positions once.
+
+    The request-to-token row is already materialized at recipient prefill. Moving this
+    lookup here turns decode-time membership discovery from O(context) per generated
+    token into a fixed position scatter, and remains correct if physical KV slots later
+    move while the request's semantic token positions stay unchanged.
+    """
+    pool = getattr(forward_batch, "req_to_token_pool", None)
+    table = getattr(pool, "req_to_token", None) if pool is not None else None
+    if table is None or int(req_pool_idx) < 0 or int(req_pool_idx) >= table.shape[0]:
+        return None
+
+    reuse_mask = ~plan.recompute_mask.to(dtype=torch.bool)
+    reuse_locs = plan.img_locs.to(device=table.device, dtype=torch.long)[reuse_mask]
+    if int(reuse_locs.numel()) == 0:
+        return None
+
+    seq_len = None
+    host_lens = getattr(forward_batch, "seq_lens_cpu", None)
+    if host_lens is not None:
+        try:
+            seq_len = int(host_lens[req_index])
+        except (IndexError, TypeError, ValueError):
+            seq_len = None
+    if seq_len is None:
+        reqs = list(getattr(forward_batch, "reqs", None) or [])
+        if 0 <= req_index < len(reqs):
+            req = reqs[req_index]
+            fill_ids = getattr(req, "fill_ids", None)
+            if fill_ids is not None:
+                seq_len = len(fill_ids)
+    if seq_len is None:
+        seq_len = int(table.shape[1])
+    seq_len = max(0, min(int(seq_len), int(table.shape[1])))
+    if seq_len == 0:
+        return None
+
+    row = table[int(req_pool_idx), :seq_len].to(dtype=torch.long)
+    positions = torch.nonzero(torch.isin(row, reuse_locs), as_tuple=False).flatten()
+    if int(positions.numel()) != int(reuse_locs.numel()):
+        return None
+    return positions.detach().cpu().contiguous()
 
 
 def maybe_register_sparse_decode_plans(
@@ -1893,8 +2923,18 @@ def maybe_register_sparse_decode_plans(
         if req_index < 0 or req_index >= int(flat.numel()):
             continue
         req_pool_idx = int(flat[req_index].item())
+        drop_positions = _resolve_sparse_decode_drop_positions(
+            forward_batch,
+            plan,
+            req_pool_idx=req_pool_idx,
+            req_index=req_index,
+        )
         if (
-            register_sparse_decode_plan_from_blend(plan, req_pool_idx=req_pool_idx)
+            register_sparse_decode_plan_from_blend(
+                plan,
+                req_pool_idx=req_pool_idx,
+                drop_positions=drop_positions,
+            )
             is not None
         ):
             registered += 1
@@ -1928,7 +2968,11 @@ def recipient_reuse_token_indices(
     """Return current-batch token offsets whose image K/V is donor-reused."""
     if cache_locs is None:
         return torch.empty(0, dtype=torch.long, device=device)
-    plans = get_recipient_blend_plans()
+    plans = tuple(
+        plan
+        for plan in get_recipient_blend_plans()
+        if int(plan.reused_tokens) > 0
+    )
     if not plans:
         return torch.empty(0, dtype=torch.long, device=device or cache_locs.device)
     dev = device or cache_locs.device
@@ -1986,7 +3030,10 @@ def _active_query_ranges_cache_key(forward_batch: Any) -> Optional[Tuple]:
         int(req_pool_indices.data_ptr()),
         tuple(req_pool_indices.shape),
         tuple(int(x) for x in extend_seq_lens_cpu),
-        len(get_recipient_blend_plans()),
+        tuple(
+            (int(plan.recomputed_tokens), int(plan.reused_tokens))
+            for plan in get_recipient_blend_plans()
+        ),
     )
 
 
@@ -2655,6 +3702,15 @@ def _build_request_contexts_for_req(
         global_step = int(global_step)
     except Exception:
         global_step = -1
+    if global_step < 0:
+        log_stats(
+            CacheBlendStats(
+                role="none",
+                request_id=rid,
+                fallback_reason="missing_global_step",
+            ).finalize()
+        )
+        return []
 
     slots = _resolve_target_slots(req, cfg, image_token_id)
     if not slots:
@@ -2713,7 +3769,7 @@ def _build_request_contexts_for_req(
 
 def _parse_turn_from_rid(rid: str) -> Optional[int]:
     try:
-        from sglang.srt.mem_cache.grpo_similarity_cache import parse_turn_from_rid
+        from sglang.srt.mem_cache.rollout_request_metadata import parse_turn_from_rid
 
         return parse_turn_from_rid(rid)
     except Exception:
@@ -2722,7 +3778,7 @@ def _parse_turn_from_rid(rid: str) -> Optional[int]:
 
 def _lookup_request_meta(rid: str) -> Dict[str, Any]:
     try:
-        from sglang.srt.mem_cache.grpo_similarity_cache import lookup_request_meta
+        from sglang.srt.mem_cache.rollout_request_metadata import lookup_request_meta
 
         return lookup_request_meta(rid) or {}
     except Exception:
@@ -2989,20 +4045,56 @@ def capture_donor_kv(
     if pool is None or img_locs.numel() == 0:
         return None
     n_img = int(img_locs.numel())
-    entry = _DONOR_STORE.get_or_create_donor(
-        group_key=group_key,
-        n_image_tokens=n_img,
-        grid_sig=grid_sig,
-        positions=(positions.detach().clone() if positions is not None else None),
+    # Resolve buffers and reject a single entry that cannot fit *before* cloning every
+    # layer.  The previous publish-only check could transiently allocate an oversized
+    # donor and OOM before the store got a chance to reject it.
+    layer_buffers = []
+    estimated_bytes = (
+        int(positions.numel()) * int(positions.element_size())
+        if isinstance(positions, torch.Tensor)
+        else 0
     )
     for layer_id in layer_ids:
         k_buf = pool.get_key_buffer(layer_id)
         v_buf = pool.get_value_buffer(layer_id)
-        k = k_buf[img_locs].detach().clone()
-        v = v_buf[img_locs].detach().clone()
-        if to_cpu:
-            k = k.cpu()
-            v = v.cpu()
-        entry.record_layer(layer_id, k, v)
-    entry.complete = True
+        layer_buffers.append((layer_id, k_buf, v_buf))
+        estimated_bytes += n_img * math.prod(k_buf.shape[1:]) * k_buf.element_size()
+        estimated_bytes += n_img * math.prod(v_buf.shape[1:]) * v_buf.element_size()
+    max_bytes = _DONOR_STORE.max_bytes
+    if not _DONOR_STORE.reserve(group_key, estimated_bytes):
+        logger.warning(
+            "VLM-CacheBlend donor rejected before capture: group=%s "
+            "estimated_bytes=%d limit=%d",
+            group_key,
+            estimated_bytes,
+            max_bytes,
+        )
+        return None
+
+    try:
+        entry = DonorEntry(
+            group_key=group_key,
+            n_image_tokens=n_img,
+            grid_sig=grid_sig,
+            positions=(positions.detach().clone() if positions is not None else None),
+        )
+        for layer_id, k_buf, v_buf in layer_buffers:
+            k = k_buf[img_locs].detach().clone()
+            v = v_buf[img_locs].detach().clone()
+            if to_cpu:
+                k = k.cpu()
+                v = v.cpu()
+            entry.record_layer(layer_id, k, v)
+        entry.complete = True
+    except Exception:
+        _DONOR_STORE.cancel_reservation(group_key)
+        raise
+    if not _DONOR_STORE.publish(entry):
+        logger.warning(
+            "VLM-CacheBlend donor rejected by memory budget: group=%s bytes=%d limit=%d",
+            group_key,
+            entry.resident_bytes(),
+            get_config().max_donor_bytes,
+        )
+        return None
     return entry

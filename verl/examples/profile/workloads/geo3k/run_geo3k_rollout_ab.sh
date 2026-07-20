@@ -37,6 +37,10 @@ export GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-0.35}"
 export CLEAN_PROFILE_LOGS="${CLEAN_PROFILE_LOGS:-1}"
 export VERL_PROFILE_ROLLOUT_ONLY=0
 export DATALOADER_NUM_WORKERS="${DATALOADER_NUM_WORKERS:-0}"
+# This A/B targets merged visual-token work in the LLM prefill stack. Keep the
+# custom similarity/per-item paths and SGLang's whole-bundle embedding cache off
+# in every arm so ViT caching cannot contribute to (or regress) the result.
+export SGLANG_VLM_CACHE_SIZE_MB=0
 export GEO3K_REFOCUS_FIRST_TURN_MAX_NEW_TOKENS="${GEO3K_REFOCUS_FIRST_TURN_MAX_NEW_TOKENS:-16}"
 export GEO3K_REFOCUS_FINAL_TURN_MAX_NEW_TOKENS="${GEO3K_REFOCUS_FINAL_TURN_MAX_NEW_TOKENS:-64}"
 
@@ -53,8 +57,8 @@ esac
 # Method B (fast apply): memoize per-forward reuse/scatter indices.
 CACHEBLEND_FAST_APPLY="${CACHEBLEND_FAST_APPLY:-0}"
 FA_TAG="fa${CACHEBLEND_FAST_APPLY}"
-# Method C (compact prefill): context attention sparse decode — physically drop
-# donor-reused image tokens from the decoder layer loop during prefill/decode.
+# Experimental compact-prefill implementation. It is deliberately independent
+# from sparse decoding and remains off in the standard sparse A/B launcher.
 CACHEBLEND_COMPACT_PREFILL="${CACHEBLEND_COMPACT_PREFILL:-0}"
 CP_TAG="cp${CACHEBLEND_COMPACT_PREFILL}"
 REPORT_DIR="${REPORT_DIR:-${VERL_ROOT}/profile_logs_geo3k_rollout_ab}"
@@ -83,7 +87,7 @@ suffix="geo3k_refocus_${VARIANT}_${RUN_TAG}_${CACHEBLEND_SELECTOR}_slots${SLOTS_
 log_root="${VERL_ROOT}/profile_logs_geo3k_refocus_${VARIANT}_${RUN_TAG}_${CACHEBLEND_SELECTOR}_slots${SLOTS_TAG}_${FA_TAG}_${CP_TAG}"
 console_log="${REPORT_DIR}/${suffix}.log"
 
-echo "[rollout-ab] cacheblend=${CACHEBLEND_SELECTOR} image_slots=${CACHEBLEND_IMAGE_SLOTS} fast_apply=${CACHEBLEND_FAST_APPLY} compact_prefill=${CACHEBLEND_COMPACT_PREFILL}"
+echo "[rollout-ab] cacheblend=${CACHEBLEND_SELECTOR} image_slots=${CACHEBLEND_IMAGE_SLOTS} fast_apply=${CACHEBLEND_FAST_APPLY} compact_prefill=${CACHEBLEND_COMPACT_PREFILL} vit_cache=off"
 echo "[rollout-ab] training=recompute (standard PPO old_log_prob path)"
 echo "[rollout-ab] log_root=${log_root} suffix=${suffix} gpus=${CUDA_VISIBLE_DEVICES} steps=${TOTAL_STEPS}"
 

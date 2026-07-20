@@ -377,6 +377,12 @@ def init_mm_embedding_cache(max_size: int = 0):
     embedding_cache = MultiModalStaticCache(max_size)
 
 
+def clear_mm_embedding_cache() -> None:
+    """Clear encoder outputs that are tied to the current model weights."""
+    if embedding_cache is not None:
+        embedding_cache.clear()
+
+
 def get_embedding_chunk(
     embedding: torch.Tensor,
     extend_prefix_len: int,
