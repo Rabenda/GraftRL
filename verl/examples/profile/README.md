@@ -2,7 +2,9 @@
 
 Upstream verl profiler scripts (NPU / torch memory) live in this directory.
 
-**Vision token reuse experiments** (Geo3K / Sokoban / Chart workloads) are documented in **[WORKLOADS.md](WORKLOADS.md)**.
+**Group-wide rollout reuse experiments** are bounded by
+**[GROUP_ROLLOUT_REUSE_DESIGN.md](GROUP_ROLLOUT_REUSE_DESIGN.md)** and indexed in
+**[WORKLOADS.md](WORKLOADS.md)**.
 
 ## Canonical Scripts (upstream)
 

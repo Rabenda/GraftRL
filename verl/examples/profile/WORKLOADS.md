@@ -2,6 +2,9 @@
 
 GRPO + SGLang profiling for **image-token reuse** experiments (Phase 1 similarity, Phase 2 replacement).
 
+Research scope and safety boundary:
+[Group-Wide Redundancy Elimination for GRPO Rollouts](GROUP_ROLLOUT_REUSE_DESIGN.md).
+
 ## Directory layout
 
 ```
@@ -14,6 +17,9 @@ examples/profile/
 
   workloads/                # one folder per dataset experiment
     geo3k/                  # baseline single-turn + Geo3K refocus multiturn
+    mmsearch_r1/            # MMSearch-R1-shaped search observations
+    mmdu/                   # multi-image dialogue snowball
+    osworld/                # OSWorld/ARPO GUI offline-replay (long decode × turns)
     sokoban/                # multi-turn env (legacy; low token count)
     chart/                  # Refocus / VTool bar-chart QA (~580 tokens)
     deepeyes/               # DeepEyes visual_toolbox_v2 zoom/crop QA
@@ -27,6 +33,8 @@ examples/profile/
     chart/                  # Refocus / VTool download, filter, smoke converts
     deepeyes/               # DeepEyes visual_toolbox_v2 download
     geo3k/                  # text-only / refocus multiturn parquet
+    mmdu/                   # MMDU benchmark / 45k converters
+    osworld/                # OSWorld traj dump → parquet + synthetic GUI
 
   archive/                  # early experiments (dummy crop, docs)
 ```
@@ -39,11 +47,28 @@ RL rollout profiling starts at **64 groups × 4 GRPO branches = 256 rollouts** p
 |----------|--------------|---------|-------------------|
 | **Geo3K** | `data/geo3k/*.parquet` | `workloads/geo3k/run_geo3k_full_profile.sh` | `shared/analysis/analyze_profiling_logs.py` |
 | **Geo3K Refocus** | `workloads/geo3k/prepare_refocus_data.sh` | `workloads/geo3k/run_geo3k_refocus_profile.sh exact|diversified|stress` | `shared/analysis/analyze_profiling_logs.py`, `shared/analysis/semantic_cacheblend_gate.py` |
+| **MMSearch-R1** | `/workspace/repo/multimodal-search-r1/mmsearch_r1/data/mini_data.pq` | `workloads/mmsearch_r1/run_mmsearch_r1_profile.sh` | runner acceptance summary + `shared/analysis/analyze_profiling_logs.py` |
+| **MMDU** | `workloads/mmdu/prepare_data.sh` | `workloads/mmdu/run_mmdu_profile.sh` | `shared/analysis/analyze_profiling_logs.py` |
+| **OSWorld GUI** | `workloads/osworld/prepare_data.sh` | `workloads/osworld/run_osworld_profile.sh` | `shared/analysis/analyze_profiling_logs.py` |
 | **Sokoban** | `workloads/sokoban/prepare_sokoban_data.sh` | `workloads/sokoban/run_sokoban_rollout_profile.sh` | `workloads/sokoban/run_sokoban_similarity.sh` |
 | **Chart** | `workloads/chart/prepare_data.sh` (→ `data_preprocess/chart/`) | `workloads/chart/run_rollout_profile.sh` | `workloads/chart/run_similarity.sh` |
 | **DeepEyes** | `workloads/deepeyes/prepare_data.sh` | `workloads/deepeyes/run_rollout_profile.sh` | `workloads/deepeyes/run_similarity.sh` |
 
 All rollout scripts need patched `sglang_vision_profile` on `PYTHONPATH` and `verl.trainer.main_ppo` via `examples/grpo_trainer/run_qwen2_5_vl_7b_fsdp.sh`.
+
+MMDU is intentionally capped by default (256 train / 64 test rows) because it is
+used here as a long-context, long-decode rollout workload.  The 110-dialogue HF
+benchmark is hard (up to ~24k prompt tokens).  For **8192-stable 64×4** runs,
+use `workloads/mmdu/prepare_45k_pool.sh` from MMDU-45k (~45k shorter dialogues).
+
+## OSWorld / ARPO GUI notes
+
+For **rollout-heavy GUI agentic** profiling (long Thought+Action decode × many
+screenshot turns, context often >10K), use `workloads/osworld/`.  Default data is
+synthetic (no Docker). Convert real ARPO/OSWorld result dumps with
+`RESULTS_ROOT=... bash workloads/osworld/prepare_data.sh`.  See
+`workloads/osworld/README.md`. Task definitions live in
+`/workspace/repo/ARPO/OSWorld/evaluation_examples/` (dvlab ARPO submodule).
 
 ## Geo3K Refocus notes
 
@@ -91,6 +116,23 @@ Selector mapping:
 |----------|-----|
 | `kvdev` | `SGLANG_VLM_CACHEBLEND_SELECT=kvdev` |
 | `cos` | `SGLANG_VLM_CACHEBLEND_SELECT=sim`, with `SGLANG_VLM_CACHEBLEND_SIM_THRESHOLD` |
+
+### Geo3K sparse-decoding A/B
+
+Use the dedicated launcher so the formal comparison stays at `64×4`, preserves
+the same kvdev prefill path in both arms, disables the separate `fast_apply` and
+`compact_prefill` experiments, and changes only decode sparsification:
+
+```bash
+CUDA_VISIBLE_DEVICES=1,2 \
+  bash examples/profile/workloads/geo3k/run_geo3k_sparse_decode_ab.sh control
+CUDA_VISIBLE_DEVICES=1,2 \
+  bash examples/profile/workloads/geo3k/run_geo3k_sparse_decode_ab.sh sparse
+```
+
+Sparse decoding is approximate and remains default-off. A performance result must
+be paired with the semantic/quality gate on a reward-bearing workload before it is
+treated as a deployable default.
 
 ## Chart-specific notes
 
@@ -157,6 +199,7 @@ Each experiment line uses its **own** `profile_logs_*` tree — do not mix.
 | **Geo3K refocus exact** | `profile_logs_geo3k_refocus_exact/` | full-canvas deterministic turn1 image |
 | **Geo3K refocus diversified** | `profile_logs_geo3k_refocus_diversified/` | full-canvas similar turn1 image |
 | **Geo3K refocus stress** | `profile_logs_geo3k_refocus_stress/` | 2x image scale + deterministic turn1 image |
+| **MMSearch-R1 image search** | `profile_logs_mmsearch_r1/` | deterministic image-search thumbnails |
 
 Under each `LOG_ROOT`:
 
