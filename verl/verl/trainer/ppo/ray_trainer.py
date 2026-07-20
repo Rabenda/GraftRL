@@ -72,6 +72,28 @@ from verl.workers.rollout.llm_server import LLMServerManager
 from verl.workers.utils.padding import left_right_2_no_padding, no_padding_2_padding
 
 
+def _rollout_only_profile_metrics(
+    *, batch: DataProto, reward_tensor: torch.Tensor, timing_raw: dict, global_step: int
+) -> dict[str, float | int]:
+    """Stable, parseable metrics for rollout-only performance/quality gates."""
+
+    response_lengths = batch.batch["response_mask"].bool().sum(-1).float()
+    aborted = response_lengths == 0
+    sequence_scores = reward_tensor.sum(-1).float()
+    valid_scores = sequence_scores[~aborted]
+    return {
+        "global_step": int(global_step),
+        "rollout_s": float(timing_raw["gen"]),
+        "reward_mean": (
+            float(valid_scores.mean().detach().item())
+            if valid_scores.numel() > 0
+            else 0.0
+        ),
+        "aborted_ratio": float(aborted.float().mean().detach().item()),
+        "response_length_mean": float(response_lengths.mean().detach().item()),
+    }
+
+
 def apply_kl_penalty(data: DataProto, kl_ctrl: core_algos.AdaptiveKLController, kl_penalty="kl"):
     """Apply KL penalty to the token-level rewards.
 
@@ -1514,6 +1536,17 @@ class RayPPOTrainer:
                         rollout_data_dir = self.config.trainer.get("rollout_data_dir", None)
                         if rollout_data_dir:
                             self._log_rollout_data(batch, reward_extra_infos_dict, timing_raw, rollout_data_dir)
+                        profile_metrics = _rollout_only_profile_metrics(
+                            batch=batch,
+                            reward_tensor=reward_tensor,
+                            timing_raw=timing_raw,
+                            global_step=self.global_steps,
+                        )
+                        print(
+                            "VERL_ROLLOUT_PROFILE_STEP "
+                            + json.dumps(profile_metrics, sort_keys=True),
+                            flush=True,
+                        )
                         rollout_only_steps = int(os.environ.get("VERL_PROFILE_ROLLOUT_ONLY_STEPS", "1"))
                         if self.global_steps >= rollout_only_steps or is_last_step:
                             print("VERL_PROFILE_ROLLOUT_ONLY=1: exiting after rollout/reward dump.")

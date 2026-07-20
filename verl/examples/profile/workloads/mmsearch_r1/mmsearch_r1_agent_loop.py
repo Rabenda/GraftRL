@@ -33,6 +33,7 @@ from verl.experimental.rollout_reuse import (
     ExecutionAction,
     ReuseContext,
     ReuseRegistry,
+    RolloutReuseRuntime,
     SharingScope,
 )
 from verl.experimental.agent_loop.agent_loop import AgentLoopBase, AgentLoopOutput, register
@@ -66,6 +67,44 @@ def _decode_safe(tokenizer: Any, token_ids: list[int]) -> str:
 
 _SELECTION_CACHE = ContentSelectionCache(max_entries=4096)
 _ARTIFACT_REGISTRY: ReuseRegistry[Any] = ReuseRegistry(max_entries=8192)
+_REUSE_RUNTIME: RolloutReuseRuntime[Any] = RolloutReuseRuntime(_ARTIFACT_REGISTRY)
+
+
+def _selection_decision_fields(
+    *,
+    modality: str,
+    candidate_count: int,
+    deduplicated_count: int,
+    ranked_skip_count: int,
+    materialized_skip_count: int,
+) -> dict[str, Any]:
+    """Emit separate exact and approximate SKIP decisions for context selection."""
+
+    exact_skip_count = max(0, deduplicated_count + materialized_skip_count)
+    exact = _REUSE_RUNTIME.decide(
+        action=(ExecutionAction.SKIP if exact_skip_count else ExecutionAction.LOCAL),
+        operator_id="mmsearch.context_materialization",
+        representation_stage=f"{modality}_observation",
+        reason=("duplicate_or_already_materialized" if exact_skip_count else "no_exact_skip"),
+        eligible_units=max(0, candidate_count),
+        applied_units=exact_skip_count,
+        approximate=False,
+        policy="content-identity-v1",
+    )
+    ranked = _REUSE_RUNTIME.decide(
+        action=(ExecutionAction.SKIP if ranked_skip_count else ExecutionAction.LOCAL),
+        operator_id="mmsearch.context_rank_prune",
+        representation_stage=f"{modality}_observation",
+        reason=("outside_context_budget" if ranked_skip_count else "within_context_budget"),
+        eligible_units=max(0, candidate_count - deduplicated_count),
+        applied_units=max(0, ranked_skip_count),
+        approximate=bool(ranked_skip_count),
+        policy="retrieval-rank-v1",
+    )
+    return {
+        **exact.event_fields("context_exact_skip"),
+        **ranked.event_fields("context_rank_skip"),
+    }
 
 
 def _content_hash(text: str) -> str:
@@ -239,7 +278,7 @@ class MMSearchR1AgentLoop(AgentLoopBase):
             returned_images, titles = _synthetic_image_search(images, self.image_search_topk)
             return tuple(returned_images), tuple(titles)
 
-        retrieval = await _ARTIFACT_REGISTRY.get_or_compute(
+        retrieval = await _REUSE_RUNTIME.get_or_compute(
             identity=retrieval_identity,
             scope=SharingScope.GROUP,
             context=reuse_context,
@@ -313,7 +352,7 @@ class MMSearchR1AgentLoop(AgentLoopBase):
             )
             return tuple(add_ids)
 
-        tokenization = await _ARTIFACT_REGISTRY.get_or_compute(
+        tokenization = await _REUSE_RUNTIME.get_or_compute(
             identity=token_identity,
             scope=SharingScope.GROUP,
             context=reuse_context,
@@ -347,6 +386,13 @@ class MMSearchR1AgentLoop(AgentLoopBase):
             "observation_tokens": len(add_ids),
             **retrieval.event_fields("retrieval"),
             **tokenization.event_fields("tokenization"),
+            **_selection_decision_fields(
+                modality="image",
+                candidate_count=selection.candidate_count,
+                deduplicated_count=deduplicated_candidate_count,
+                ranked_skip_count=skipped_by_selection_count,
+                materialized_skip_count=skipped_already_materialized_count,
+            ),
         }
         return images + selected_images, add_ids, event
 
@@ -373,7 +419,7 @@ class MMSearchR1AgentLoop(AgentLoopBase):
                 "external_snapshot": "synthetic-static-v1",
             },
         )
-        retrieval = await _ARTIFACT_REGISTRY.get_or_compute(
+        retrieval = await _REUSE_RUNTIME.get_or_compute(
             identity=retrieval_identity,
             scope=SharingScope.GROUP,
             context=reuse_context,
@@ -434,7 +480,7 @@ class MMSearchR1AgentLoop(AgentLoopBase):
             )
             return tuple(add_ids)
 
-        tokenization = await _ARTIFACT_REGISTRY.get_or_compute(
+        tokenization = await _REUSE_RUNTIME.get_or_compute(
             identity=token_identity,
             scope=SharingScope.GROUP,
             context=reuse_context,
@@ -482,6 +528,13 @@ class MMSearchR1AgentLoop(AgentLoopBase):
             "observation_tokens": len(add_ids),
             **retrieval.event_fields("retrieval"),
             **tokenization.event_fields("tokenization"),
+            **_selection_decision_fields(
+                modality="document",
+                candidate_count=selection.candidate_count,
+                deduplicated_count=deduplicated_candidate_count,
+                ranked_skip_count=skipped_by_selection_count,
+                materialized_skip_count=skipped_already_materialized_count,
+            ),
         }
         return doc_spans, add_ids, event
 

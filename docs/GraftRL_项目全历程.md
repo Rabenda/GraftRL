@@ -694,15 +694,18 @@ python3 examples/profile/shared/analysis/analyze_profiling_logs.py \
 | LLM prefill CacheBlend 复用 | rollout `50.380s → 43.895s`，**-12.9%** | 已证明端到端正收益 |
 | 同两个 PPO step 整步 | `124.503s → 117.747s`，**-5.4%** | 已证明整步正收益 |
 | CUDA Graph dense decode | 相对 forced eager dense 约 **-3.6%** | 已证明正收益 |
-| Sparse decoding 局部 forward | 长上下文下 **-2.1%～-2.7%** | 局部计算已变快 |
-| Sparse decoding rollout | `127.797s → 128.007s`，**+0.16%** | 测量噪声内持平，尚无净收益 |
+| 旧 reuse-mask sparse 局部 forward | 长上下文下 **-2.1%～-2.7%** | 局部计算已变快 |
+| 旧 reuse-mask sparse rollout | `127.797s → 128.007s`，**+0.16%** | 测量噪声内持平，且策略假设已废弃 |
+| query-aware sparse v1 | MMDU rollout `315.004s → 295.028s`，**-6.34%** | 单组 `64×4` 性能/质量 gate 已通过 |
+| mass-budget sparse v2 | MMDU `287.068s → 295.671s`，墙钟 **+3.00%**；token/s **+0.83%** | 质量/长度门通过，但端到端门未过；已继续优化 v2.1 |
 | 自定义 ViT cache / token sparse | 历史实验均慢于 baseline | 已删除，不保留 |
 | `fast_apply` / `compact_prefill` | 整理、拷贝开销无法被省下的计算覆盖 | 默认关闭 |
 | MMSearch 跨分支 KV 复用 | 新架构可 exact retrieval，但仍有大量 position mismatch | 无正式性能收益 |
 
 因此，当前不能宣称「所有 workload 都等价或优于 baseline」。可采信的收益边界是：
 **Geo3K/Refocus 这类组内重复视觉内容、且 recipient 能命中 donor 的场景，当前纯 LLM
-prefill 复用可带来约 13% rollout 和约 5% 完整 PPO step 收益。**
+prefill 复用可带来约 13% rollout 和约 5% 完整 PPO step 收益；在 decode-heavy MMDU
+单组正式 gate 中，query-aware sparse v1 带来 6.34% rollout 收益。**
 
 ### 16.2 纯 prefill `64×4` 正式结果
 
@@ -727,18 +730,118 @@ token span 匹配、donor K/V graft 以及被复用 merged visual token 的 LLM 
 
 ### 16.3 Sparse decoding 的当前边界
 
-已实现 semantic position、fused Triton compact、稳定 buffer/cache、CUDA Graph、
-append-only page table、profitability floor，以及从 `req_to_token` 直接 gather/compact。
+截至 2026-07-19 的正式数据来自旧 `reuse` 策略：把 CacheBlend 在 prefill 判为可复用的
+image KV 当作 decode 可忽略的 token。该策略已实现 semantic position、fused Triton
+compact、稳定 buffer/cache、CUDA Graph、append-only page table、profitability floor，
+以及从 `req_to_token` 直接 gather/compact。
 
 - 上下文丢弃约 28% 时，long/high-batch decoder forward 快 **2.1%～2.7%**。
 - 加入 4096-token profitability floor 后，稀疏 rollout 从原先比 dense 慢 1.43%
   收敛到只慢 **0.16%**，但仍不能计为正收益。
 - direct-source 路径用于移除每个 decode token 的完整 dense page-table gather/
-  allocation；已通过 CPU/编译回归，但尚无正式 GPU 数据，不计入收益。
+  allocation；旧 `reuse` 结果尚未覆盖它，本次 query-aware 正式 gate 的 7,086 条
+  `SKIP` forward 已全部实际走过该路径。
 
-这说明 sparse decoding 的 attention FLOPs 已经减少，但省下的计算仍被稀疏索引、
-page-table 整理和调度开销吃掉。它仍是重点优化方向，但当前只能标记为「局部正收益、
-端到端持平」。
+这说明旧实现的 attention FLOPs 确实减少，但省下的计算仍被稀疏索引、page-table
+整理和调度开销吃掉。更关键的是，`prefill K/V 可复用` 并不推出 `future decode query
+可以不 attend 该 K/V`；因此 `reuse → drop` 规则即便跑快也缺少语义依据。
+旧环境变量别名现在也默认进入 `query_blocks`；历史 `reuse` 策略仅在显式设置
+`SPARSE_DECODE_MODE=reuse` 时用于复现实验，不再因兼容别名被隐式选中。
+
+通过正式 gate 的 v1 是独立的 query-aware block 策略：
+
+- 不依赖 CacheBlend reuse mask，`SGLANG_VLM_CACHEBLEND=0` 时也能工作；
+- 在 Qwen2.5-VL prefill 第 20 层，用新 prompt 末尾 32 token 中的 4 个 query landmark，对每个
+  64-token 历史 block 的 4 个 K landmark 打分；
+- 首 128 token 和最近 512 token 永远保留，候选 block 至少保留 50%；
+- block 排序只做一次，decode 继续使用固定 position plan、direct-source fused compact、
+  append-only page table 和 CUDA Graph，没有逐 token top-k；
+- 这是近似 `SKIP`，不是 `EXACT/PARTIAL` 复用；CPU/静态回归和下述单组 GPU gate 均已通过。
+
+正式验收只跑了一组 MMDU dense/query-sparse A/B：真实 `64×4`、两个 rollout-only
+step、temperature=1 且固定 data seed=42、CUDA Graph；无 smoke、ABBA 或隐藏重复。
+
+| 指标 | dense | query sparse | 变化 / 门槛 |
+|------|-------|--------------|-------------|
+| step 1 rollout | 165.910s | 159.241s | **-4.02%** |
+| step 2 rollout | 149.094s | 135.786s | **-8.92%** |
+| 两步 rollout 总计 | 315.004s | 295.028s | **-6.34%**（要求 ≥5%） |
+| reward mean | 0.441203 | 0.437968 | -0.003235（允许下降 ≤0.01） |
+| response length mean | 475.904 | 460.902 | -3.15%（允许漂移 ≤5%） |
+| abort ratio max | 0 | 0 | 通过 |
+
+稀疏端共有 7,086 条实际 `SKIP` forward、2,233 条 fail-closed `LOCAL` forward；全部
+`SKIP` 使用 direct-source compact，其中 4,216 条命中 incremental append。累计保留
+1,346,761,602、丢弃 387,485,698 个 decode attention context-token visit，实际丢弃率
+22.34%，不是 dense bypass。该单组 gate 已通过；但 sparse attention 仍是近似策略，且
+输出长度相差 3.15%，所以结论限定为“这组固定 seed 的端到端正收益与质量代理门通过”，
+不外推为严格无损或多 seed 稳健性证明，默认仍保持关闭、由 workload 显式 opt-in。
+按 `64×4×2=512` 条轨迹的实际平均输出长度折算，生成吞吐约从 773.5 提升到
+799.9 response token/s（+3.41%）；因此 6.34% 墙钟收益不只是少生成 3.15% token，
+但墙钟收益中确实包含了输出长度差异，不能把全部 6.34% 都归为 kernel 加速。
+
+#### Gate 后继续开发与一次正式 v2 验证
+
+按“先做确定的执行优化，再改变近似强度”的顺序继续开发，并没有停在 6.34%：
+
+- 重新解析正式 CSV 后，`LOCAL=2233/9319` 的说法被纠正：其中 789 条是 EXTEND，
+  真正 decode `LOCAL` 是 `1444/8530=16.9%`。624 条发生在 batch=1，另有大量短于
+  4096 的上下文；这些正是历史上强行 sparse 会负收益的尾部，不能为了降低 LOCAL
+  计数而取消 profitability fallback。
+- 7,086 条 sparse forward 中有 2,870 条重新 full compact。根因之一是 plan store 的
+  全局 revision：无关请求注册/释放 plan 也会使稳定 batch 的 workspace 失效。v2 改为
+  按当前 batch 的 request + plan object identity 做 key；同一 pool slot 的 plan 替换仍
+  必然失效，但无关 store churn 不再打断 incremental append。workspace/static cache
+  working set 也从 8/16 提高到 32/64。按 v1 同 batch-size 的 forward 差值估算，所有
+  可避免 full compact 的理论上限约 3.19s；这是上限分析，不是新的实测收益。
+- Sparse selector 不再使用“固定保留 top-k 比例”。v2 将结构上限放宽到最多丢 70%，
+  但只有累计 query-score softmax mass 不超过 5% 的低分 block 才允许删除；分数均匀、
+  判断不确定时自动接近 dense。prompt-tail query landmark 从 4 个增加到 8 个，仍只在
+  prefill 排一次，decode 没有逐 token top-k。策略标识为
+  `query-block-mass-prefill-v2`。
+- 该 5% 是 landmark 近似得到的 proxy error bound，不是完整 attention 的数学误差界；
+  它现在随 `rollout-reuse-action-v1` 的 approximate `SKIP` 事件写入
+  `reuse_error_bound`，避免只报“丢了多少”而不报近似风险。
+- 多 turn 重打分现在先撤销旧 turn plan；只有本轮所有 guard 和 score-mass 门通过才
+  安装新 plan。若本轮分数均匀或打分失败，请求会 dense fail closed，不会继续沿用
+  与当前 query 不一致的旧 drop 位置。
+- full compact Triton kernel 不再清零 FA3 永远不会读取的 page-table 矩形尾部，并合并
+  重复的 keep-count reduction；这只减少内存写和 reduction，不改变有效前缀或
+  `cache_seqlens`。
+- 所有 dense fallback 现在区分 `empty_plan_store`、`no_active_sparse_plan`、
+  `drop_upper_bound_below_floor`、实际 drop/ratio 不足等原因。下一次单组运行即可判断
+  哪类可优化，不需要为归因另跑实验。
+- 验收除 wall time、reward、length、abort 外，新增 token-throughput 必须为正；防止
+  把“少生成”误报为核心执行收益。
+
+上述 v2 随后只跑了一组新的正式 `64×4` dense→sparse pair，没有 smoke、ABBA、扫参
+或隐藏重复：
+
+| 指标 | dense | mass-budget v2 | 变化 |
+|------|-------|----------------|------|
+| 两步 rollout | 287.068s | 295.671s | **+3.00%（未过端到端门）** |
+| response token/s | 819.06 | 825.84 | **+0.83%** |
+| response length mean | 459.229 | 476.908 | +3.85%（门内） |
+| reward mean | 0.442712 | 0.443376 | +0.000665 |
+| abort ratio max | 0 | 0 | 通过 |
+
+v2 的实际 context-token 丢弃率提高到 30.4%，7,411 条 `SKIP` 中 5,846 条
+incremental append（78.9%）；因此策略、direct-source 和增量路径均真实生效。但输出
+更长使墙钟变慢，且归一化吞吐只快 0.83%，不能宣称端到端收益。剩余 1,565 条 full
+compact 的同 bucket 乐观可避免上限约 3.11s，其中两次首次 Triton JIT 约 1.16s 落在
+正式 rollout 内。
+
+测量后直接继续开发 v2.1，没有再占 GPU：
+
+- direct position plan 不再为了遗留物理位置诊断把整条 `req_to_token` 从 GPU 拷回
+  CPU；decode 只使用稳定 semantic positions。
+- direct compact 的相关 power-of-two Triton 变体移到 CUDA Graph/server 初始化阶段
+  预热，避免首次编译污染正式 rollout latency；真实 kernel 执行仍保留在计时路径。
+- 正式 MMDU pair 在 temperature=1 下为每个 `global step × sample × GRPO branch × turn`
+  生成稳定 SGLang sampling seed。两臂仍按各自 logits 采样，不强行令输出相同，但不再
+  把并发调度导致的 RNG 流差异误认为 sparse 语义差异。
+- v2.1 只通过 86 项相关 CPU 回归和静态检查，尚无新的 GPU 数字；当前可引用的正收益
+  仍只有 v1 的 6.34%，而 v2 的正式结论是墙钟负收益、token throughput 小幅为正。
 
 ### 16.4 删除、保留与默认开关
 
@@ -746,18 +849,47 @@ page-table 整理和调度开销吃掉。它仍是重点优化方向，但当前
 - 默认关闭：`fast_apply`、`compact_prefill`；目前没有可采信正收益。
 - 继续保留：LLM prefill CacheBlend（包括 exact/kvdev 与 similarity selector）。删除的
   `grpo_similarity_cache.py` 属于旧 ViT 线，不是 LLM prefill 的 similarity selector。
-- 继续优化：sparse decoding；默认启用前必须取得真实 `64×4` 端到端正收益。
+- 继续保留：query-aware sparse v1 已取得一组真实 `64×4` 端到端正收益；v2 正式 pair
+  墙钟未过门后已继续优化为 v2.1，尚未再次占卡。该方向因 approximate 语义保持显式
+  opt-in。
 
 ### 16.5 正确性与质量口径
 
 - Geo3K profile 的两臂生成长度一致，能证明性能可比，但 profile reward 为 0，
   不能作为任务质量验收。
 - 旧 MMDU 单次结果：baseline reward `0.4601`，prefill `0.4522`，
-  prefill+sparse `0.4514`。Sparse 相对同一 prefill 只变化 `-0.00074`，但样本不足，
-  不能宣称质量无损。
+  prefill+sparse `0.4514`。新 query-aware 正式 pair 的 reward 为 `0.441203 → 0.437968`
+  （`-0.003235`）、abort 为 0，已通过预设代理质量门；仍不能据单 seed 宣称严格质量无损。
 - MMSearch 已完成 exact retrieval/tokenization reuse 和 group/replica 归因，但不同分支的
   position/prefix hidden state 仍会使 K/V graft fail closed；在新架构完成正式实验前，
   不宣称性能收益。
+
+### 16.6 统一 `EXACT/PARTIAL/SKIP/LOCAL` 运行时
+
+此前 `rollout_reuse` 只提供 identity/registry/routing，MMSearch、CacheBlend 和 sparse
+decode 各自使用不同字段，确实还不能称为公共运行时。当前已补齐：
+
+- `ExecutionDecision` 把 action、operator、representation stage、reason、eligible/applied
+  units、approximate/error bound 和 policy 放入同一个强校验对象；
+- `RolloutReuseRuntime` 统一执行 exact registry、记录各 action、聚合计数与工作量，并能
+  读取远端 backend 的 versioned wire event；
+- MMSearch retrieval/tokenization 的 `EXACT/LOCAL`、去重/已物化的精确 `SKIP`、rank
+  budget 的近似 `SKIP` 已接入该 runtime；
+- SGLang CacheBlend 的 `PARTIAL/LOCAL` 与 sparse decode 的近似 `SKIP` 都输出同一
+  `rollout-reuse-action-v1` schema；backend 先通过 `rollout_reuse_backend.py` 校验，
+  agent runtime 可读取并合并归因；
+- query-aware selector 已从 CacheBlend 主模块中独立到
+  `query_aware_sparse_decode.py`，Sparse Decode 不再由视觉复用语义驱动。
+- v2 的 query-score mass 作为 approximate `SKIP` 的 proxy `error_bound` 进入同一事件，
+  不再用无误差口径的固定 top-k 数量代表策略质量。
+- 正式 pair 暴露出一个纯归因问题：未命中 sparse plan 的 `LOCAL` decode 行仍沿用
+  `vlm_cacheblend.prefill` operator 名。它不影响执行或上述计时，现已改为
+  `sparse_decode.context_attention / decode_kv_blocks / no_active_sparse_plan`；后续 trace
+  可以按同一 operator 同时统计 `SKIP` 与 fail-closed `LOCAL`。
+
+边界也需说清：`vlm_cacheblend.py` 内仍保留大量 prefill KV backend 与 sparse page-table
+executor 的机械实现，尚未完成文件级拆分；但它不再拥有另一套 action 语义。公共运行时
+已经形成控制契约和统一 trace，后续重构是 backend 拆包，不是重新设计论文抽象。
 
 ---
 

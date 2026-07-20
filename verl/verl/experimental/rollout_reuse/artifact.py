@@ -38,6 +38,113 @@ class SharingScope(str, Enum):
     GLOBAL = "global"
 
 
+ACTION_SCHEMA_VERSION = "rollout-reuse-action-v1"
+
+
+@dataclass(frozen=True)
+class ExecutionDecision:
+    """One runtime decision under the EXACT/PARTIAL/SKIP/LOCAL contract.
+
+    The action and its accounting live together so a backend cannot report saved
+    work without also declaring whether it reused an equivalent artifact or made an
+    approximate skip.  ``eligible_units`` is the work considered by the policy and
+    ``applied_units`` is the subset actually reused/skipped.
+    """
+
+    action: ExecutionAction
+    operator_id: str
+    representation_stage: str
+    reason: str
+    eligible_units: int = 0
+    applied_units: int = 0
+    approximate: bool = False
+    error_bound: float | None = None
+    policy: str = ""
+
+    def __post_init__(self) -> None:
+        if not self.operator_id or not self.representation_stage:
+            raise ValueError("operator_id and representation_stage are required")
+        if not self.reason:
+            raise ValueError("decision reason is required")
+        if self.eligible_units < 0 or self.applied_units < 0:
+            raise ValueError("decision unit counts must be non-negative")
+        if self.applied_units > self.eligible_units:
+            raise ValueError("applied_units cannot exceed eligible_units")
+        if self.action is ExecutionAction.EXACT and self.approximate:
+            raise ValueError("EXACT decisions cannot be approximate")
+        if (
+            self.action is ExecutionAction.EXACT
+            and self.applied_units != self.eligible_units
+        ):
+            raise ValueError("EXACT decisions must apply every eligible unit")
+        if self.action is ExecutionAction.LOCAL and self.applied_units:
+            raise ValueError("LOCAL decisions cannot report reused/skipped units")
+        if self.error_bound is not None and self.error_bound < 0:
+            raise ValueError("error_bound must be non-negative")
+        if self.error_bound is not None and not self.approximate:
+            raise ValueError("error_bound is only valid for approximate decisions")
+
+    def event_fields(self, prefix: str) -> dict[str, Any]:
+        return {
+            f"{prefix}_action_schema": ACTION_SCHEMA_VERSION,
+            f"{prefix}_action": self.action.value,
+            f"{prefix}_operator_id": self.operator_id,
+            f"{prefix}_representation_stage": self.representation_stage,
+            f"{prefix}_reason": self.reason,
+            f"{prefix}_eligible_units": self.eligible_units,
+            f"{prefix}_applied_units": self.applied_units,
+            f"{prefix}_approximate": self.approximate,
+            f"{prefix}_error_bound": self.error_bound,
+            f"{prefix}_policy": self.policy,
+        }
+
+    @classmethod
+    def from_event_fields(
+        cls, fields: Mapping[str, Any], prefix: str
+    ) -> "ExecutionDecision":
+        """Decode the portable event schema emitted by a remote backend.
+
+        SGLang runs in a separate process and deliberately does not import the verl
+        control plane.  This parser is the adapter boundary that turns its wire fields
+        back into the same validated decision used by agent-side operators.
+        """
+
+        def value(name: str, default: Any = None) -> Any:
+            return fields.get(f"{prefix}_{name}", default)
+
+        schema = str(value("action_schema", ""))
+        if schema != ACTION_SCHEMA_VERSION:
+            raise ValueError(f"unsupported action schema: {schema!r}")
+
+        approximate_raw = value("approximate", False)
+        if isinstance(approximate_raw, str):
+            approximate = approximate_raw.strip().lower() in (
+                "1",
+                "true",
+                "yes",
+                "on",
+            )
+        else:
+            approximate = bool(approximate_raw)
+        error_bound_raw = value("error_bound")
+        error_bound = (
+            None
+            if error_bound_raw in (None, "")
+            else float(error_bound_raw)
+        )
+        return cls(
+            action=ExecutionAction(str(value("action"))),
+            operator_id=str(value("operator_id", "")),
+            representation_stage=str(value("representation_stage", "")),
+            reason=str(value("reason", "")),
+            eligible_units=int(value("eligible_units", 0)),
+            applied_units=int(value("applied_units", 0)),
+            approximate=approximate,
+            error_bound=error_bound,
+            policy=str(value("policy", "")),
+        )
+
+
 def _canonicalize(value: Any) -> Any:
     if dataclasses.is_dataclass(value):
         return _canonicalize(dataclasses.asdict(value))
@@ -147,10 +254,24 @@ class ReuseResult(Generic[T]):
     def exact_reuse(self) -> bool:
         return self.action is ExecutionAction.EXACT
 
+    @property
+    def decision(self) -> ExecutionDecision:
+        identity = self.artifact.identity
+        return ExecutionDecision(
+            action=self.action,
+            operator_id=identity.operator_id,
+            representation_stage=identity.representation_stage,
+            reason=self.source,
+            eligible_units=1,
+            applied_units=1 if self.action is ExecutionAction.EXACT else 0,
+            approximate=False,
+            policy="content-addressed-single-flight",
+        )
+
     def event_fields(self, prefix: str) -> dict[str, Any]:
         producer = self.artifact.producer
         return {
-            f"{prefix}_action": self.action.value,
+            **self.decision.event_fields(prefix),
             f"{prefix}_source": self.source,
             f"{prefix}_exact_reuse": self.exact_reuse,
             f"{prefix}_producer_group_id": producer.group_id,

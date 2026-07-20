@@ -231,9 +231,20 @@ Decode remains in scope through rigorously separated mechanisms:
 
 Dynamic sparse execution must demonstrate net end-to-end benefit after page-table
 maintenance, scheduling, kernel, and batching overhead. The original physical-slot
-search path was negative; the current semantic-position/fused implementation has a
-positive real-scale Geo3K rollout result (Section 8), but remains an approximate
-`SKIP` policy whose task-quality boundary still needs validation.
+search path was negative. Its semantic-position/fused successor reached local
+forward gains but not a positive end-to-end result (Section 8). More importantly,
+its `reuse` rule was not semantically justified: prefill K/V reuse does not imply a
+future query may ignore those tokens.
+
+The current implementation is therefore query-aware block selection. At one prefill
+probe layer it scores old context blocks against several prompt-tail query landmarks,
+protects the initial and recent windows, and persists one stable position plan for
+autoregressive decode. V2 no longer drops a fixed top-k quota: it removes the
+lowest-score blocks only while their cumulative proxy attention mass remains under an
+explicit error budget and a structural drop cap. It does no per-token top-k and does
+not change CUDA Graph shapes. This remains an approximate `SKIP` and explicit opt-in.
+The old reuse-mask policy is selected only by an explicit `MODE=reuse`, never
+implicitly by the legacy enable alias.
 
 ## 6. Runtime boundary
 
@@ -244,6 +255,7 @@ intentionally smaller than the eventual layout:
 rollout_reuse/
   artifact.py       # identity, scope, action, provenance
   registry.py       # exact lookup, invalidation, single-flight, accounting
+  runtime.py        # execute/ingest decisions and aggregate one action trace
   routing.py        # keep a group inside one artifact owner
 ```
 
@@ -252,7 +264,12 @@ second execution path needs them. SGLang remains the GPU artifact backend; the
 agent registry does not duplicate ViT tensors.
 
 The control contract is shared; modality-specific matching and representation
-operators remain adapters.
+operators remain adapters. Agent-side operators record decisions directly through
+`RolloutReuseRuntime`. The SGLang process emits the same versioned wire schema, which
+the runtime validates and ingests with `record_event_fields`. CacheBlend is therefore
+a prefill-K/V backend adapter, not a second decision vocabulary. SGLang validates
+backend events through `rollout_reuse_backend.py` before emitting them. This does not
+yet mechanically split every tensor helper out of the large `vlm_cacheblend.py` file.
 
 `ContextBank` may name the artifact registry. `ContextView` may name the
 recipient-local materialization. A `ContextPlan` is an optional producer of
@@ -286,13 +303,15 @@ Implemented and aligned with the design:
   recipient-local prompt order, positions, causal work, and mRoPE remain local.
 - Cache invalidation after model-weight updates, memory release, and explicit
   cache flush.
-- Sparse decode resolves semantic drop positions once at recipient prefill, caches
-  stable batch plans/buffers, and fuses mask gating plus page-table compaction in one
-  prewarmed Triton kernel. Production CUDA Graph replay writes fixed captured buffers;
-  stable batches append only the new causal tail. The current direct-source kernel
-  reads live `req_to_token` rows without first gathering a dense intermediate. It does
-  not claim K/V equivalence; it is a `SKIP` action.
-- MMSearch reward and rollout attribution needed to check quality.
+- Sparse decode is independent of CacheBlend. Its query-aware selector lives in
+  `query_aware_sparse_decode.py`, scores context blocks once at a prefill probe layer,
+  and registers stable semantic drop positions. The executor caches batch plans and
+  buffers, uses a prewarmed fused Triton compact path, writes fixed CUDA Graph buffers,
+  and incrementally appends only the new causal tail. The direct-source kernel reads
+  live `req_to_token` rows without first gathering a dense intermediate. It does not
+  claim K/V equivalence; it is an approximate `SKIP` action.
+- MMSearch reward and rollout attribution now propagate through the trainer, while
+  its cross-branch K/V path still has no formal performance result.
 
 Integrated exact-reuse control path:
 
@@ -306,6 +325,13 @@ Integrated exact-reuse control path:
   already-materialized context `SKIP` action.
 - SGLang records server/worker PID, physical replica, CacheBlend reuse, and
   sparse-context attribution without enabling a custom ViT tensor cache.
+- Exact registry results, MMSearch rank/materialization skips, CacheBlend partial
+  grafts, sparse decode skips, and dense fallbacks all use the versioned
+  `rollout-reuse-action-v1` trace fields.
+- A post-gate attribution fix labels sparse-plan misses as `LOCAL` under
+  `sparse_decode.context_attention/decode_kv_blocks` instead of inheriting the old
+  `vlm_cacheblend.prefill` envelope. This changes no execution or timing result; it
+  makes SKIP/fallback accounting belong to the same real operator.
 
 Prototype-only mechanisms:
 
@@ -319,9 +345,8 @@ Not implemented:
 - Dependency-aware partial visual reuse for crop/refocus overlap.
 - Real-document fetch/parse/chunk artifacts and chunk-overlap matching.
 - A common deterministic-tool adapter and validity policy.
-- A unified `EXACT/PARTIAL/SKIP/LOCAL` decision trace.
 
-Current sparse-decode evidence (2026-07-19/20):
+Historical reuse-mask sparse-decode evidence (2026-07-19/20):
 
 - Geo3K stress, Qwen2.5-VL-7B, two replicas, real `64×4`, two complete PPO steps;
   custom ViT cache off, identical kvdev prefill, `fast_apply=0`,
@@ -345,11 +370,55 @@ Current sparse-decode evidence (2026-07-19/20):
   and this stress run has no useful reward discrimination. Do not promote it as a
   quality-preserving default until a task-quality A/B passes.
 
+Current query-aware sparse-decode status (2026-07-20):
+
+- The selector no longer consumes the CacheBlend reuse mask and can run while
+  `SGLANG_VLM_CACHEBLEND=0`.
+- The measured V1 used four query landmarks from the last 32 newly extended prompt
+  tokens, four K landmarks per 64-token block, and a fixed 50% keep/drop cap. Ranking
+  ran once at Qwen layer 20 and decode reused the fixed plan.
+- CPU/static regression passed. The single fixed-data-seed MMDU dense/sparse pair
+  also passed its predeclared gate: real `64×4`, temperature 1, two rollout-only
+  steps, and CUDA Graph enabled.
+- Dense rollout total was `315.004s`; query sparse was `295.028s`, a **6.34%**
+  end-to-end speedup. Mean reward changed `0.441203 -> 0.437968` (-0.003235),
+  aborts remained zero, and mean response length changed `475.904 -> 460.902`
+  (-3.15%). These satisfy the respective 5%, 0.01, zero-abort, and 5% gates.
+- 7,086 forward rows actually used approximate `SKIP`, dropping 387,485,698 of
+  1,734,247,300 cumulative decode context-token visits (22.34%); this was not a
+  dense bypass. This is one-seed evidence, not a claim of exact quality equivalence,
+  so the policy remains explicit opt-in rather than a global default.
+- Approximate generated-token throughput was `773.5 -> 799.9 token/s` (+3.41%).
+  Thus the 6.34% wall-time improvement is not explained solely by the 3.15% shorter
+  outputs, but it must not be reported as a pure kernel speedup either.
+- V2 removes the fixed keep-top-k rule, permits at most 70% structural drop subject
+  to at most 5% cumulative proxy score mass, and uses eight prompt-tail query
+  landmarks. The proxy mass is emitted as the approximate action's `error_bound`.
+- Existing V1 logs show 789 of the formerly reported 2,233 LOCAL rows were EXTEND;
+  actual decode fallback was 1,444/8,530 (16.9%), dominated by batch-1 and short-context
+  tails that should remain dense. V2 instead targets avoidable full compaction: batch
+  workspaces are keyed by the participating plan identities, so unrelated plan-store
+  mutations no longer reset incremental append. Fallback reasons are now explicit.
+- A new prompt turn clears the previous query-conditioned plan before replanning; an
+  ambiguous/failed mass-budget decision therefore falls back to dense instead of
+  silently reusing stale drop positions. Full compaction also stops clearing the
+  rectangular page-table tail that FA3 masks with `cache_seqlens`.
+- The one formal V2 `64x4` pair did not pass the wall-time gate: `287.068s ->
+  295.671s` (-3.00% speedup). Output length was +3.85%, reward was +0.000665, and
+  normalized response-token throughput was +0.83%. It dropped 30.4% of cumulative
+  context visits and hit incremental append on 5,846/7,411 sparse forwards, so this
+  was a real sparse execution with insufficient end-to-end margin, not a dense bypass.
+- Post-measurement V2.1 moves first-use Triton compilation to server/CUDA-Graph
+  initialization and removes the full request-table GPU-to-CPU copy from position-plan
+  registration. Paired MMDU profiling also assigns a stable RNG stream per
+  step/sample/branch/turn; this reduces comparison noise and is not counted as a
+  runtime optimization. V2.1 is CPU/static-tested but not GPU-measured.
+
 ## 9. Implementation sequence
 
-1. Validate sparse decode quality on a reward-bearing workload, then repeat the
-   real `64×4` paired rollout measurement; keep the policy default-off until both
-   performance and quality pass.
+1. Preserve the passing MMDU `64×4` dense/query-sparse pair as the reference gate;
+   do not multiply reruns unless a future code change or publication-level
+   multi-seed study requires it.
 2. Add document/tool acquisition artifacts to MMSearch and report fetch, parse,
    chunk, tokenize, and LLM-prefill costs separately.
 3. Demonstrate the same exact-reuse lifecycle in at least one non-MMSearch
@@ -357,9 +426,10 @@ Current sparse-decode evidence (2026-07-19/20):
 4. Implement chunk-level document overlap and coordinate-aware visual overlap.
 5. Keep visual `PARTIAL` as future research rather than restoring the deleted ViT
    cache implementation.
-6. Keep fixed top-k and decode sparse execution as isolated policies. Promote
-   either only when it adds reproducible end-to-end value without unacceptable
-   GRPO quality/semantics changes.
+6. Keep optional retrieval-context suppression and decode sparse execution as
+   isolated policies. Sparse decode must use the score-mass budget rather than a
+   fixed top-k quota; promote either policy only with end-to-end value and acceptable
+   GRPO quality/semantics.
 
 ## 10. Existing implementation mapping
 
@@ -374,7 +444,7 @@ Current sparse-decode evidence (2026-07-19/20):
 | Already-seen context suppression | Preserved behavior | `SKIP` | stop reporting it as reuse |
 | Fixed top-k | Optional only | `SKIP` policy | disabled in exact-reuse default |
 | Reward scorer | Preserved unchanged | quality attribution | no reuse dependency |
-| Sparse decode | Kept as an isolated approximate `SKIP` policy | semantic drop positions + fused page-table compaction | default-off; quality gate and repeat paired A/B |
+| Sparse decode | Kept as an isolated approximate `SKIP` policy | score-mass-budget blocks + stable positions + fused page-table compaction | V1 gate passed at 6.34%; V2 wall gate failed/token throughput +0.83%; V2.1 unmeasured and explicit opt-in |
 
 ## 11. Required attribution
 
