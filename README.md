@@ -98,7 +98,6 @@ Typical CacheBlend profiling (Chart refocus):
 ```bash
 cd verl
 export CUDA_VISIBLE_DEVICES=0,1,2,3
-export SGLANG_GRPO_SIM_CACHE=0
 export SGLANG_VLM_CACHEBLEND=1
 bash examples/profile/workloads/chart/run_model_refocus_profile.sh
 ```

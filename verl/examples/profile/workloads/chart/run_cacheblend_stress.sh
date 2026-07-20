@@ -65,7 +65,6 @@ run_one() {
   export SUFFIX="${SUFFIX:-cacheblend_stress_s2_${mode}_4g_n${ROLLOUT_N}}"
 
   # Keep this workload focused on LLM-side visual KV reuse.
-  export SGLANG_GRPO_SIM_CACHE=0
   export VTOOL_MODEL_REFOCUS=0
   export VTOOL_ORACLE_REFOCUS=1
   export VTOOL_ORACLE_DIVERSIFY=0
