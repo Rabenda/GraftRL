@@ -114,7 +114,11 @@ def load_csv(path: str) -> list[dict]:
             line = raw.strip()
             if not line:
                 continue
-            if line.startswith("timestamp,") or line.startswith("request_id,"):
+            if (
+                line.startswith("timestamp,")
+                or line.startswith("request_id,")
+                or line.startswith("server_pid,")
+            ):
                 fieldnames = line.split(",")
                 continue
             if fieldnames is None:

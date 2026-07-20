@@ -1,18 +1,17 @@
 #!/usr/bin/env python3
-"""Compare turn1 ViT timing for the token-sparse reuse path vs a baseline.
+"""Analyze archived turn1 ViT token-sparse experiments.
 
 Reads two vision_encoder_log CSVs (baseline = cache off, reuse = token_sparse)
 and reports turn1 vision_encoder_time_ms plus the realized token reuse, so you
-can see whether skipping reused tokens' FFN actually saves wall time.
+can inspect the historical negative result. The runtime path and its environment
+switches have been removed; this script is retained only for old log files.
 
 Usage:
   python3 compare_token_sparse_timing.py \
     --baseline profile_logs_vtool_chart_token_reuse/vision_encoder_log_vtool_chart_baseline_nocache.csv \
     --reuse    profile_logs_vtool_chart_token_reuse/vision_encoder_log_vtool_chart_token_sparse_t084.csv
 
-Both runs must use the SAME data/batch and have merged-token-sim logging OFF
-(SGLANG_GRPO_LOG_MERGED_TOKEN_SIM=0), otherwise the reuse run runs a second
-full ViT forward and the timing is meaningless.
+The archived runs must use the same data and batch size.
 """
 
 from __future__ import annotations

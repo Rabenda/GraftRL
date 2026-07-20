@@ -823,6 +823,27 @@ class CudaGraphRunner:
             attn_backend = self.model_runner.decode_attn_backend_group[stream_idx]
         else:
             attn_backend = self.model_runner.attn_backend
+        set_sparse_host_indices = getattr(
+            attn_backend, "set_sparse_decode_cuda_graph_host_indices", None
+        )
+        if set_sparse_host_indices is not None:
+            reqs = list(getattr(forward_batch, "reqs", None) or [])
+            if len(reqs) >= raw_bs and all(
+                getattr(req, "req_pool_idx", None) is not None
+                for req in reqs[:raw_bs]
+            ):
+                req_pool_indices_cpu = [
+                    int(req.req_pool_idx) for req in reqs[:raw_bs]
+                ]
+            else:
+                req_pool_indices_cpu = (
+                    forward_batch.req_pool_indices[:raw_bs]
+                    .detach()
+                    .to(device="cpu", dtype=torch.long)
+                    .tolist()
+                )
+            req_pool_indices_cpu.extend([-1] * (bs - raw_bs))
+            set_sparse_host_indices(req_pool_indices_cpu)
         attn_backend.init_forward_metadata_replay_cuda_graph(
             bs,
             buffers.req_pool_indices[:bs],

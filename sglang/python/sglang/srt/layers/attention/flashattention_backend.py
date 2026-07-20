@@ -332,6 +332,7 @@ class FlashAttentionBackend(AttentionBackend):
         self.max_context_len = model_runner.model_config.context_len
         self.device = model_runner.device
         self.decode_cuda_graph_metadata = {}
+        self._sparse_decode_cuda_graph_req_pool_indices_cpu = None
         self.target_verify_metadata = {}
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
         self.kv_cache_dtype = model_runner.kv_cache_dtype
@@ -385,6 +386,11 @@ class FlashAttentionBackend(AttentionBackend):
             )
             else 0
         )
+
+    def set_sparse_decode_cuda_graph_host_indices(self, values) -> None:
+        """Provide replay request routing without a decode-time GPU sync."""
+
+        self._sparse_decode_cuda_graph_req_pool_indices_cpu = values
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Initialize forward metadata hence all layers in the forward pass can reuse it."""
@@ -472,12 +478,40 @@ class FlashAttentionBackend(AttentionBackend):
                 metadata.cu_seqlens_q = torch.arange(
                     0, batch_size + 1, dtype=torch.int32, device=device
                 )
-                metadata.cu_seqlens_k = torch.nn.functional.pad(
-                    torch.cumsum(seqlens_in_batch, dim=0, dtype=torch.int32), (1, 0)
-                )
-                metadata.page_table = forward_batch.req_to_token_pool.req_to_token[
-                    forward_batch.req_pool_indices, : metadata.max_seq_len_k
-                ]
+                # Single-token paged decode consumes cache_seqlens directly. Avoid an
+                # otherwise unused cumsum+pad launch on every dense or sparse token.
+                metadata.cu_seqlens_k = None
+                req_to_token = forward_batch.req_to_token_pool.req_to_token
+                sparse_batch = None
+                # CacheBlend sparse decode is forward-level metadata, not layer work.
+                # Build it once here so every decoder layer directly consumes the
+                # shortened table without repeating Python routing in its hot path.
+                if not self.has_local_attention and not self.has_swa:
+                    from sglang.srt.mem_cache import vlm_cacheblend
+
+                    if vlm_cacheblend.sparse_decode_enabled():
+                        # This row slice is a metadata-only view. The sparse kernel
+                        # gathers live request rows directly, avoiding a dense
+                        # req_to_token[req_indices] intermediate on every decode token.
+                        page_table_shape = req_to_token[
+                            :batch_size, : metadata.max_seq_len_k
+                        ]
+                        sparse_batch = vlm_cacheblend.build_sparse_decode_batch(
+                            forward_batch,
+                            page_table=page_table_shape,
+                            cache_seqlens=metadata.cache_seqlens_int32,
+                            page_size=int(self.page_size or 1),
+                            source_req_to_token=req_to_token,
+                        )
+                        if sparse_batch is not None:
+                            metadata.page_table = sparse_batch.page_table
+                            metadata.cache_seqlens_int32 = sparse_batch.cache_seqlens
+                            metadata.cu_seqlens_k = sparse_batch.cu_seqlens_k
+                            metadata.max_seq_len_k = sparse_batch.max_seqlen_k
+                if sparse_batch is None:
+                    metadata.page_table = req_to_token[
+                        forward_batch.req_pool_indices, : metadata.max_seq_len_k
+                    ]
             # TODO: we need to test this part for llama 4 eagle case
             self._maybe_init_local_attn_metadata(forward_batch, metadata, device)
         elif forward_batch.forward_mode.is_target_verify():
@@ -1302,43 +1336,6 @@ class FlashAttentionBackend(AttentionBackend):
                     -1, layer.tp_q_head_num, layer.head_dim
                 )
 
-                # [VLM-CacheBlend sparse decode] optionally shorten the context page
-                # table by dropping donor-reused image KV slots registered at prefill.
-                # Only for normal decode (no cascade / local / cross / SWA-pool remap).
-                if (
-                    not use_cascade_attn
-                    and not use_local_attn
-                    and not layer.is_cross_attention
-                    and not (is_swa_layer and self.use_sliding_window_kv_pool)
-                    and forward_batch.spec_info is None
-                ):
-                    from sglang.srt.mem_cache import vlm_cacheblend
-
-                    if vlm_cacheblend.sparse_decode_enabled():
-                        # Cache once per forward: FA3 runs this path every layer.
-                        if not hasattr(
-                            forward_batch, "_cacheblend_sparse_decode_batch"
-                        ):
-                            sparse_batch = vlm_cacheblend.build_sparse_decode_batch(
-                                forward_batch,
-                                page_table=page_table,
-                                cache_seqlens=cache_seqlens,
-                                page_size=int(self.page_size or 1),
-                            )
-                            setattr(
-                                forward_batch,
-                                "_cacheblend_sparse_decode_batch",
-                                sparse_batch,
-                            )
-                        else:
-                            sparse_batch = getattr(
-                                forward_batch, "_cacheblend_sparse_decode_batch"
-                            )
-                        if sparse_batch is not None:
-                            page_table = sparse_batch.page_table
-                            cache_seqlens = sparse_batch.cache_seqlens
-                            cu_seqlens_k = sparse_batch.cu_seqlens_k
-
                 # Default: single-token self-attention
                 result = flash_attn_with_kvcache(
                     q=q_reshaped,
@@ -1824,12 +1821,13 @@ class FlashAttentionBackend(AttentionBackend):
             else:
                 # Normal Decode
                 # Get sequence information
-                metadata.cache_seqlens_int32 = seq_lens.to(torch.int32)
+                metadata.cache_seqlens_int32 = self.decode_cuda_graph_metadata[
+                    "cache_seqlens"
+                ][:bs]
+                metadata.cache_seqlens_int32.copy_(seq_lens.to(torch.int32))
                 batch_size = len(seq_lens)
                 device = seq_lens.device
-                metadata.cu_seqlens_k = torch.nn.functional.pad(
-                    torch.cumsum(seq_lens, dim=0, dtype=torch.int32), (1, 0)
-                )
+                metadata.cu_seqlens_k = None
                 # Precompute maximum sequence length
                 metadata.max_seq_len_k = seq_lens.max().item()
                 # Precompute page table
@@ -2078,21 +2076,51 @@ class FlashAttentionBackend(AttentionBackend):
                 max_len = seq_lens_cpu.max().item()
                 max_seq_pages = (max_len + self.page_size - 1) // self.page_size
                 metadata.max_seq_len_k = max_len
+                sparse_batch = None
+                if not self.has_local_attention and not self.has_swa:
+                    from sglang.srt.mem_cache import vlm_cacheblend
 
-                normal_decode_set_metadata(
-                    metadata.cache_seqlens_int32,
-                    metadata.cu_seqlens_k,
-                    metadata.page_table,
-                    self.req_to_token,
-                    req_pool_indices,
-                    self.decode_cuda_graph_metadata["strided_indices"],
-                    max_seq_pages,
-                    seq_lens,
-                    0,
-                    self.page_size,
-                    metadata.swa_page_table,
-                    self.token_to_kv_pool if self.use_sliding_window_kv_pool else None,
-                )
+                    if vlm_cacheblend.sparse_decode_enabled() and self.page_size == 1:
+                        # A view supplies only shape/device metadata. The direct sparse
+                        # kernel reads self.req_to_token using req_pool_indices, so CUDA
+                        # Graph replay no longer allocates and gathers a full dense page
+                        # table before compacting or appending it.
+                        page_table_shape = metadata.page_table[
+                            :bs, :max_seq_pages
+                        ]
+                        sparse_batch = vlm_cacheblend.build_sparse_decode_batch(
+                            self,
+                            page_table=page_table_shape,
+                            cache_seqlens=seq_lens,
+                            page_size=1,
+                            req_pool_indices=req_pool_indices,
+                            seq_lens_cpu=seq_lens_cpu,
+                            req_pool_indices_cpu=(
+                                self._sparse_decode_cuda_graph_req_pool_indices_cpu
+                            ),
+                            output_page_table=metadata.page_table,
+                            output_cache_seqlens=metadata.cache_seqlens_int32,
+                            source_req_to_token=self.req_to_token,
+                        )
+                if sparse_batch is not None:
+                    metadata.max_seq_len_k = sparse_batch.max_seqlen_k
+                else:
+                    normal_decode_set_metadata(
+                        metadata.cache_seqlens_int32,
+                        metadata.cu_seqlens_k,
+                        metadata.page_table,
+                        self.req_to_token,
+                        req_pool_indices,
+                        self.decode_cuda_graph_metadata["strided_indices"],
+                        max_seq_pages,
+                        seq_lens,
+                        0,
+                        self.page_size,
+                        metadata.swa_page_table,
+                        self.token_to_kv_pool
+                        if self.use_sliding_window_kv_pool
+                        else None,
+                    )
 
                 self._maybe_update_local_attn_metadata_for_replay(
                     metadata,
@@ -2720,7 +2748,7 @@ class FlashAttentionMultiStepBackend:
 # NOTE: torch.compile makes it slower in speculative decoding
 def normal_decode_set_metadata(
     cache_seqlens_int32: torch.Tensor,
-    cu_seqlens_k: torch.Tensor,
+    cu_seqlens_k: Optional[torch.Tensor],
     page_table: torch.Tensor,
     req_to_token: torch.Tensor,
     req_pool_indices: torch.Tensor,
@@ -2733,7 +2761,10 @@ def normal_decode_set_metadata(
     token_to_kv_pool: Optional[SWAKVPool] = None,
 ):
     cache_seqlens_int32.copy_(seq_lens + seq_len_delta)
-    cu_seqlens_k[1:].copy_(torch.cumsum(cache_seqlens_int32, dim=0, dtype=torch.int32))
+    if cu_seqlens_k is not None:
+        cu_seqlens_k[1:].copy_(
+            torch.cumsum(cache_seqlens_int32, dim=0, dtype=torch.int32)
+        )
     page_indices = req_to_token[
         req_pool_indices[:, None],
         strided_indices[:max_seq_pages][None, :],
