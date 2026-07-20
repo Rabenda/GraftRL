@@ -100,6 +100,18 @@ def default_compute_score(
         from . import refocus_chart
 
         res = refocus_chart.compute_score(solution_str, ground_truth)
+    elif data_source in ["laolao77/MMDU"]:
+        from . import mmdu
+
+        res = mmdu.compute_score(solution_str, ground_truth)
+    elif str(data_source).startswith("mmsearch_r1/"):
+        from . import mmsearch_r1
+
+        res = mmsearch_r1.compute_score(solution_str, ground_truth, extra_info)
+    elif data_source in ["osworld_gui", "osworld_gui_synth", "osworld_task_synth"]:
+        from . import osworld_gui
+
+        res = osworld_gui.compute_score(solution_str, ground_truth)
     elif data_source in [
         "searchR1_nq",
         "searchR1_triviaqa",

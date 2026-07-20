@@ -1,0 +1,5 @@
+- name: osworld_gui_agent
+  _target_: examples.profile.workloads.osworld.osworld_gui_agent_loop.OSWorldGUIAgentLoop
+  max_runtime_turns: 8
+  intermediate_max_new_tokens: 512
+  final_max_new_tokens: 1024

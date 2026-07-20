@@ -1,0 +1,8 @@
+- name: mmsearch_r1_agent
+  _target_: examples.profile.workloads.mmsearch_r1.mmsearch_r1_agent_loop.MMSearchR1AgentLoop
+  max_gen_round: 3
+  first_turn_max_new_tokens: 128
+  followup_max_new_tokens: 512
+  image_search_topk: 5
+  text_search_topk: 5
+  force_tool: image

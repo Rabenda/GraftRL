@@ -1,0 +1,5 @@
+- name: mmdu_multiturn_agent
+  _target_: examples.profile.workloads.mmdu.mmdu_multiturn_agent_loop.MMDUMultiturnAgentLoop
+  max_runtime_turns: 4
+  intermediate_max_new_tokens: 128
+  final_max_new_tokens: 512
